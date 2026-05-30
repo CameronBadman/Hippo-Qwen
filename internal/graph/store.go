@@ -81,16 +81,25 @@ func (s *Store) AddNode(node MemoryNode) (MemoryNode, error) {
 func (s *Store) UpsertEdge(edge MemoryEdge) (MemoryEdge, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	edge = normalizeEdge(edge)
 	if _, ok := s.graph.Nodes[edge.Source]; !ok {
 		return MemoryEdge{}, fmt.Errorf("source node %q does not exist", edge.Source)
 	}
 	if _, ok := s.graph.Nodes[edge.Target]; !ok {
 		return MemoryEdge{}, fmt.Errorf("target node %q does not exist", edge.Target)
 	}
+	edge = normalizeEdgeWithGraph(edge, s.graph)
 	if existing, ok := s.graph.Edges[edge.ID]; ok {
 		edge.UseCount += existing.UseCount
 		edge.EvidenceCount += existing.EvidenceCount
+		if edge.Confidence == 0 {
+			edge.Confidence = existing.Confidence
+		}
+		if edge.ActivationMask == 0 {
+			edge.ActivationMask = existing.ActivationMask
+		}
+		if edge.LastOutcome == "" {
+			edge.LastOutcome = existing.LastOutcome
+		}
 		if edge.LastUsedAt.IsZero() {
 			edge.LastUsedAt = existing.LastUsedAt
 		}
@@ -228,7 +237,7 @@ func (s *Store) apply(event GraphEvent) {
 		}
 	case EventEdgeUpsert:
 		if event.Edge != nil {
-			edge := normalizeEdge(*event.Edge)
+			edge := normalizeEdgeWithGraph(*event.Edge, s.graph)
 			s.graph.Edges[edge.ID] = edge
 		}
 	case EventFeedback:
@@ -271,8 +280,23 @@ func normalizeEdge(edge MemoryEdge) MemoryEdge {
 	if edge.DecayRate == 0 {
 		edge.DecayRate = 0.02
 	}
+	if edge.Confidence == 0 {
+		edge.Confidence = clamp(edge.Weight, 0.05, 1)
+	}
 	if edge.LastUsedAt.IsZero() {
 		edge.LastUsedAt = time.Now().UTC()
+	}
+	return edge
+}
+
+func normalizeEdgeWithGraph(edge MemoryEdge, g *Graph) MemoryEdge {
+	edge = normalizeEdge(edge)
+	if edge.ActivationMask == 0 && g != nil {
+		source, sourceOK := g.Nodes[edge.Source]
+		target, targetOK := g.Nodes[edge.Target]
+		if sourceOK && targetOK {
+			edge.ActivationMask = ActivationMaskForEdge(source, target, edge.Type)
+		}
 	}
 	return edge
 }
@@ -298,6 +322,8 @@ func applyFeedback(g *Graph, feedback Feedback) {
 			continue
 		}
 		edge.Weight = clamp(edge.Weight+delta, 0, 1.5)
+		edge.Confidence = clamp(edge.Confidence+delta/2, 0, 1)
+		edge.LastOutcome = feedback.Outcome
 		edge.LastUsedAt = now
 		if delta > 0 {
 			edge.UseCount++

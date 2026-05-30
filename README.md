@@ -11,6 +11,11 @@ The vector layer is deliberately abstracted. The current runtime uses an exact
 `LinearIndex`; the next acceleration step is an HNSW implementation that keeps
 the same `VectorIndex` contract and only replaces seed/candidate discovery.
 
+Edges intentionally carry compact routing features rather than prose: weight,
+confidence, activation bitmask, last outcome, usage counts, and decay policy.
+Traversal uses the activation mask to prefer edges that match the current query
+without turning every edge into a text document.
+
 ## Run
 
 ```bash

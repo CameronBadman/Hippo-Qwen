@@ -46,6 +46,15 @@ func TestStoreReplaySnapshotAndFeedback(t *testing.T) {
 	if got.Weight <= edge.Weight {
 		t.Fatalf("feedback did not strengthen edge: got %.3f <= %.3f", got.Weight, edge.Weight)
 	}
+	if got.Confidence == 0 {
+		t.Fatalf("expected confidence to be populated")
+	}
+	if got.ActivationMask == 0 {
+		t.Fatalf("expected activation mask to be populated")
+	}
+	if got.LastOutcome != "helpful" {
+		t.Fatalf("last outcome = %q, want helpful", got.LastOutcome)
+	}
 	if g.Nodes[second.ID].Importance <= second.Importance {
 		t.Fatalf("feedback did not raise node importance")
 	}

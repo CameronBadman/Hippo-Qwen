@@ -17,6 +17,8 @@ type EdgeAction struct {
 	ConnectScore    float64 `json:"connect_score"`
 	EdgeType        string  `json:"edge_type"`
 	Weight          float64 `json:"weight"`
+	Confidence      float64 `json:"confidence"`
+	ActivationMask  uint64  `json:"activation_mask"`
 	DecayRate       float64 `json:"decay_rate"`
 	ImportanceDelta float64 `json:"importance_delta"`
 }
@@ -65,6 +67,8 @@ func (l HeuristicLibrarian) Place(req LibrarianRequest) LibrarianResponse {
 			ConnectScore:    score,
 			EdgeType:        edgeType,
 			Weight:          clamp(0.2+score, 0.05, 1.2),
+			Confidence:      clamp(score, 0.05, 1),
+			ActivationMask:  ActivationMaskForEdge(req.Anchor, candidate, edgeType),
 			DecayRate:       decayForEdge(edgeType),
 			ImportanceDelta: clamp((score-0.5)*0.08, -0.04, 0.08),
 		})
@@ -89,11 +93,13 @@ func (l HeuristicLibrarian) ActionsToEdges(anchor MemoryNode, response Librarian
 	edges := make([]MemoryEdge, 0, len(response.Actions)*2)
 	for _, action := range response.Actions {
 		forward := MemoryEdge{
-			Source:    anchor.ID,
-			Target:    action.CandidateID,
-			Type:      action.EdgeType,
-			Weight:    action.Weight,
-			DecayRate: action.DecayRate,
+			Source:         anchor.ID,
+			Target:         action.CandidateID,
+			Type:           action.EdgeType,
+			Weight:         action.Weight,
+			Confidence:     action.Confidence,
+			ActivationMask: action.ActivationMask,
+			DecayRate:      action.DecayRate,
 		}
 		edges = append(edges, normalizeEdge(forward))
 		if action.EdgeType != "temporal_next" {

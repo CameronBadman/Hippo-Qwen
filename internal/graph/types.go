@@ -23,16 +23,19 @@ type MemoryNode struct {
 }
 
 type MemoryEdge struct {
-	ID            string    `json:"id"`
-	Source        string    `json:"source"`
-	Target        string    `json:"target"`
-	Type          string    `json:"type"`
-	Weight        float64   `json:"weight"`
-	DecayRate     float64   `json:"decay_rate"`
-	UseCount      int       `json:"use_count"`
-	LastUsedAt    time.Time `json:"last_used_at"`
-	EvidenceCount int       `json:"evidence_count"`
-	Protected     bool      `json:"protected"`
+	ID             string    `json:"id"`
+	Source         string    `json:"source"`
+	Target         string    `json:"target"`
+	Type           string    `json:"type"`
+	Weight         float64   `json:"weight"`
+	Confidence     float64   `json:"confidence"`
+	ActivationMask uint64    `json:"activation_mask"`
+	DecayRate      float64   `json:"decay_rate"`
+	UseCount       int       `json:"use_count"`
+	LastUsedAt     time.Time `json:"last_used_at"`
+	LastOutcome    string    `json:"last_outcome,omitempty"`
+	EvidenceCount  int       `json:"evidence_count"`
+	Protected      bool      `json:"protected"`
 }
 
 type GraphEvent struct {

@@ -34,12 +34,13 @@ func Search(g *Graph, idx VectorIndex, req SearchRequest) SearchResponse {
 		req.Budget = 2400
 	}
 	queryEmbedding := EmbedText(req.Query, DefaultEmbeddingDims)
+	queryActivation := ActivationMaskForText(req.Query)
 	vector := vectorRank(g, idx, queryEmbedding, maxInt(req.Limit, 12))
 	seeds := vector
 	if len(seeds) > 8 {
 		seeds = seeds[:8]
 	}
-	graphResults := graphRank(g, seeds)
+	graphResults := graphRank(g, seeds, queryActivation)
 	if len(vector) > req.Limit {
 		vector = vector[:req.Limit]
 	}
@@ -90,7 +91,7 @@ func vectorRank(g *Graph, idx VectorIndex, queryEmbedding []float64, limit int) 
 	return results
 }
 
-func graphRank(g *Graph, seeds []SearchResult) []SearchResult {
+func graphRank(g *Graph, seeds []SearchResult, queryActivation uint64) []SearchResult {
 	byNode := make(map[string]SearchResult)
 	for _, seed := range seeds {
 		seed.GraphScore = seed.VectorScore * 0.35
@@ -98,7 +99,7 @@ func graphRank(g *Graph, seeds []SearchResult) []SearchResult {
 		byNode[seed.Node.ID] = seed
 	}
 	for _, seed := range seeds {
-		expandFrom(g, byNode, seed, 2)
+		expandFrom(g, byNode, seed, queryActivation, 2)
 	}
 	results := make([]SearchResult, 0, len(byNode))
 	for _, result := range byNode {
@@ -108,7 +109,7 @@ func graphRank(g *Graph, seeds []SearchResult) []SearchResult {
 	return results
 }
 
-func expandFrom(g *Graph, byNode map[string]SearchResult, seed SearchResult, depth int) {
+func expandFrom(g *Graph, byNode map[string]SearchResult, seed SearchResult, queryActivation uint64, depth int) {
 	frontier := []SearchResult{seed}
 	for step := 0; step < depth; step++ {
 		var next []SearchResult
@@ -124,7 +125,9 @@ func expandFrom(g *Graph, byNode map[string]SearchResult, seed SearchResult, dep
 				if target.ID == seed.Node.ID || pathContains(current.Path, target.ID) {
 					continue
 				}
-				graphScore := current.GraphScore + edge.Weight*edgeTypeBoost(edge.Type)/(float64(step)+1.5)
+				activationBoost := 0.75 + 0.5*ActivationOverlap(queryActivation, edge.ActivationMask)
+				confidenceBoost := 0.75 + 0.25*edge.Confidence
+				graphScore := current.GraphScore + edge.Weight*edgeTypeBoost(edge.Type)*activationBoost*confidenceBoost/(float64(step)+1.5)
 				score := seed.VectorScore*0.55 + graphScore + target.Importance*0.08
 				path := append(append([]string(nil), current.Path...), current.Node.ID, target.ID)
 				edgeIDs := append(append([]string(nil), current.EdgeIDs...), edge.ID)
