@@ -4,13 +4,19 @@ const state = {
 }
 
 const $ = (id) => document.getElementById(id)
+const API_PREFIX = "/api"
 
 async function api(path, options = {}) {
-  const response = await fetch(path, {
+  const response = await fetch(`${API_PREFIX}${path}`, {
     headers: { "Content-Type": "application/json", ...(options.headers || {}) },
     ...options,
   })
-  const body = await response.json()
+  const contentType = response.headers.get("content-type") || ""
+  const raw = await response.text()
+  if (!contentType.includes("application/json")) {
+    throw new Error(`Expected JSON from ${path}, got ${contentType || "unknown"}: ${raw.slice(0, 80)}`)
+  }
+  const body = JSON.parse(raw)
   if (!response.ok) throw new Error(body.error || response.statusText)
   return body
 }
@@ -99,25 +105,33 @@ $("memoryForm").addEventListener("submit", async (event) => {
     importance: Number($("memoryImportance").value || "0.5"),
     metadata: project ? { project } : {},
   }
-  const response = await api("/memories", { method: "POST", body: JSON.stringify(payload) })
-  $("memoryText").value = ""
-  await refreshGraph([response.node.id, ...response.edges.flatMap((edge) => [edge.source, edge.target])])
+  try {
+    const response = await api("/memories", { method: "POST", body: JSON.stringify(payload) })
+    $("memoryText").value = ""
+    await refreshGraph([response.node.id, ...response.edges.flatMap((edge) => [edge.source, edge.target])])
+  } catch (error) {
+    alert(error.message)
+  }
 })
 
 $("searchForm").addEventListener("submit", async (event) => {
   event.preventDefault()
-  const response = await api("/search", {
-    method: "POST",
-    body: JSON.stringify({
-      query: $("queryText").value,
-      limit: Number($("limit").value || "8"),
-      budget: Number($("budget").value || "1800"),
-    }),
-  })
-  state.lastSearch = response
-  resultList($("vectorResults"), response.vector_results)
-  resultList($("graphResults"), response.graph_results)
-  await refreshGraph(response.context_node_ids || [])
+  try {
+    const response = await api("/search", {
+      method: "POST",
+      body: JSON.stringify({
+        query: $("queryText").value,
+        limit: Number($("limit").value || "8"),
+        budget: Number($("budget").value || "1800"),
+      }),
+    })
+    state.lastSearch = response
+    resultList($("vectorResults"), response.vector_results)
+    resultList($("graphResults"), response.graph_results)
+    await refreshGraph(response.context_node_ids || [])
+  } catch (error) {
+    alert(error.message)
+  }
 })
 
 async function sendFeedback(outcome) {
@@ -145,4 +159,3 @@ $("decayBtn").addEventListener("click", async () => {
 })
 
 refreshGraph().catch((error) => console.error(error))
-

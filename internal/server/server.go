@@ -36,13 +36,21 @@ func New(config Config) (*Server, error) {
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", s.handleHealth)
+	mux.HandleFunc("GET /api/healthz", s.handleHealth)
 	mux.HandleFunc("POST /memories", s.handleRemember)
+	mux.HandleFunc("POST /api/memories", s.handleRemember)
 	mux.HandleFunc("POST /search", s.handleSearch)
+	mux.HandleFunc("POST /api/search", s.handleSearch)
 	mux.HandleFunc("POST /feedback", s.handleFeedback)
+	mux.HandleFunc("POST /api/feedback", s.handleFeedback)
 	mux.HandleFunc("POST /maintenance/decay", s.handleDecay)
+	mux.HandleFunc("POST /api/maintenance/decay", s.handleDecay)
 	mux.HandleFunc("GET /graph", s.handleGraph)
+	mux.HandleFunc("GET /api/graph", s.handleGraph)
 	mux.HandleFunc("GET /tools/list", s.handleToolList)
+	mux.HandleFunc("GET /api/tools/list", s.handleToolList)
 	mux.HandleFunc("POST /tools/call", s.handleToolCall)
+	mux.HandleFunc("POST /api/tools/call", s.handleToolCall)
 	if s.webDir != "" {
 		mux.Handle("/", http.FileServer(http.Dir(s.webDir)))
 	}

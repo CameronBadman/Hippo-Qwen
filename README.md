@@ -29,6 +29,9 @@ The server writes local graph state to `data/hippograph/`:
 - `GET /graph`: return the current graph for visualization
 - `GET /tools/list` and `POST /tools/call`: MCP-style tool wrapper
 
+The web UI calls the same endpoints under `/api/*` to avoid static-route
+collisions. The non-`/api` routes remain available for curl and compatibility.
+
 ## Python Librarian Placeholder
 
 The Python service mirrors the future PyTorch model contract:
