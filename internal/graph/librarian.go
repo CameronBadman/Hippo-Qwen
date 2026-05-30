@@ -52,9 +52,10 @@ func (l HeuristicLibrarian) Place(req LibrarianRequest) LibrarianResponse {
 		cosine := Cosine(req.Anchor.Embedding, candidate.Embedding)
 		jaccard := TokenJaccard(req.Anchor.Text+" "+req.Anchor.Summary, candidate.Text+" "+candidate.Summary)
 		meta := metadataScore(req.Anchor.Metadata, candidate.Metadata)
+		cluster := clusterScore(req.Anchor, candidate)
 		recency := recencyScore(now, candidate.Timestamp)
 		graphBonus := graphProximityScore(req.Graph, req.Anchor.ID, candidate.ID)
-		score := 0.45*cosine + 0.25*jaccard + 0.15*meta + 0.10*recency + 0.05*graphBonus
+		score := 0.35*cosine + 0.20*jaccard + 0.20*meta + 0.15*cluster + 0.05*recency + 0.05*graphBonus
 		if score < l.Threshold {
 			continue
 		}
@@ -121,6 +122,16 @@ func metadataScore(a map[string]string, b map[string]string) float64 {
 		return 0
 	}
 	return float64(matches) / float64(total)
+}
+
+func clusterScore(anchor MemoryNode, candidate MemoryNode) float64 {
+	if anchor.Cluster == "" || candidate.Cluster == "" {
+		return 0
+	}
+	if anchor.Cluster == candidate.Cluster {
+		return 1
+	}
+	return 0
 }
 
 func recencyScore(now time.Time, timestamp time.Time) float64 {

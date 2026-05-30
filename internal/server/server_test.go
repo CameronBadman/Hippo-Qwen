@@ -26,11 +26,15 @@ func TestRememberSearchAndFeedbackAPI(t *testing.T) {
 		"importance": 0.8,
 		"metadata":   map[string]string{"project": "hippograph"},
 	}, http.StatusOK)
-	postJSON(t, handler, "/memories", map[string]any{
+	var second rememberResponse
+	postJSONInto(t, handler, "/memories", map[string]any{
 		"text":       "HippoGraph stores memory as weighted graph edges.",
 		"importance": 0.7,
 		"metadata":   map[string]string{"project": "hippograph"},
-	}, http.StatusOK)
+	}, http.StatusOK, &second)
+	if len(second.Edges) == 0 {
+		t.Fatalf("expected heuristic librarian to create same-project edges")
+	}
 
 	var search graph.SearchResponse
 	postJSONInto(t, handler, "/search", map[string]any{

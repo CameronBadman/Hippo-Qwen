@@ -4,6 +4,7 @@ import (
 	"flag"
 	"log"
 	"net/http"
+	"strings"
 
 	"hippograph/internal/graph"
 	"hippograph/internal/server"
@@ -23,8 +24,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("server: %v", err)
 	}
-	log.Printf("HippoGraph listening on http://localhost%s", *addr)
+	log.Printf("HippoGraph listening on %s", displayURL(*addr))
 	if err := http.ListenAndServe(*addr, app.Handler()); err != nil {
 		log.Fatal(err)
 	}
+}
+
+func displayURL(addr string) string {
+	if strings.HasPrefix(addr, ":") {
+		return "http://localhost" + addr
+	}
+	return "http://" + addr
 }
