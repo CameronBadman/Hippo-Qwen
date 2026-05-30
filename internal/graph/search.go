@@ -119,6 +119,9 @@ func expandFrom(g *Graph, byNode map[string]SearchResult, seed SearchResult, dep
 				if !ok {
 					continue
 				}
+				if target.ID == seed.Node.ID || pathContains(current.Path, target.ID) {
+					continue
+				}
 				graphScore := current.GraphScore + edge.Weight*edgeTypeBoost(edge.Type)/(float64(step)+1.5)
 				score := seed.VectorScore*0.55 + graphScore + target.Importance*0.08
 				path := append(append([]string(nil), current.Path...), current.Node.ID, target.ID)
@@ -140,6 +143,15 @@ func expandFrom(g *Graph, byNode map[string]SearchResult, seed SearchResult, dep
 		}
 		frontier = next
 	}
+}
+
+func pathContains(path []string, id string) bool {
+	for _, item := range path {
+		if item == id {
+			return true
+		}
+	}
+	return false
 }
 
 func edgeTypeBoost(edgeType string) float64 {
