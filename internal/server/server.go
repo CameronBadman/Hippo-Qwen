@@ -13,12 +13,14 @@ import (
 
 type Server struct {
 	store     *graph.Store
+	index     graph.VectorIndex
 	librarian graph.HeuristicLibrarian
 	webDir    string
 }
 
 type Config struct {
 	Store  *graph.Store
+	Index  graph.VectorIndex
 	WebDir string
 }
 
@@ -26,8 +28,15 @@ func New(config Config) (*Server, error) {
 	if config.Store == nil {
 		return nil, errors.New("store is required")
 	}
+	if config.Index == nil {
+		config.Index = graph.NewLinearIndex(graph.DefaultEmbeddingDims)
+	}
+	if err := config.Index.Rebuild(config.Store.Graph().Nodes); err != nil {
+		return nil, err
+	}
 	return &Server{
 		store:     config.Store,
+		index:     config.Index,
 		librarian: graph.NewHeuristicLibrarian(),
 		webDir:    config.WebDir,
 	}, nil
@@ -105,7 +114,11 @@ func (s *Server) handleRemember(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err)
 		return
 	}
-	candidates := graph.TopCandidates(before, stored.Embedding, stored.ID, 32)
+	if err := s.index.Insert(stored); err != nil {
+		writeError(w, http.StatusInternalServerError, err)
+		return
+	}
+	candidates := graph.TopCandidates(before, s.index, stored.Embedding, stored.ID, 32)
 	librarianResponse := s.librarian.Place(graph.LibrarianRequest{
 		Anchor:     stored,
 		Candidates: candidates,
@@ -141,7 +154,7 @@ func (s *Server) handleSearch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, errors.New("query is required"))
 		return
 	}
-	resp := graph.Search(s.store.Graph(), req)
+	resp := graph.Search(s.store.Graph(), s.index, req)
 	writeJSON(w, http.StatusOK, resp)
 }
 

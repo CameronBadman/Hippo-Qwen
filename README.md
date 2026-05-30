@@ -7,6 +7,10 @@ This phase does not require Qwen Cloud credentials. It uses deterministic local
 embeddings and a heuristic librarian behind the same contracts that the later
 neighborhood transformer and Qwen teacher will use.
 
+The vector layer is deliberately abstracted. The current runtime uses an exact
+`LinearIndex`; the next acceleration step is an HNSW implementation that keeps
+the same `VectorIndex` contract and only replaces seed/candidate discovery.
+
 ## Run
 
 ```bash

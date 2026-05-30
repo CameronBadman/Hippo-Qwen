@@ -32,8 +32,12 @@ func TestSearchUsesGraphTraversalForConnectedContext(t *testing.T) {
 		Weight: 1.1,
 	})
 	g.Edges[edge.ID] = edge
+	idx := NewLinearIndex(DefaultEmbeddingDims)
+	if err := idx.Rebuild(g.Nodes); err != nil {
+		t.Fatal(err)
+	}
 
-	resp := Search(g, SearchRequest{Query: "what should I take for a headache?", Limit: 3, Budget: 1000})
+	resp := Search(g, idx, SearchRequest{Query: "what should I take for a headache?", Limit: 3, Budget: 1000})
 	if !containsNode(resp.GraphResults, critical.ID) {
 		t.Fatalf("graph results did not include critical connected node: %#v", ids(resp.GraphResults))
 	}

@@ -1,8 +1,6 @@
 package graph
 
-import (
-	"sort"
-)
+import "sort"
 
 type SearchRequest struct {
 	Query  string `json:"query"`
@@ -28,7 +26,7 @@ type SearchResponse struct {
 	ContextEdgeIDs []string       `json:"context_edge_ids"`
 }
 
-func Search(g *Graph, req SearchRequest) SearchResponse {
+func Search(g *Graph, idx VectorIndex, req SearchRequest) SearchResponse {
 	if req.Limit <= 0 {
 		req.Limit = 10
 	}
@@ -36,7 +34,7 @@ func Search(g *Graph, req SearchRequest) SearchResponse {
 		req.Budget = 2400
 	}
 	queryEmbedding := EmbedText(req.Query, DefaultEmbeddingDims)
-	vector := vectorRank(g, queryEmbedding)
+	vector := vectorRank(g, idx, queryEmbedding, maxInt(req.Limit, 12))
 	seeds := vector
 	if len(seeds) > 8 {
 		seeds = seeds[:8]
@@ -59,8 +57,8 @@ func Search(g *Graph, req SearchRequest) SearchResponse {
 	}
 }
 
-func TopCandidates(g *Graph, embedding []float64, excludeID string, limit int) []MemoryNode {
-	ranked := vectorRank(g, embedding)
+func TopCandidates(g *Graph, idx VectorIndex, embedding []float64, excludeID string, limit int) []MemoryNode {
+	ranked := vectorRank(g, idx, embedding, limit+1)
 	out := make([]MemoryNode, 0, limit)
 	for _, result := range ranked {
 		if result.Node.ID == excludeID {
@@ -74,14 +72,18 @@ func TopCandidates(g *Graph, embedding []float64, excludeID string, limit int) [
 	return out
 }
 
-func vectorRank(g *Graph, queryEmbedding []float64) []SearchResult {
-	results := make([]SearchResult, 0, len(g.Nodes))
-	for _, node := range g.Nodes {
-		score := Cosine(queryEmbedding, node.Embedding)
+func vectorRank(g *Graph, idx VectorIndex, queryEmbedding []float64, limit int) []SearchResult {
+	hits := idx.Search(queryEmbedding, limit)
+	results := make([]SearchResult, 0, len(hits))
+	for _, hit := range hits {
+		node, ok := g.Nodes[hit.NodeID]
+		if !ok {
+			continue
+		}
 		results = append(results, SearchResult{
 			Node:        node,
-			Score:       score,
-			VectorScore: score,
+			Score:       hit.Score,
+			VectorScore: hit.Score,
 		})
 	}
 	sortResults(results)
@@ -190,6 +192,10 @@ func packContext(results []SearchResult, budget int) (string, []string, []string
 }
 
 func sortResults(results []SearchResult) {
+	sortSearchResults(results)
+}
+
+func sortSearchResults(results []SearchResult) {
 	sort.Slice(results, func(i, j int) bool {
 		if results[i].Score == results[j].Score {
 			return results[i].Node.ID < results[j].Node.ID
@@ -212,4 +218,11 @@ func compactPath(path []string) []string {
 		last = id
 	}
 	return out
+}
+
+func maxInt(a int, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
