@@ -279,13 +279,16 @@ python3 -m python.selector.stress_matrix \
   --eval-state-corruptions none,mild \
   --seeds 51,53,55 \
   --cases 5000 \
-  --epochs 4
+  --epochs 4 \
+  --condition-timeout-seconds 1800 \
+  --progress-file artifacts/librarian/stress_matrix/progress.jsonl
 ```
 
 The matrix reuses `evolved_state_regression`, writes one subdirectory per
 scenario/corruption pair, and produces `stress_matrix_summary.json` plus
 `stress_matrix_summary.md` with recall, precision, noise, and second-half drift
-readouts.
+readouts. `progress.jsonl` records condition start/finish events so a Colab run
+can be inspected even if notebook stdout stalls.
 
 Inspect selector failures by synthetic role:
 

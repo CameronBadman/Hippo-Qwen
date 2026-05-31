@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import selectors
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -22,9 +24,47 @@ def parse_csv(value: str) -> list[str]:
     return items
 
 
-def run_command(cmd: list[str], cwd: Path) -> None:
+def write_progress(args: argparse.Namespace, event: dict[str, Any]) -> None:
+    progress_file = getattr(args, "progress_file", "")
+    if not progress_file:
+        return
+    path = Path(progress_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()), **event}
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(payload) + "\n")
+
+
+def run_command(cmd: list[str], cwd: Path, timeout_seconds: int = 0) -> None:
     print("$ " + " ".join(cmd), flush=True)
-    subprocess.run(cmd, cwd=cwd, check=True)
+    started = time.monotonic()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    while proc.poll() is None:
+        for key, _mask in selector.select(timeout=1.0):
+            line = key.fileobj.readline()
+            if line:
+                print(line, end="", flush=True)
+        if timeout_seconds > 0 and time.monotonic() - started > timeout_seconds:
+            proc.kill()
+            proc.wait()
+            selector.close()
+            raise TimeoutError(f"command exceeded {timeout_seconds}s: {' '.join(cmd)}")
+    for line in proc.stdout:
+        print(line, end="", flush=True)
+    selector.close()
+    return_code = proc.wait()
+    if return_code:
+        raise subprocess.CalledProcessError(return_code, cmd)
 
 
 def scenario_dir_name(scenario: str, corruption: str) -> str:
@@ -36,8 +76,27 @@ def run_regression(args: argparse.Namespace, repo: Path, scenario: str, corrupti
     summary_path = run_dir / "summary.json"
     if summary_path.exists() and not args.force:
         print(f"using existing regression summary {summary_path}", flush=True)
+        write_progress(
+            args,
+            {
+                "event": "condition_skipped_existing",
+                "scenario": scenario,
+                "eval_state_corruption": corruption,
+                "summary_json": str(summary_path),
+            },
+        )
         return summary_path
 
+    print(f"starting condition scenario={scenario} eval_state_corruption={corruption}", flush=True)
+    write_progress(
+        args,
+        {
+            "event": "condition_started",
+            "scenario": scenario,
+            "eval_state_corruption": corruption,
+            "work_dir": str(run_dir),
+        },
+    )
     cmd = [
         sys.executable,
         "-u",
@@ -100,7 +159,19 @@ def run_regression(args: argparse.Namespace, repo: Path, scenario: str, corrupti
         cmd.append("--force")
     if args.cpu:
         cmd.append("--cpu")
-    run_command(cmd, repo)
+    started = time.monotonic()
+    run_command(cmd, repo, args.condition_timeout_seconds)
+    elapsed_seconds = time.monotonic() - started
+    write_progress(
+        args,
+        {
+            "event": "condition_finished",
+            "scenario": scenario,
+            "eval_state_corruption": corruption,
+            "elapsed_seconds": round(elapsed_seconds, 3),
+            "summary_json": str(summary_path),
+        },
+    )
     return summary_path
 
 
@@ -215,6 +286,8 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
     parser.add_argument("--selector-post-rank-bias", action="store_true")
+    parser.add_argument("--condition-timeout-seconds", type=int, default=0)
+    parser.add_argument("--progress-file", default="")
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
