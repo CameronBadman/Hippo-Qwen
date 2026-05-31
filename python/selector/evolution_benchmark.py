@@ -18,6 +18,7 @@ from python.synthetic.generate import build_cases
 Ranked = list[tuple[str, float, str]]
 Scorer = Callable[[dict[str, Any]], Ranked]
 PREFERENCE_MARKERS = {"preference", "prefer", "prefers", "preferred", "wants", "likes", "avoids", "needs"}
+EVOLUTION_POLICIES = {"off", "always", "uncertainty_gated", "low_confidence_only"}
 
 
 class MemoryState:
@@ -249,38 +250,162 @@ def metric_delta(evolved: dict[str, float], static: dict[str, float]) -> dict[st
     return {key: evolved.get(key, 0.0) - static.get(key, 0.0) for key in keys}
 
 
-def evaluate_online(rows: list[dict[str, Any]], scorers: dict[str, Scorer], top_k: int, budget: int, bias_scale: float) -> dict[str, Any]:
+def confidence_features(ranked: Ranked, top_k: int) -> dict[str, float]:
+    if not ranked:
+        return {
+            "top_score": 0.0,
+            "top_margin": 0.0,
+            "cutoff_margin": 0.0,
+            "score_spread": 0.0,
+            "cutoff_crowding": 0.0,
+        }
+    scores = [score for _, score, _ in ranked]
+    top_margin = scores[0] - scores[1] if len(scores) > 1 else abs(scores[0])
+    cutoff_index = min(max(0, top_k - 1), len(scores) - 1)
+    cutoff_score = scores[cutoff_index]
+    next_score = scores[cutoff_index + 1] if cutoff_index + 1 < len(scores) else scores[-1]
+    cutoff_crowding = sum(1 for score in scores if abs(score - cutoff_score) <= 0.03)
+    return {
+        "top_score": float(scores[0]),
+        "top_margin": float(top_margin),
+        "cutoff_margin": float(cutoff_score - next_score),
+        "score_spread": float(scores[0] - scores[-1]),
+        "cutoff_crowding": float(cutoff_crowding),
+    }
+
+
+def policy_bias_scale(
+    policy: str,
+    bias_scale: float,
+    confidence: dict[str, float],
+    gate_margin: float,
+    low_confidence_score: float,
+    low_spread: float,
+) -> float:
+    if policy == "off" or bias_scale <= 0.0:
+        return 0.0
+    if policy == "always":
+        return bias_scale
+    if policy == "uncertainty_gated":
+        return bias_scale if confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4 else 0.0
+    if policy == "low_confidence_only":
+        return bias_scale if confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread else 0.0
+    raise ValueError(f"unknown evolution policy: {policy}")
+
+
+def evaluate_variant(
+    rows: list[dict[str, Any]],
+    scorer: Scorer,
+    top_k: int,
+    budget: int,
+    policy: str,
+    bias_scale: float,
+    gate_margin: float,
+    low_confidence_score: float,
+    low_spread: float,
+) -> dict[str, Any]:
+    if policy == "off":
+        metrics = []
+        roles: dict[str, dict[str, int]] = {}
+        confidence_items = []
+        for row in rows:
+            ranked = scorer(row)
+            metrics.append(evaluate_ranked(row, ranked, top_k, budget))
+            merge_role_counts(roles, role_exposure(row, ranked, budget))
+            confidence_items.append(confidence_features(ranked, top_k))
+        return {
+            "policy": policy,
+            "bias_scale": bias_scale,
+            "applied_rate": 0.0,
+            "evolved": summarize_windows(metrics),
+            "feedback": {},
+            "state": {"memories_touched": 0, "signatures_touched": 0, "feedback": {}},
+            "confidence": average_metrics(confidence_items),
+            "evolved_role_metrics": summarize_role_counts(roles),
+        }
+
+    state = MemoryState()
+    evolved_metrics = []
+    evolved_roles: dict[str, dict[str, int]] = {}
+    feedback = Counter()
+    confidence_items = []
+    applied_count = 0
+    for row in rows:
+        evolved_row = state.apply(row)
+        base_ranked = scorer(evolved_row)
+        confidence = confidence_features(base_ranked, top_k)
+        effective_scale = policy_bias_scale(policy, bias_scale, confidence, gate_margin, low_confidence_score, low_spread)
+        evolved_ranked = state.rerank(evolved_row, base_ranked, effective_scale)
+        evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
+        merge_role_counts(evolved_roles, role_exposure(row, evolved_ranked, budget))
+        feedback.update(apply_feedback(state, evolved_row, evolved_ranked, budget))
+        confidence_items.append(confidence)
+        if effective_scale > 0.0:
+            applied_count += 1
+
+    return {
+        "policy": policy,
+        "bias_scale": bias_scale,
+        "applied_rate": applied_count / max(1, len(rows)),
+        "evolved": summarize_windows(evolved_metrics),
+        "feedback": dict(sorted(feedback.items())),
+        "state": state.summary(),
+        "confidence": average_metrics(confidence_items),
+        "evolved_role_metrics": summarize_role_counts(evolved_roles),
+    }
+
+
+def evaluate_online(
+    rows: list[dict[str, Any]],
+    scorers: dict[str, Scorer],
+    top_k: int,
+    budget: int,
+    policies: list[str],
+    bias_scales: list[float],
+    gate_margin: float,
+    low_confidence_score: float,
+    low_spread: float,
+) -> dict[str, Any]:
     results: dict[str, Any] = {}
     for name, scorer in scorers.items():
-        state = MemoryState()
         static_metrics = []
-        evolved_metrics = []
         static_roles: dict[str, dict[str, int]] = {}
-        evolved_roles: dict[str, dict[str, int]] = {}
-        feedback = Counter()
         for row in rows:
             static_ranked = scorer(row)
-            evolved_row = state.apply(row)
-            evolved_ranked = state.rerank(evolved_row, scorer(evolved_row), bias_scale)
             static_metrics.append(evaluate_ranked(row, static_ranked, top_k, budget))
-            evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
             merge_role_counts(static_roles, role_exposure(row, static_ranked, budget))
-            merge_role_counts(evolved_roles, role_exposure(row, evolved_ranked, budget))
-            feedback.update(apply_feedback(state, evolved_row, evolved_ranked, budget))
 
         static_summary = summarize_windows(static_metrics)
-        evolved_summary = summarize_windows(evolved_metrics)
+        variants = {}
+        for policy in policies:
+            for bias_scale in bias_scales:
+                key = f"{policy}@{bias_scale:g}"
+                variant = evaluate_variant(
+                    rows,
+                    scorer,
+                    top_k,
+                    budget,
+                    policy,
+                    bias_scale,
+                    gate_margin,
+                    low_confidence_score,
+                    low_spread,
+                )
+                variant["delta"] = {
+                    "overall": metric_delta(variant["evolved"]["overall"], static_summary["overall"]),
+                    "second_half": metric_delta(variant["evolved"]["second_half"], static_summary["second_half"]),
+                }
+                variants[key] = variant
+        first_variant = next(iter(variants.values()))
         results[name] = {
             "static": static_summary,
-            "evolved": evolved_summary,
-            "delta": {
-                "overall": metric_delta(evolved_summary["overall"], static_summary["overall"]),
-                "second_half": metric_delta(evolved_summary["second_half"], static_summary["second_half"]),
-            },
-            "feedback": dict(sorted(feedback.items())),
-            "state": state.summary(),
             "static_role_metrics": summarize_role_counts(static_roles),
-            "evolved_role_metrics": summarize_role_counts(evolved_roles),
+            "variants": variants,
+            "evolved": first_variant["evolved"],
+            "delta": first_variant["delta"],
+            "feedback": first_variant["feedback"],
+            "state": first_variant["state"],
+            "evolved_role_metrics": first_variant["evolved_role_metrics"],
         }
     return results
 
@@ -313,6 +438,23 @@ def build_scorers(args: argparse.Namespace) -> dict[str, Scorer]:
     return scorers
 
 
+def parse_bias_scales(value: str, fallback: float) -> list[float]:
+    if not value.strip():
+        return [fallback]
+    scales = [float(item.strip()) for item in value.split(",") if item.strip()]
+    return scales or [fallback]
+
+
+def parse_policies(value: str) -> list[str]:
+    policies = [item.strip() for item in value.split(",") if item.strip()]
+    if not policies:
+        return ["always"]
+    unknown = sorted(set(policies) - EVOLUTION_POLICIES)
+    if unknown:
+        raise ValueError(f"unknown evolution policies: {', '.join(unknown)}")
+    return policies
+
+
 def write_markdown(result: dict[str, Any], path: Path) -> None:
     lines = [
         "# Memory Evolution Benchmark",
@@ -321,25 +463,36 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- scenario: `{result['scenario']}`",
         f"- top_k: `{result['top_k']}`",
         f"- budget: `{result['budget']}`",
+        f"- policies: `{', '.join(result['evolution_policies'])}`",
+        f"- bias scales: `{', '.join(str(item) for item in result['evolution_bias_scales'])}`",
         "",
-        "| method | mode | recall@k | context precision | context recall | noise |",
-        "| --- | --- | ---: | ---: | ---: | ---: |",
+        "| method | policy | scale | applied | recall@k | context precision | context recall | noise |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, item in result["methods"].items():
-        for mode in ("static", "evolved"):
-            metrics = item[mode]["overall"]
+        static = item["static"]["overall"]
+        lines.append(
+            f"| {name} | static | 0 | 0.0000 | {static.get('recall_at_k', 0.0):.4f} | "
+            f"{static.get('context_precision', 0.0):.4f} | {static.get('context_recall', 0.0):.4f} | "
+            f"{static.get('noise', 0.0):.2f} |"
+        )
+        for variant in item["variants"].values():
+            metrics = variant["evolved"]["overall"]
             lines.append(
-                f"| {name} | {mode} | {metrics.get('recall_at_k', 0.0):.4f} | "
+                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | {variant.get('applied_rate', 0.0):.4f} | "
+                f"{metrics.get('recall_at_k', 0.0):.4f} | "
                 f"{metrics.get('context_precision', 0.0):.4f} | {metrics.get('context_recall', 0.0):.4f} | "
                 f"{metrics.get('noise', 0.0):.2f} |"
             )
-    lines.extend(["", "## Second-Half Delta", "", "| method | recall@k | context precision | context recall | noise |", "| --- | ---: | ---: | ---: | ---: |"])
+    lines.extend(["", "## Second-Half Delta", "", "| method | policy | scale | recall@k | context precision | context recall | noise |", "| --- | --- | ---: | ---: | ---: | ---: | ---: |"])
     for name, item in result["methods"].items():
-        delta = item["delta"]["second_half"]
-        lines.append(
-            f"| {name} | {delta.get('recall_at_k', 0.0):+.4f} | {delta.get('context_precision', 0.0):+.4f} | "
-            f"{delta.get('context_recall', 0.0):+.4f} | {delta.get('noise', 0.0):+.2f} |"
-        )
+        for variant in item["variants"].values():
+            delta = variant["delta"]["second_half"]
+            lines.append(
+                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | "
+                f"{delta.get('recall_at_k', 0.0):+.4f} | {delta.get('context_precision', 0.0):+.4f} | "
+                f"{delta.get('context_recall', 0.0):+.4f} | {delta.get('noise', 0.0):+.2f} |"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -359,10 +512,17 @@ def main() -> None:
     parser.add_argument("--output-md", default="")
     parser.add_argument("--output-dataset", default="")
     parser.add_argument("--evolution-bias-scale", type=float, default=0.5)
+    parser.add_argument("--evolution-bias-scales", default="")
+    parser.add_argument("--evolution-policies", default="always")
+    parser.add_argument("--gate-margin", type=float, default=0.03)
+    parser.add_argument("--low-confidence-score", type=float, default=0.72)
+    parser.add_argument("--low-spread", type=float, default=0.18)
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
     rows = load_or_generate_rows(args)
+    policies = parse_policies(args.evolution_policies)
+    bias_scales = parse_bias_scales(args.evolution_bias_scales, args.evolution_bias_scale)
     result = {
         "cases": len(rows),
         "scenario": args.scenario,
@@ -371,7 +531,22 @@ def main() -> None:
         "top_k": args.top_k,
         "budget": args.budget,
         "evolution_bias_scale": args.evolution_bias_scale,
-        "methods": evaluate_online(rows, build_scorers(args), args.top_k, args.budget, args.evolution_bias_scale),
+        "evolution_bias_scales": bias_scales,
+        "evolution_policies": policies,
+        "gate_margin": args.gate_margin,
+        "low_confidence_score": args.low_confidence_score,
+        "low_spread": args.low_spread,
+        "methods": evaluate_online(
+            rows,
+            build_scorers(args),
+            args.top_k,
+            args.budget,
+            policies,
+            bias_scales,
+            args.gate_margin,
+            args.low_confidence_score,
+            args.low_spread,
+        ),
     }
     body = json.dumps(result, indent=2)
     print(body)

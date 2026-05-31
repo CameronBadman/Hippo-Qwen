@@ -197,7 +197,8 @@ status, and duplicate-like text:
 python3 -m python.selector.evolution_benchmark \
   --scenario adversarial \
   --cases 2000 \
-  --evolution-bias-scale 0.5 \
+  --evolution-policies off,always,uncertainty_gated,low_confidence_only \
+  --evolution-bias-scales 0,0.1,0.25,0.5,1.0 \
   --output-json artifacts/librarian/evolution/summary.json \
   --output-md artifacts/librarian/evolution/summary.md
 ```
