@@ -21,17 +21,17 @@ SELECTOR_ABLATIONS: dict[str, dict[str, Any]] = {
         "query_only": True,
     },
     "multi_seed_no_state": {
-        "feature_dim": 17,
+        "feature_dim": 21,
         "rank_loss_weight": 0.25,
         "query_only": False,
     },
     "multi_seed_full": {
-        "feature_dim": 24,
+        "feature_dim": 31,
         "rank_loss_weight": 0.25,
         "query_only": False,
     },
     "multi_seed_no_rank": {
-        "feature_dim": 24,
+        "feature_dim": 31,
         "rank_loss_weight": 0.0,
         "query_only": False,
     },

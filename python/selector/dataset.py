@@ -88,6 +88,7 @@ def selector_features(
     metadata = candidate.get("metadata") or {}
     preference = preference_features(anchor.get("text", ""), candidate.get("text", ""))
     cluster = cluster_score(anchor, candidate)
+    context = context_features(anchor, candidate, preference, cluster, state)
     features = [
         cosine(query_embedding, candidate["embedding"]),
         jaccard(query, candidate.get("text", "")),
@@ -106,6 +107,10 @@ def selector_features(
         preference["same_context_conflict"] * cluster,
         float(anchor.get("importance") or 0.5),
         min(anchor_len, candidate_len) / max(anchor_len, candidate_len),
+        context["mismatch"],
+        context["mismatch_lexical"],
+        context["mismatch_preference_overlap"],
+        context["mismatch_preference_conflict"],
         state["candidate_age_norm"],
         state["candidate_use_norm"],
         state["candidate_evidence_norm"],
@@ -113,6 +118,9 @@ def selector_features(
         state["protected_flag"],
         state["stale_unused_flag"],
         state["recency_score"],
+        context["mismatch_positive_state"],
+        context["same_context_stale"],
+        context["same_context_positive_state"],
     ]
     features = [clamp(float(value), -1.0, 1.0) for value in features]
     if feature_dim <= len(features):
@@ -145,4 +153,32 @@ def preference_features(anchor_text: str, candidate_text: str) -> dict[str, floa
         "overlap": overlap,
         "conflict": conflict,
         "same_context_conflict": conflict,
+    }
+
+
+def context_features(
+    anchor: dict[str, Any],
+    candidate: dict[str, Any],
+    preference: dict[str, float],
+    cluster: float,
+    state: dict[str, float],
+) -> dict[str, float]:
+    anchor_cluster = str(anchor.get("cluster") or "")
+    candidate_cluster = str(candidate.get("cluster") or "")
+    mismatch = 1.0 if anchor_cluster and candidate_cluster and anchor_cluster != candidate_cluster else 0.0
+    lexical = jaccard(anchor.get("text", ""), candidate.get("text", ""))
+    positive_state = (
+        state["candidate_use_norm"]
+        + state["candidate_evidence_norm"]
+        + max(0.0, state["last_outcome_value"])
+        + float(candidate.get("importance") or 0.5)
+    ) / 4.0
+    return {
+        "mismatch": mismatch,
+        "mismatch_lexical": mismatch * lexical,
+        "mismatch_preference_overlap": mismatch * preference["overlap"],
+        "mismatch_preference_conflict": mismatch * preference["conflict"],
+        "mismatch_positive_state": mismatch * positive_state,
+        "same_context_stale": cluster * state["stale_unused_flag"],
+        "same_context_positive_state": cluster * positive_state,
     }
