@@ -91,10 +91,14 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
         reason = result.get("reason_metrics") or {}
         lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('macro_recall', 0.0):.4f} | {reason.get('total', 0)} |")
 
-    lines.extend(["", "## Auxiliary Multi-Label Head", "", "| ablation | bit accuracy | macro f1 |", "| --- | ---: | ---: |"])
+    lines.extend(["", "## Auxiliary Multi-Label Head", "", "| ablation | bit accuracy | macro f1 | tuned macro f1 |", "| --- | ---: | ---: | ---: |"])
     for name, result in summary["selectors"].items():
         auxiliary = result.get("auxiliary_metrics") or {}
-        lines.append(f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | {auxiliary.get('macro_f1', 0.0):.4f} |")
+        tuned = auxiliary.get("tuned") or {}
+        lines.append(
+            f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | "
+            f"{auxiliary.get('macro_f1', 0.0):.4f} | {tuned.get('macro_f1', 0.0):.4f} |"
+        )
 
     lines.extend(["", "## Error Highlights", ""])
     for name, result in summary["error_analysis"].items():

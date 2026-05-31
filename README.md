@@ -135,7 +135,9 @@ It uses only observable query, anchor, candidate, and memory-state features;
 the synthetic role labels are withheld from the model. The training objective
 also includes optional explanation heads: a single reason class and a multi-label
 auxiliary head for relevance, context match, preference match/conflict, stale
-duplicates, and wrong-context decisions.
+duplicates, and wrong-context decisions. Auxiliary training uses capped
+per-label positive weighting by default, and benchmark reports include both
+fixed-threshold and tuned-threshold diagnostic F1.
 
 ```bash
 python3 -m python.selector.train_selector \

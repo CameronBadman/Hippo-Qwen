@@ -138,6 +138,8 @@ def benchmark_selector(args: argparse.Namespace, dataset: Path, checkpoint: Path
         limit=args.eval_limit,
         top_k=args.top_k,
         budget=args.budget,
+        auxiliary_threshold=0.5,
+        tune_auxiliary_thresholds=True,
         output_json="",
         cpu=args.cpu,
     )
@@ -200,10 +202,14 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
     for name, result in summary["selectors"].items():
         reason = result.get("reason_metrics") or {}
         lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('macro_recall', 0.0):.4f} | {reason.get('total', 0)} |")
-    lines.extend(["", "## Auxiliary Multi-Label Head", "", "| ablation | bit accuracy | macro f1 |", "| --- | ---: | ---: |"])
+    lines.extend(["", "## Auxiliary Multi-Label Head", "", "| ablation | bit accuracy | macro f1 | tuned macro f1 |", "| --- | ---: | ---: | ---: |"])
     for name, result in summary["selectors"].items():
         auxiliary = result.get("auxiliary_metrics") or {}
-        lines.append(f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | {auxiliary.get('macro_f1', 0.0):.4f} |")
+        tuned = auxiliary.get("tuned") or {}
+        lines.append(
+            f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | "
+            f"{auxiliary.get('macro_f1', 0.0):.4f} | {tuned.get('macro_f1', 0.0):.4f} |"
+        )
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

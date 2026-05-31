@@ -71,7 +71,7 @@ def reason_report(model, row: dict, budget: int) -> dict:
     return {"total": total, "correct": correct, "confusion": confusion}
 
 
-def auxiliary_report(model, row: dict, budget: int) -> dict[str, dict[str, int]]:
+def auxiliary_report(model, row: dict, budget: int, thresholds: dict[str, float]) -> dict:
     import torch
 
     dataset = ContextSelectorDataset.__new__(ContextSelectorDataset)
@@ -91,12 +91,14 @@ def auxiliary_report(model, row: dict, budget: int) -> dict[str, dict[str, int]]
     with torch.no_grad():
         batch = {key: value.to(device) for key, value in batch.items()}
         outputs = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
-        predicted = torch.sigmoid(outputs["auxiliary_logits"])[0].detach().cpu() >= 0.5
+        scores = torch.sigmoid(outputs["auxiliary_logits"])[0].detach().cpu()
     valid = item["mask"]
     expected = item["auxiliary"] >= 0.5
     report: dict[str, dict[str, int]] = {}
+    samples: dict[str, list[tuple[float, bool]]] = {}
     for idx, label in enumerate(AUXILIARY_LABELS):
-        pred = predicted[valid, idx]
+        threshold = thresholds.get(label, 0.5)
+        pred = scores[valid, idx] >= threshold
         exp = expected[valid, idx]
         report[label] = {
             "tp": int((pred & exp).sum().item()),
@@ -104,7 +106,8 @@ def auxiliary_report(model, row: dict, budget: int) -> dict[str, dict[str, int]]
             "fn": int((~pred & exp).sum().item()),
             "tn": int((~pred & ~exp).sum().item()),
         }
-    return report
+        samples[label] = [(float(score), bool(value)) for score, value in zip(scores[valid, idx].tolist(), exp.tolist())]
+    return {"counts": report, "samples": samples}
 
 
 def run(args: argparse.Namespace) -> dict:
@@ -117,6 +120,8 @@ def run(args: argparse.Namespace) -> dict:
     reason_totals = {"total": 0, "correct": 0}
     confusion: dict[str, dict[str, int]] = {}
     auxiliary_totals = {label: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for label in AUXILIARY_LABELS}
+    auxiliary_samples: dict[str, list[tuple[float, bool]]] = {label: [] for label in AUXILIARY_LABELS}
+    auxiliary_thresholds = {label: args.auxiliary_threshold for label in AUXILIARY_LABELS}
     for row in rows:
         ranked = selector_scores(model, row, args.budget)
         metrics.append(evaluate_ranked(row, ranked, args.top_k, args.budget))
@@ -127,10 +132,16 @@ def run(args: argparse.Namespace) -> dict:
             confusion.setdefault(expected, {})
             for predicted, count in predicted_counts.items():
                 confusion[expected][predicted] = confusion[expected].get(predicted, 0) + count
-        auxiliary = auxiliary_report(model, row, args.budget)
-        for label, counts in auxiliary.items():
+        auxiliary = auxiliary_report(model, row, args.budget, auxiliary_thresholds)
+        for label, counts in auxiliary["counts"].items():
             for key, count in counts.items():
                 auxiliary_totals[label][key] += count
+        for label, samples in auxiliary["samples"].items():
+            auxiliary_samples[label].extend(samples)
+    auxiliary_metrics = summarize_auxiliary(auxiliary_totals)
+    auxiliary_metrics["thresholds"] = auxiliary_thresholds
+    if args.tune_auxiliary_thresholds:
+        auxiliary_metrics["tuned"] = tune_auxiliary_thresholds(auxiliary_samples)
     return {
         "dataset": args.dataset,
         "checkpoint": args.checkpoint,
@@ -139,7 +150,7 @@ def run(args: argparse.Namespace) -> dict:
         "budget": args.budget,
         "metrics": {"context_selector": average_metrics(metrics)},
         "reason_metrics": summarize_reasons(reason_totals, confusion),
-        "auxiliary_metrics": summarize_auxiliary(auxiliary_totals),
+        "auxiliary_metrics": auxiliary_metrics,
     }
 
 
@@ -197,6 +208,46 @@ def summarize_auxiliary(totals: dict[str, dict[str, int]]) -> dict:
     }
 
 
+def tune_auxiliary_thresholds(samples: dict[str, list[tuple[float, bool]]]) -> dict:
+    thresholds = [index / 20.0 for index in range(1, 20)]
+    per_label = {}
+    totals = {}
+    for label in AUXILIARY_LABELS:
+        best_threshold = 0.5
+        best_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+        best_f1 = -1.0
+        for threshold in thresholds:
+            counts = counts_for_threshold(samples[label], threshold)
+            precision = counts["tp"] / max(1, counts["tp"] + counts["fp"])
+            recall = counts["tp"] / max(1, counts["tp"] + counts["fn"])
+            f1 = 2.0 * precision * recall / max(1e-6, precision + recall)
+            if f1 > best_f1 or (f1 == best_f1 and abs(threshold - 0.5) < abs(best_threshold - 0.5)):
+                best_f1 = f1
+                best_threshold = threshold
+                best_counts = counts
+        totals[label] = best_counts
+        per_label[label] = {"threshold": best_threshold, "f1": best_f1}
+    summary = summarize_auxiliary(totals)
+    for label, details in per_label.items():
+        summary["per_label"][label]["threshold"] = details["threshold"]
+    return summary
+
+
+def counts_for_threshold(samples: list[tuple[float, bool]], threshold: float) -> dict[str, int]:
+    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
+    for score, expected in samples:
+        predicted = score >= threshold
+        if predicted and expected:
+            counts["tp"] += 1
+        elif predicted:
+            counts["fp"] += 1
+        elif expected:
+            counts["fn"] += 1
+        else:
+            counts["tn"] += 1
+    return counts
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="data/synthetic/librarian_hard_cases.jsonl")
@@ -204,6 +255,10 @@ def main() -> None:
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
+    parser.add_argument("--auxiliary-threshold", type=float, default=0.5)
+    parser.add_argument("--tune-auxiliary-thresholds", action="store_true")
+    parser.add_argument("--no-tune-auxiliary-thresholds", dest="tune_auxiliary_thresholds", action="store_false")
+    parser.set_defaults(tune_auxiliary_thresholds=True)
     parser.add_argument("--output-json", default="")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
