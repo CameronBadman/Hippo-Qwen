@@ -243,7 +243,7 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
-    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial"], default="longitudinal")
+    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial", "preference_shift"], default="longitudinal")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu", action="store_true")

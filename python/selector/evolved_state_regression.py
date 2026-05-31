@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
+import random
 import statistics
 import subprocess
 import sys
@@ -52,6 +54,56 @@ def split_dataset(source: Path, train_path: Path, eval_path: Path, train_fractio
                 eval_file.write(line)
                 eval_count += 1
     return train_count, eval_count
+
+
+def corrupt_card(card: dict[str, Any], rng: random.Random, mode: str) -> dict[str, Any]:
+    item = copy.deepcopy(card)
+    if mode == "none":
+        return item
+    if mode == "mild":
+        item["use_count"] = max(0, int(float(item.get("use_count") or 0) * rng.uniform(0.4, 1.8)))
+        item["evidence_count"] = max(0, int(float(item.get("evidence_count") or 0) * rng.uniform(0.5, 1.7)))
+        item["importance"] = min(0.95, max(0.05, float(item.get("importance") or 0.5) + rng.uniform(-0.18, 0.18)))
+        if rng.random() < 0.35:
+            item["last_outcome"] = rng.choice(["", "helpful", "ignored", "corrected"])
+        return item
+    if mode == "strong":
+        item["use_count"] = rng.choice([0, 0, 1, 5, 21, 89, 144])
+        item["evidence_count"] = rng.choice([0, 1, 3, 8, 21, 55])
+        item["importance"] = rng.choice([0.08, 0.18, 0.35, 0.65, 0.82, 0.94])
+        item["last_outcome"] = rng.choice(["", "helpful", "ignored", "corrected"])
+        if rng.random() < 0.2:
+            item["age_days"] = rng.choice([0, 1, 14, 180, 365, 720])
+        return item
+    raise ValueError(f"unknown corruption mode: {mode}")
+
+
+def corrupt_eval_dataset(args: argparse.Namespace, source: Path, output: Path, seed: int) -> Path:
+    if args.eval_state_corruption == "none":
+        return source
+    if output.exists() and not args.force:
+        print(f"using existing corrupted eval dataset {output}", flush=True)
+        return output
+    rng = random.Random(seed + 17000)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with source.open("r", encoding="utf-8") as src, output.open("w", encoding="utf-8") as dst:
+        for line in src:
+            if not line.strip():
+                continue
+            row = json.loads(line)
+            if rng.random() < args.state_corruption_rate:
+                row["anchor"] = corrupt_card(row["anchor"], rng, args.eval_state_corruption)
+            row["candidates"] = [
+                corrupt_card(candidate, rng, args.eval_state_corruption) if rng.random() < args.state_corruption_rate else candidate
+                for candidate in row.get("candidates", [])
+            ]
+            row["state_corruption"] = {
+                "mode": args.eval_state_corruption,
+                "rate": args.state_corruption_rate,
+                "seed": seed,
+            }
+            dst.write(json.dumps(row) + "\n")
+    return output
 
 
 def generate_dataset(args: argparse.Namespace, repo: Path, seed_dir: Path, seed: int) -> Path:
@@ -241,6 +293,8 @@ def write_markdown(summary: dict[str, Any], path: Path) -> None:
         f"- eval limit: `{summary['eval_limit']}`",
         f"- evolved variant: `{summary['evolved_variant']}`",
         f"- selector post-rank bias: `{summary['selector_post_rank_bias']}`",
+        f"- eval state corruption: `{summary['eval_state_corruption']}`",
+        f"- state corruption rate: `{summary['state_corruption_rate']}`",
         "",
         "## Aggregate",
         "",
@@ -299,6 +353,7 @@ def run_seed(args: argparse.Namespace, repo: Path, seed: int) -> dict[str, Any]:
     train_path = seed_dir / "train.jsonl"
     eval_path = seed_dir / "eval.jsonl"
     train_cases, eval_cases = split_dataset(base, train_path, eval_path, args.train_fraction, args.force)
+    benchmark_eval_path = corrupt_eval_dataset(args, eval_path, seed_dir / f"eval_state_{args.eval_state_corruption}.jsonl", seed)
     evolved_train = seed_dir / "train_evolved.jsonl"
     evolve_training_data(args, repo, train_path, evolved_train, seed)
 
@@ -307,8 +362,9 @@ def run_seed(args: argparse.Namespace, repo: Path, seed: int) -> dict[str, Any]:
     train_selector(args, repo, train_path, raw_checkpoint, seed)
     train_selector(args, repo, evolved_train, augmented_checkpoint, seed)
 
-    raw_result = run_evolution_benchmark(args, repo, eval_path, raw_checkpoint, seed_dir / "raw_evolution.json")
-    augmented_result = run_evolution_benchmark(args, repo, eval_path, augmented_checkpoint, seed_dir / "evolved_state_evolution.json")
+    suffix = f"_{args.eval_state_corruption}" if args.eval_state_corruption != "none" else ""
+    raw_result = run_evolution_benchmark(args, repo, benchmark_eval_path, raw_checkpoint, seed_dir / f"raw_evolution{suffix}.json")
+    augmented_result = run_evolution_benchmark(args, repo, benchmark_eval_path, augmented_checkpoint, seed_dir / f"evolved_state_evolution{suffix}.json")
     return {
         "seed": seed,
         "train_cases": train_cases,
@@ -317,6 +373,7 @@ def run_seed(args: argparse.Namespace, repo: Path, seed: int) -> dict[str, Any]:
             "base": str(base),
             "train": str(train_path),
             "eval": str(eval_path),
+            "benchmark_eval": str(benchmark_eval_path),
             "evolved_train": str(evolved_train),
             "raw_checkpoint": str(raw_checkpoint),
             "evolved_state_checkpoint": str(augmented_checkpoint),
@@ -336,7 +393,9 @@ def main() -> None:
     parser.add_argument("--train-fraction", type=float, default=0.75)
     parser.add_argument("--eval-limit", type=int, default=1000)
     parser.add_argument("--candidates", type=int, default=32)
-    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial"], default="adversarial")
+    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial", "preference_shift"], default="adversarial")
+    parser.add_argument("--eval-state-corruption", choices=["none", "mild", "strong"], default="none")
+    parser.add_argument("--state-corruption-rate", type=float, default=0.35)
     parser.add_argument("--evolution-passes", type=int, default=2)
     parser.add_argument("--feedback-scorer", choices=["heuristic_graph", "vector_only", "oracle"], default="heuristic_graph")
     parser.add_argument("--evolution-policies", default="off,always")
@@ -370,6 +429,8 @@ def main() -> None:
         "eval_limit": args.eval_limit,
         "candidates": args.candidates,
         "scenario": args.scenario,
+        "eval_state_corruption": args.eval_state_corruption,
+        "state_corruption_rate": args.state_corruption_rate,
         "evolution_passes": args.evolution_passes,
         "feedback_scorer": args.feedback_scorer,
         "evolution_policies": args.evolution_policies,

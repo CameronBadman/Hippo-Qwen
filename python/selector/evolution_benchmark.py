@@ -515,7 +515,7 @@ def main() -> None:
     parser.add_argument("--checkpoint", default="")
     parser.add_argument("--cases", type=int, default=2000)
     parser.add_argument("--candidates", type=int, default=32)
-    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial"], default="adversarial")
+    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial", "preference_shift"], default="adversarial")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--top-k", type=int, default=8)

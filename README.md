@@ -240,6 +240,21 @@ python3 -m python.selector.evolved_state_regression \
 The regression writes per-seed checkpoints and aggregate `summary.json` /
 `summary.md` reports. By default it evaluates `always@0`, which means online
 memory-state mutation is enabled but selector post-rank graph bias remains off.
+Use `--scenario preference_shift` to stress changing user preferences, where
+old high-use memories conflict with newer corrections. Use
+`--eval-state-corruption mild` or `--eval-state-corruption strong` to perturb
+`use_count`, `evidence_count`, `importance`, `last_outcome`, and sometimes age
+at evaluation time:
+
+```bash
+python3 -m python.selector.evolved_state_regression \
+  --work-dir artifacts/librarian/preference_shift_corrupt \
+  --scenario preference_shift \
+  --eval-state-corruption mild \
+  --seeds 61,63,65 \
+  --cases 5000 \
+  --epochs 4
+```
 
 Run a temporal evaluation that trains on earlier generated cases and tests on
 later cases:
