@@ -6,13 +6,13 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from .features import DEFAULT_DIMS, EDGE_TYPES
+from .features import DEFAULT_DIMS, DEFAULT_FEATURE_DIMS, EDGE_TYPES
 
 
 @dataclass
 class ModelConfig:
     embedding_dim: int = DEFAULT_DIMS
-    feature_dim: int = 8
+    feature_dim: int = DEFAULT_FEATURE_DIMS
     d_model: int = 128
     num_layers: int = 4
     num_heads: int = 4
@@ -90,4 +90,3 @@ def load_checkpoint(path: str | Path, device: torch.device | str = "cpu") -> Nei
     model.load_state_dict(checkpoint["state_dict"])
     model.eval()
     return model
-

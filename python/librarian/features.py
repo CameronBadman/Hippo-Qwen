@@ -5,6 +5,7 @@ import re
 from typing import Any
 
 DEFAULT_DIMS = 64
+DEFAULT_FEATURE_DIMS = 16
 EDGE_TYPES = [
     "same_cluster",
     "same_context",
@@ -138,7 +139,17 @@ def heuristic_action(anchor: dict[str, Any], candidate: dict[str, Any]) -> dict[
     )
     meta = metadata_score(anchor, candidate)
     cluster = cluster_score(anchor, candidate)
-    score = 0.35 * semantic + 0.20 * lexical + 0.20 * meta + 0.15 * cluster + 0.05
+    state = state_features(anchor, candidate)
+    state_adjustment = (
+        0.08 * state["candidate_use_norm"]
+        + 0.06 * state["candidate_evidence_norm"]
+        + 0.05 * state["protected_flag"]
+        + 0.08 * max(0.0, state["last_outcome_value"])
+        - 0.16 * state["stale_unused_flag"]
+        - 0.10 * max(0.0, -state["last_outcome_value"])
+    )
+    score = 0.35 * semantic + 0.20 * lexical + 0.20 * meta + 0.15 * cluster + 0.05 + state_adjustment
+    score = clamp(score, 0.0, 1.0)
     edge_type = infer_edge_type(anchor, candidate, lexical, meta)
     return {
         "candidate_id": candidate["id"],
@@ -154,7 +165,7 @@ def heuristic_action(anchor: dict[str, Any], candidate: dict[str, Any]) -> dict[
     }
 
 
-def candidate_features(anchor: dict[str, Any], candidate: dict[str, Any]) -> list[float]:
+def candidate_features(anchor: dict[str, Any], candidate: dict[str, Any], feature_dim: int = DEFAULT_FEATURE_DIMS) -> list[float]:
     ensure_embedding(anchor)
     ensure_embedding(candidate)
     semantic = cosine(anchor["embedding"], candidate["embedding"])
@@ -165,7 +176,8 @@ def candidate_features(anchor: dict[str, Any], candidate: dict[str, Any]) -> lis
     candidate_importance = float(candidate.get("importance") or 0.5)
     anchor_len = max(1, len(tokens(anchor.get("text", ""))))
     candidate_len = max(1, len(tokens(candidate.get("text", ""))))
-    return [
+    state = state_features(anchor, candidate)
+    features = [
         semantic,
         lexical,
         meta,
@@ -174,7 +186,57 @@ def candidate_features(anchor: dict[str, Any], candidate: dict[str, Any]) -> lis
         candidate_importance,
         min(anchor_len, candidate_len) / max(anchor_len, candidate_len),
         min(candidate_len / 64.0, 1.0),
+        state["anchor_age_norm"],
+        state["candidate_age_norm"],
+        state["candidate_use_norm"],
+        state["candidate_evidence_norm"],
+        state["last_outcome_value"],
+        state["protected_flag"],
+        state["stale_unused_flag"],
+        state["recency_score"],
     ]
+    if feature_dim <= len(features):
+        return features[:feature_dim]
+    return features + [0.0] * (feature_dim - len(features))
+
+
+def state_features(anchor: dict[str, Any], candidate: dict[str, Any]) -> dict[str, float]:
+    anchor_age = numeric_value(anchor, "age_days", 0.0)
+    candidate_age = numeric_value(candidate, "age_days", 0.0)
+    use_count = numeric_value(candidate, "use_count", 0.0)
+    evidence_count = numeric_value(candidate, "evidence_count", 0.0)
+    last_outcome = str(candidate.get("last_outcome") or "").lower()
+    last_outcome_value = {
+        "helpful": 1.0,
+        "corrected": 0.35,
+        "ignored": -0.65,
+    }.get(last_outcome, 0.0)
+    protected = 1.0 if bool(candidate.get("protected")) else 0.0
+    candidate_age_norm = clamp(candidate_age / 365.0, 0.0, 1.0)
+    candidate_use_norm = clamp(math.log1p(use_count) / math.log1p(100.0), 0.0, 1.0)
+    candidate_evidence_norm = clamp(math.log1p(evidence_count) / math.log1p(50.0), 0.0, 1.0)
+    stale_unused = 1.0 if candidate_age >= 180.0 and use_count <= 0 and protected == 0.0 else 0.0
+    return {
+        "anchor_age_norm": clamp(anchor_age / 365.0, 0.0, 1.0),
+        "candidate_age_norm": candidate_age_norm,
+        "candidate_use_norm": candidate_use_norm,
+        "candidate_evidence_norm": candidate_evidence_norm,
+        "last_outcome_value": last_outcome_value,
+        "protected_flag": protected,
+        "stale_unused_flag": stale_unused,
+        "recency_score": 1.0 - candidate_age_norm,
+    }
+
+
+def numeric_value(card: dict[str, Any], key: str, default: float) -> float:
+    value = card.get(key)
+    if value is None:
+        metadata = card.get("metadata") or {}
+        value = metadata.get(key)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def ensure_embedding(card: dict[str, Any], dims: int = DEFAULT_DIMS) -> None:
@@ -194,4 +256,3 @@ def decay_for_edge(edge_type: str) -> float:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
-

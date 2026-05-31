@@ -10,7 +10,7 @@ from pathlib import Path
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from python.librarian.features import EDGE_TYPES, embed_text, heuristic_action
+from python.librarian.features import EDGE_TYPE_TO_ID, EDGE_TYPES, embed_text, heuristic_action
 
 
 PROJECTS = ["hippograph", "resume", "printer", "research-notes", "home-network", "colab-training"]
@@ -62,6 +62,11 @@ def build_history(seed: int, count: int) -> list[dict]:
                 "positive_edge_hints": [project, preference],
                 "preference": preference,
                 "task": task,
+                "age_days": rng.choice([1, 3, 7, 14, 30, 90, 180, 365]),
+                "use_count": rng.choice([0, 0, 1, 2, 5, 13, 34]),
+                "evidence_count": rng.choice([0, 1, 2, 3, 5, 8]),
+                "last_outcome": rng.choice(["", "", "", "helpful", "ignored", "corrected"]),
+                "protected": rng.random() < 0.08,
             }
         )
     return rows
@@ -78,7 +83,31 @@ def memory_card(row: dict, index: int) -> dict:
         "importance": 0.4 + (index % 5) * 0.1,
         "cluster": cluster,
         "metadata": metadata,
+        "age_days": row.get("age_days", 0),
+        "use_count": row.get("use_count", 0),
+        "evidence_count": row.get("evidence_count", 0),
+        "last_outcome": row.get("last_outcome", ""),
+        "protected": bool(row.get("protected", False)),
     }
+
+
+def generated_card(anchor: dict, text: str, role: str, idx: int, slot: int, **state: object) -> dict:
+    card = {
+        "id": f"{role}_{idx}_{slot}",
+        "text": text,
+        "summary": "",
+        "embedding": embed_text(text),
+        "importance": float(state.pop("importance", 0.35)),
+        "cluster": str(state.pop("cluster", anchor.get("cluster", ""))),
+        "metadata": {"project": str(state.pop("project", anchor.get("cluster", "")))},
+        "age_days": int(state.pop("age_days", 0)),
+        "use_count": int(state.pop("use_count", 0)),
+        "evidence_count": int(state.pop("evidence_count", 0)),
+        "last_outcome": str(state.pop("last_outcome", "")),
+        "protected": bool(state.pop("protected", False)),
+        "synthetic_role": role,
+    }
+    return card
 
 
 def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
@@ -93,6 +122,7 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
     for idx in range(count):
         anchor = cards[idx]
         anchor_preference = rows[idx]["preference"]
+        anchor_task = rows[idx]["task"]
         excluded = {idx}
         same_project_indexes = [card_index for card_index in by_project[anchor["cluster"]] if card_index != idx]
         same_preference_indexes = [
@@ -100,56 +130,147 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
             for card_index in by_preference[anchor_preference]
             if card_index != idx and cards[card_index]["cluster"] != anchor["cluster"]
         ]
-        positive_target = max(1, candidates // 4)
-        hard_target = max(1, candidates // 8)
+        positive_target = max(2, candidates // 5)
+        hard_target = max(2, candidates // 8)
+        chosen_roles: list[tuple[dict, str]] = []
         chosen_indexes = rng.sample(same_project_indexes, min(len(same_project_indexes), positive_target))
         excluded.update(chosen_indexes)
         preference_sample = rng.sample(same_preference_indexes, min(len(same_preference_indexes), hard_target))
         chosen_indexes.extend(preference_sample)
         excluded.update(preference_sample)
-        chosen = [cards[card_index] for card_index in chosen_indexes]
-        other_target = max(0, candidates // 4 - len(chosen))
+        for card_index in chosen_indexes:
+            role = "cross_relevant" if card_index in preference_sample else "relevant"
+            chosen_roles.append((cards[card_index], role))
+
+        for slot in range(max(2, candidates // 8)):
+            text = f"{anchor['cluster']}: {rng.choice(NOISE)}. Not useful for {anchor_task}."
+            chosen_roles.append(
+                (
+                    generated_card(anchor, text, "same_project_hard_negative", idx, slot, age_days=7, use_count=0),
+                    "same_project_hard_negative",
+                )
+            )
+        for slot in range(max(2, candidates // 8)):
+            text = f"{anchor['cluster']}: old note about {anchor_task}. Superseded and no longer useful."
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        text,
+                        "stale_negative",
+                        idx,
+                        slot,
+                        age_days=365,
+                        use_count=0,
+                        evidence_count=0,
+                        last_outcome="ignored",
+                        importance=0.2,
+                    ),
+                    "stale_negative",
+                )
+            )
+        duplicate_text = f"{anchor['text']} Duplicate wording captured again."
+        chosen_roles.append(
+            (
+                generated_card(anchor, duplicate_text, "near_duplicate", idx, 0, age_days=1, use_count=0, importance=0.25),
+                "near_duplicate",
+            )
+        )
+
+        other_target = max(0, candidates // 4 - len(chosen_roles))
         for _ in range(other_target):
             for _attempt in range(32):
                 card_index = rng.randrange(len(cards))
                 card = cards[card_index]
                 if card_index not in excluded and card["cluster"] != anchor["cluster"]:
-                    chosen.append(card)
+                    chosen_roles.append((card, "other_negative"))
                     excluded.add(card_index)
                     break
-        while len(chosen) < candidates:
+        while len(chosen_roles) < candidates:
             noise_text = f"{rng.choice(NOISE)}. Reference {rng.randint(1000, 9999)}."
-            chosen.append(
-                {
-                    "id": f"noise_{idx}_{len(chosen)}",
-                    "text": noise_text,
-                    "summary": "",
-                    "embedding": embed_text(noise_text),
-                    "importance": 0.2,
-                    "cluster": "noise",
-                    "metadata": {"project": "noise"},
-                }
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        noise_text,
+                        "noise_negative",
+                        idx,
+                        len(chosen_roles),
+                        cluster="noise",
+                        project="noise",
+                        age_days=rng.choice([3, 30, 180]),
+                        use_count=0,
+                        importance=0.2,
+                    ),
+                    "noise_negative",
+                )
             )
-        rng.shuffle(chosen)
-        actions = [heuristic_action(anchor, candidate) for candidate in chosen]
+        chosen_roles = chosen_roles[:candidates]
+        rng.shuffle(chosen_roles)
+        chosen = [item[0] for item in chosen_roles]
+        roles = [item[1] for item in chosen_roles]
+        actions = [action_for_role(anchor, candidate, role) for candidate, role in chosen_roles]
+        relevant_ids = [candidate["id"] for candidate, role in chosen_roles if role in ("relevant", "cross_relevant")]
         yield {
             "anchor": anchor,
             "candidates": chosen,
             "labels": {
                 "attach": [action["attach"] for action in actions],
+                "rank": [action["rank"] for action in actions],
                 "edge_type": [action["edge_type_id"] for action in actions],
                 "weight": [action["weight"] for action in actions],
                 "confidence": [action["confidence"] for action in actions],
                 "decay_rate": [action["decay_rate"] for action in actions],
                 "importance_delta": [action["importance_delta"] for action in actions],
             },
-            "teacher": "heuristic_v0",
+            "retrieval_task": {
+                "query": f"Find memories useful for {anchor['cluster']} when the user {anchor_task} and {anchor_preference}.",
+                "relevant_ids": relevant_ids,
+                "budget": 900,
+            },
+            "teacher": "synthetic_retrieval_v1",
+            "schema_version": 2,
             "edge_types": EDGE_TYPES,
         }
 
 
 def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
     return list(iter_cases(seed, count, candidates))
+
+
+def action_for_role(anchor: dict, candidate: dict, role: str) -> dict:
+    action = heuristic_action(anchor, candidate)
+    if role in ("relevant", "cross_relevant"):
+        action["attach"] = 1.0
+        action["rank"] = 1.0
+        action["connect_score"] = max(action["connect_score"], 0.68)
+        action["confidence"] = max(action["confidence"], 0.68)
+        action["weight"] = max(action["weight"], 0.8)
+        if role == "cross_relevant":
+            action["edge_type"] = "preference"
+            action["edge_type_id"] = EDGE_TYPE_TO_ID["preference"]
+            action["decay_rate"] = 0.005
+        return action
+    if role == "near_duplicate":
+        action["attach"] = 1.0
+        action["rank"] = 0.35
+        action["connect_score"] = 0.42
+        action["edge_type"] = "same_context"
+        action["edge_type_id"] = EDGE_TYPE_TO_ID["same_context"]
+        action["weight"] = 0.28
+        action["confidence"] = 0.55
+        action["decay_rate"] = 0.02
+        action["importance_delta"] = -0.01
+        return action
+    action["attach"] = 0.0
+    action["rank"] = 0.0
+    action["connect_score"] = min(action["connect_score"], 0.18)
+    action["weight"] = min(action["weight"], 0.25)
+    action["confidence"] = min(action["confidence"], 0.25)
+    action["importance_delta"] = min(action["importance_delta"], 0.0)
+    if role == "stale_negative":
+        action["decay_rate"] = 0.04
+    return action
 
 
 def main() -> None:

@@ -7,13 +7,14 @@ from typing import Any
 import torch
 from torch.utils.data import Dataset
 
-from python.librarian.features import EDGE_TYPES, candidate_features, ensure_embedding
+from python.librarian.features import DEFAULT_FEATURE_DIMS, EDGE_TYPES, candidate_features, ensure_embedding
 
 
 class NeighborhoodDataset(Dataset):
-    def __init__(self, path: str | Path, max_candidates: int):
+    def __init__(self, path: str | Path, max_candidates: int, feature_dim: int = DEFAULT_FEATURE_DIMS):
         self.path = Path(path)
         self.max_candidates = max_candidates
+        self.feature_dim = feature_dim
         with self.path.open("r", encoding="utf-8") as handle:
             self.rows = [json.loads(line) for line in handle if line.strip()]
 
@@ -29,9 +30,10 @@ class NeighborhoodDataset(Dataset):
         emb_dim = len(anchor["embedding"])
 
         candidate_embeddings = torch.zeros((self.max_candidates, emb_dim), dtype=torch.float32)
-        pair_features = torch.zeros((self.max_candidates, 8), dtype=torch.float32)
+        pair_features = torch.zeros((self.max_candidates, self.feature_dim), dtype=torch.float32)
         mask = torch.zeros((self.max_candidates,), dtype=torch.bool)
         attach = torch.zeros((self.max_candidates,), dtype=torch.float32)
+        rank = torch.zeros((self.max_candidates,), dtype=torch.float32)
         edge_type = torch.zeros((self.max_candidates,), dtype=torch.long)
         weight = torch.zeros((self.max_candidates,), dtype=torch.float32)
         confidence = torch.zeros((self.max_candidates,), dtype=torch.float32)
@@ -41,9 +43,10 @@ class NeighborhoodDataset(Dataset):
         for idx, candidate in enumerate(candidates):
             ensure_embedding(candidate)
             candidate_embeddings[idx] = torch.tensor(candidate["embedding"], dtype=torch.float32)
-            pair_features[idx] = torch.tensor(candidate_features(anchor, candidate), dtype=torch.float32)
+            pair_features[idx] = torch.tensor(candidate_features(anchor, candidate, self.feature_dim), dtype=torch.float32)
             mask[idx] = True
             attach[idx] = float(labels["attach"][idx])
+            rank[idx] = float(labels.get("rank", labels["attach"])[idx])
             edge_type[idx] = int(labels["edge_type"][idx])
             weight[idx] = float(labels["weight"][idx])
             confidence[idx] = float(labels["confidence"][idx])
@@ -56,10 +59,10 @@ class NeighborhoodDataset(Dataset):
             "pair_features": pair_features,
             "mask": mask,
             "attach": attach,
+            "rank": rank,
             "edge_type": edge_type.clamp(0, len(EDGE_TYPES) - 1),
             "weight": weight,
             "confidence": confidence,
             "decay_rate": decay_rate,
             "importance_delta": importance_delta,
         }
-

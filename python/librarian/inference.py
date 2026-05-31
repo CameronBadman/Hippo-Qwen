@@ -5,7 +5,9 @@ from typing import Any
 from .features import EDGE_TYPES, activation_mask_for_edge, candidate_features, ensure_embedding, heuristic_action
 
 
-def tensorize_payload(payload: dict[str, Any], max_candidates: int) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]]]:
+def tensorize_payload(
+    payload: dict[str, Any], max_candidates: int, feature_dim: int
+) -> tuple[dict[str, torch.Tensor], list[dict[str, Any]]]:
     import torch
 
     anchor = dict(payload["anchor"])
@@ -17,11 +19,11 @@ def tensorize_payload(payload: dict[str, Any], max_candidates: int) -> tuple[dic
     emb_dim = len(anchor["embedding"])
     anchor_tensor = torch.tensor(anchor["embedding"], dtype=torch.float32).unsqueeze(0)
     candidate_tensor = torch.zeros((1, max_candidates, emb_dim), dtype=torch.float32)
-    feature_tensor = torch.zeros((1, max_candidates, 8), dtype=torch.float32)
+    feature_tensor = torch.zeros((1, max_candidates, feature_dim), dtype=torch.float32)
     mask = torch.zeros((1, max_candidates), dtype=torch.bool)
     for idx, candidate in enumerate(candidates):
         candidate_tensor[0, idx] = torch.tensor(candidate["embedding"], dtype=torch.float32)
-        feature_tensor[0, idx] = torch.tensor(candidate_features(anchor, candidate), dtype=torch.float32)
+        feature_tensor[0, idx] = torch.tensor(candidate_features(anchor, candidate, feature_dim), dtype=torch.float32)
         mask[0, idx] = True
     return {
         "anchor": anchor_tensor,
@@ -34,7 +36,7 @@ def tensorize_payload(payload: dict[str, Any], max_candidates: int) -> tuple[dic
 def score_with_model(model: Any, payload: dict[str, Any], threshold: float = 0.5) -> dict[str, Any]:
     import torch
 
-    tensors, candidates = tensorize_payload(payload, model.config.max_candidates)
+    tensors, candidates = tensorize_payload(payload, model.config.max_candidates, model.config.feature_dim)
     with torch.no_grad():
         device = next(model.parameters()).device
         tensors = {key: value.to(device) for key, value in tensors.items()}
