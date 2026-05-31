@@ -303,6 +303,7 @@ def evaluate_variant(
     gate_margin: float,
     low_confidence_score: float,
     low_spread: float,
+    allow_bias: bool,
 ) -> dict[str, Any]:
     if policy == "off":
         metrics = []
@@ -316,6 +317,7 @@ def evaluate_variant(
         return {
             "policy": policy,
             "bias_scale": bias_scale,
+            "bias_enabled": False,
             "applied_rate": 0.0,
             "evolved": summarize_windows(metrics),
             "feedback": {},
@@ -334,7 +336,11 @@ def evaluate_variant(
         evolved_row = state.apply(row)
         base_ranked = scorer(evolved_row)
         confidence = confidence_features(base_ranked, top_k)
-        effective_scale = policy_bias_scale(policy, bias_scale, confidence, gate_margin, low_confidence_score, low_spread)
+        effective_scale = (
+            policy_bias_scale(policy, bias_scale, confidence, gate_margin, low_confidence_score, low_spread)
+            if allow_bias
+            else 0.0
+        )
         evolved_ranked = state.rerank(evolved_row, base_ranked, effective_scale)
         evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
         merge_role_counts(evolved_roles, role_exposure(row, evolved_ranked, budget))
@@ -346,6 +352,7 @@ def evaluate_variant(
     return {
         "policy": policy,
         "bias_scale": bias_scale,
+        "bias_enabled": allow_bias,
         "applied_rate": applied_count / max(1, len(rows)),
         "evolved": summarize_windows(evolved_metrics),
         "feedback": dict(sorted(feedback.items())),
@@ -365,6 +372,7 @@ def evaluate_online(
     gate_margin: float,
     low_confidence_score: float,
     low_spread: float,
+    selector_post_rank_bias: bool,
 ) -> dict[str, Any]:
     results: dict[str, Any] = {}
     for name, scorer in scorers.items():
@@ -380,6 +388,7 @@ def evaluate_online(
         for policy in policies:
             for bias_scale in bias_scales:
                 key = f"{policy}@{bias_scale:g}"
+                allow_bias = name != "context_selector" or selector_post_rank_bias
                 variant = evaluate_variant(
                     rows,
                     scorer,
@@ -390,6 +399,7 @@ def evaluate_online(
                     gate_margin,
                     low_confidence_score,
                     low_spread,
+                    allow_bias,
                 )
                 variant["delta"] = {
                     "overall": metric_delta(variant["evolved"]["overall"], static_summary["overall"]),
@@ -465,21 +475,23 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- budget: `{result['budget']}`",
         f"- policies: `{', '.join(result['evolution_policies'])}`",
         f"- bias scales: `{', '.join(str(item) for item in result['evolution_bias_scales'])}`",
+        f"- selector post-rank bias: `{result['selector_post_rank_bias']}`",
         "",
-        "| method | policy | scale | applied | recall@k | context precision | context recall | noise |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| method | policy | scale | bias | applied | recall@k | context precision | context recall | noise |",
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, item in result["methods"].items():
         static = item["static"]["overall"]
         lines.append(
-            f"| {name} | static | 0 | 0.0000 | {static.get('recall_at_k', 0.0):.4f} | "
+            f"| {name} | static | 0 | off | 0.0000 | {static.get('recall_at_k', 0.0):.4f} | "
             f"{static.get('context_precision', 0.0):.4f} | {static.get('context_recall', 0.0):.4f} | "
             f"{static.get('noise', 0.0):.2f} |"
         )
         for variant in item["variants"].values():
             metrics = variant["evolved"]["overall"]
+            bias = "on" if variant.get("bias_enabled") else "off"
             lines.append(
-                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | {variant.get('applied_rate', 0.0):.4f} | "
+                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | {bias} | {variant.get('applied_rate', 0.0):.4f} | "
                 f"{metrics.get('recall_at_k', 0.0):.4f} | "
                 f"{metrics.get('context_precision', 0.0):.4f} | {metrics.get('context_recall', 0.0):.4f} | "
                 f"{metrics.get('noise', 0.0):.2f} |"
@@ -517,6 +529,7 @@ def main() -> None:
     parser.add_argument("--gate-margin", type=float, default=0.03)
     parser.add_argument("--low-confidence-score", type=float, default=0.72)
     parser.add_argument("--low-spread", type=float, default=0.18)
+    parser.add_argument("--selector-post-rank-bias", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
@@ -536,6 +549,7 @@ def main() -> None:
         "gate_margin": args.gate_margin,
         "low_confidence_score": args.low_confidence_score,
         "low_spread": args.low_spread,
+        "selector_post_rank_bias": args.selector_post_rank_bias,
         "methods": evaluate_online(
             rows,
             build_scorers(args),
@@ -546,6 +560,7 @@ def main() -> None:
             args.gate_margin,
             args.low_confidence_score,
             args.low_spread,
+            args.selector_post_rank_bias,
         ),
     }
     body = json.dumps(result, indent=2)

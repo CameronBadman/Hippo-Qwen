@@ -205,6 +205,9 @@ python3 -m python.selector.evolution_benchmark \
 
 Pass `--checkpoint artifacts/librarian/temporal_eval/multi_seed_full.pt` to
 include the transformer context selector in the same static-vs-evolved loop.
+For selector checkpoints, post-rank graph bias is disabled by default so the
+benchmark measures evolved memory state as model input; pass
+`--selector-post-rank-bias` only when explicitly testing external reranking.
 
 To train the selector on the same evolved state it sees online, expand a case
 file with simulated feedback first:
