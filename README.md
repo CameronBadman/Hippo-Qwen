@@ -268,6 +268,25 @@ python3 -m python.selector.temporal_evaluation \
   --epochs 6
 ```
 
+Run a stress matrix when you want one report across multiple hard scenarios and
+state-corruption settings. This is the best Colab entry point for deciding
+whether the evolved-state selector is robust enough to keep:
+
+```bash
+python3 -m python.selector.stress_matrix \
+  --work-dir artifacts/librarian/stress_matrix \
+  --scenarios adversarial,preference_shift \
+  --eval-state-corruptions none,mild \
+  --seeds 51,53,55 \
+  --cases 5000 \
+  --epochs 4
+```
+
+The matrix reuses `evolved_state_regression`, writes one subdirectory per
+scenario/corruption pair, and produces `stress_matrix_summary.json` plus
+`stress_matrix_summary.md` with recall, precision, noise, and second-half drift
+readouts.
+
 Inspect selector failures by synthetic role:
 
 ```bash
