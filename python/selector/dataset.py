@@ -20,6 +20,8 @@ from python.librarian.features import (
     tokens,
 )
 
+PREFERENCE_MARKERS = {"preference", "prefer", "prefers", "preferred", "wants", "likes", "avoids", "needs"}
+
 
 class ContextSelectorDataset(Dataset):
     def __init__(self, path: str | Path, max_candidates: int = 32, budget_tokens: int = 90, feature_dim: int = 16):
@@ -84,6 +86,8 @@ def selector_features(
     anchor_len = max(1, len(tokens(anchor.get("text", ""))))
     query_len = max(1, len(tokens(query)))
     metadata = candidate.get("metadata") or {}
+    preference = preference_features(anchor.get("text", ""), candidate.get("text", ""))
+    cluster = cluster_score(anchor, candidate)
     features = [
         cosine(query_embedding, candidate["embedding"]),
         jaccard(query, candidate.get("text", "")),
@@ -96,7 +100,10 @@ def selector_features(
         cosine(anchor["embedding"], candidate["embedding"]),
         jaccard(anchor.get("text", ""), candidate.get("text", "")),
         metadata_score(anchor, candidate),
-        cluster_score(anchor, candidate),
+        cluster,
+        preference["overlap"],
+        preference["conflict"],
+        preference["same_context_conflict"] * cluster,
         float(anchor.get("importance") or 0.5),
         min(anchor_len, candidate_len) / max(anchor_len, candidate_len),
         state["candidate_age_norm"],
@@ -111,3 +118,31 @@ def selector_features(
     if feature_dim <= len(features):
         return features[:feature_dim]
     return features + [0.0] * (feature_dim - len(features))
+
+
+def preference_terms(text: str) -> set[str]:
+    raw_tokens = tokens(text)
+    terms: set[str] = set()
+    for idx, token in enumerate(raw_tokens):
+        if token not in PREFERENCE_MARKERS:
+            continue
+        terms.update(raw_tokens[idx + 1 : idx + 5])
+    return {term for term in terms if len(term) > 1}
+
+
+def preference_features(anchor_text: str, candidate_text: str) -> dict[str, float]:
+    anchor_terms = preference_terms(anchor_text)
+    candidate_terms = preference_terms(candidate_text)
+    if not anchor_terms or not candidate_terms:
+        return {
+            "overlap": 0.0,
+            "conflict": 0.0,
+            "same_context_conflict": 0.0,
+        }
+    overlap = len(anchor_terms & candidate_terms) / len(anchor_terms | candidate_terms)
+    conflict = 1.0 if overlap < 0.34 else 0.0
+    return {
+        "overlap": overlap,
+        "conflict": conflict,
+        "same_context_conflict": conflict,
+    }

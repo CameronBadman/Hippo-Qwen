@@ -125,7 +125,11 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
         anchor_preference = rows[idx]["preference"]
         anchor_task = rows[idx]["task"]
         excluded = {idx}
-        same_project_indexes = [card_index for card_index in by_project[anchor["cluster"]] if card_index != idx]
+        same_project_indexes = [
+            card_index
+            for card_index in by_project[anchor["cluster"]]
+            if card_index != idx and rows[card_index]["preference"] == anchor_preference
+        ]
         same_preference_indexes = [
             card_index
             for card_index in by_preference[anchor_preference]
@@ -252,7 +256,11 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
         excluded = {idx}
         chosen_roles: list[tuple[dict, str]] = []
 
-        same_project_indexes = [card_index for card_index in by_project[anchor["cluster"]] if card_index != idx]
+        same_project_indexes = [
+            card_index
+            for card_index in by_project[anchor["cluster"]]
+            if card_index != idx and rows[card_index]["preference"] == anchor_preference
+        ]
         same_preference_indexes = [
             card_index
             for card_index in by_preference[anchor_preference]
@@ -261,7 +269,8 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
 
         project_positive_target = max(2, candidates // 7)
         preference_positive_target = max(1, candidates // 10)
-        for card_index in rng.sample(same_project_indexes, min(len(same_project_indexes), project_positive_target)):
+        project_sample = rng.sample(same_project_indexes, min(len(same_project_indexes), project_positive_target))
+        for card_index in project_sample:
             card = dict(cards[card_index])
             card.update(
                 {
@@ -275,6 +284,25 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
             )
             chosen_roles.append((card, "longitudinal_relevant"))
             excluded.add(card_index)
+        for slot in range(project_positive_target - len(project_sample)):
+            text = longitudinal_text(anchor["cluster"], rng.choice(TASKS), anchor_preference, slot)
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        text,
+                        "longitudinal_relevant",
+                        idx,
+                        slot,
+                        age_days=rng.choice([1, 3, 7, 14]),
+                        use_count=rng.choice([8, 13, 21, 34]),
+                        evidence_count=rng.choice([3, 5, 8]),
+                        last_outcome="helpful",
+                        importance=0.7,
+                    ),
+                    "longitudinal_relevant",
+                )
+            )
 
         for card_index in rng.sample(same_preference_indexes, min(len(same_preference_indexes), preference_positive_target)):
             card = dict(cards[card_index])
@@ -334,7 +362,7 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
                 )
             )
 
-        for slot in range(max(2, candidates // 8)):
+        for slot in range(max(3, candidates // 6)):
             wrong_preference = rng.choice([preference for preference in PREFERENCES if preference != anchor_preference])
             text = longitudinal_text(anchor["cluster"], anchor_task, wrong_preference, slot)
             chosen_roles.append(
