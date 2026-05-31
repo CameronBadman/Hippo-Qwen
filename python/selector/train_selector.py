@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, random_split
 
-from python.selector.dataset import ContextSelectorDataset
+from python.selector.dataset import CONTEXT_REASONS, ContextSelectorDataset, reason_label
 from python.selector.model import MultiSeedContextSelector, SelectorConfig, save_selector
 
 
@@ -79,6 +79,20 @@ def reason_metrics(reason_logits: torch.Tensor, reason: torch.Tensor, mask: torc
     return {"reason_accuracy": float((predicted[valid] == reason[valid]).float().mean().detach().cpu().item())}
 
 
+def reason_class_weights(dataset: ContextSelectorDataset, device: torch.device, enabled: bool) -> torch.Tensor | None:
+    if not enabled:
+        return None
+    counts = torch.ones((len(CONTEXT_REASONS),), dtype=torch.float32)
+    for row in dataset.rows:
+        task = row.get("retrieval_task") or {}
+        relevant = set(task.get("relevant_ids") or [])
+        anchor = row.get("anchor") or {}
+        for candidate in row.get("candidates", [])[: dataset.max_candidates]:
+            counts[reason_label(anchor, candidate, candidate.get("id") in relevant)] += 1.0
+    weights = counts.sum() / (counts * len(CONTEXT_REASONS))
+    return torch.clamp(weights, max=8.0).to(device)
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     dataset = ContextSelectorDataset(args.dataset, args.max_candidates, args.budget, args.feature_dim)
@@ -100,6 +114,7 @@ def train(args: argparse.Namespace) -> None:
     )
     model = MultiSeedContextSelector(config).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    reason_weights = reason_class_weights(dataset, device, args.reason_class_balance)
 
     for epoch in range(args.epochs):
         model.train()
@@ -110,7 +125,7 @@ def train(args: argparse.Namespace) -> None:
             logits = outputs["select_logits"]
             bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
             rank = ranking_loss(logits, batch["select"], batch["mask"])
-            reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]])
+            reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]], weight=reason_weights)
             loss = bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss
             optimizer.zero_grad()
             loss.backward()
@@ -129,7 +144,7 @@ def train(args: argparse.Namespace) -> None:
                 logits = outputs["select_logits"]
                 bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
                 rank = ranking_loss(logits, batch["select"], batch["mask"])
-                reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]])
+                reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]], weight=reason_weights)
                 val_losses.append(float((bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss).detach().cpu().item()))
                 val_metrics.append(metrics(logits, batch["select"], batch["mask"], args.top_k))
                 val_reason.append(reason_metrics(outputs["reason_logits"], batch["reason"], batch["mask"]))
@@ -165,6 +180,7 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--rank-loss-weight", type=float, default=0.25)
     parser.add_argument("--reason-loss-weight", type=float, default=0.1)
+    parser.add_argument("--no-reason-class-balance", dest="reason_class_balance", action="store_false")
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
