@@ -139,6 +139,7 @@ def benchmark_selector(args: argparse.Namespace, dataset: Path, checkpoint: Path
         top_k=args.top_k,
         budget=args.budget,
         auxiliary_threshold=0.5,
+        use_checkpoint_auxiliary_thresholds=True,
         tune_auxiliary_thresholds=True,
         output_json="",
         cpu=args.cpu,

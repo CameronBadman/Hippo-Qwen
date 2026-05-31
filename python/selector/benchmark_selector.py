@@ -9,6 +9,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from python.benchmarks.benchmark_librarian import average_metrics, evaluate_ranked, load_rows
+from python.selector.calibration import default_auxiliary_thresholds, summarize_auxiliary, tune_auxiliary_thresholds
 from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS, ContextSelectorDataset
 from python.selector.model import load_selector
 
@@ -121,7 +122,10 @@ def run(args: argparse.Namespace) -> dict:
     confusion: dict[str, dict[str, int]] = {}
     auxiliary_totals = {label: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for label in AUXILIARY_LABELS}
     auxiliary_samples: dict[str, list[tuple[float, bool]]] = {label: [] for label in AUXILIARY_LABELS}
-    auxiliary_thresholds = {label: args.auxiliary_threshold for label in AUXILIARY_LABELS}
+    if args.use_checkpoint_auxiliary_thresholds:
+        auxiliary_thresholds = getattr(model, "auxiliary_thresholds", None) or default_auxiliary_thresholds(args.auxiliary_threshold)
+    else:
+        auxiliary_thresholds = default_auxiliary_thresholds(args.auxiliary_threshold)
     for row in rows:
         ranked = selector_scores(model, row, args.budget)
         metrics.append(evaluate_ranked(row, ranked, args.top_k, args.budget))
@@ -171,83 +175,6 @@ def summarize_reasons(reason_totals: dict[str, int], confusion: dict[str, dict[s
     }
 
 
-def summarize_auxiliary(totals: dict[str, dict[str, int]]) -> dict:
-    per_label = {}
-    correct = 0
-    total = 0
-    macro_f1 = 0.0
-    labelled = 0
-    for label in AUXILIARY_LABELS:
-        counts = totals[label]
-        tp = counts["tp"]
-        fp = counts["fp"]
-        fn = counts["fn"]
-        tn = counts["tn"]
-        label_total = tp + fp + fn + tn
-        precision = tp / max(1, tp + fp)
-        recall = tp / max(1, tp + fn)
-        f1 = 2.0 * precision * recall / max(1e-6, precision + recall)
-        per_label[label] = {
-            "precision": precision,
-            "recall": recall,
-            "f1": f1,
-            "support": tp + fn,
-            "tp": tp,
-            "fp": fp,
-            "fn": fn,
-            "tn": tn,
-        }
-        correct += tp + tn
-        total += label_total
-        macro_f1 += f1
-        labelled += 1
-    return {
-        "bit_accuracy": correct / max(1, total),
-        "macro_f1": macro_f1 / max(1, labelled),
-        "per_label": per_label,
-    }
-
-
-def tune_auxiliary_thresholds(samples: dict[str, list[tuple[float, bool]]]) -> dict:
-    thresholds = [index / 20.0 for index in range(1, 20)]
-    per_label = {}
-    totals = {}
-    for label in AUXILIARY_LABELS:
-        best_threshold = 0.5
-        best_counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-        best_f1 = -1.0
-        for threshold in thresholds:
-            counts = counts_for_threshold(samples[label], threshold)
-            precision = counts["tp"] / max(1, counts["tp"] + counts["fp"])
-            recall = counts["tp"] / max(1, counts["tp"] + counts["fn"])
-            f1 = 2.0 * precision * recall / max(1e-6, precision + recall)
-            if f1 > best_f1 or (f1 == best_f1 and abs(threshold - 0.5) < abs(best_threshold - 0.5)):
-                best_f1 = f1
-                best_threshold = threshold
-                best_counts = counts
-        totals[label] = best_counts
-        per_label[label] = {"threshold": best_threshold, "f1": best_f1}
-    summary = summarize_auxiliary(totals)
-    for label, details in per_label.items():
-        summary["per_label"][label]["threshold"] = details["threshold"]
-    return summary
-
-
-def counts_for_threshold(samples: list[tuple[float, bool]], threshold: float) -> dict[str, int]:
-    counts = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
-    for score, expected in samples:
-        predicted = score >= threshold
-        if predicted and expected:
-            counts["tp"] += 1
-        elif predicted:
-            counts["fp"] += 1
-        elif expected:
-            counts["fn"] += 1
-        else:
-            counts["tn"] += 1
-    return counts
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--dataset", default="data/synthetic/librarian_hard_cases.jsonl")
@@ -256,6 +183,9 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
     parser.add_argument("--auxiliary-threshold", type=float, default=0.5)
+    parser.add_argument("--use-checkpoint-auxiliary-thresholds", action="store_true")
+    parser.add_argument("--no-use-checkpoint-auxiliary-thresholds", dest="use_checkpoint_auxiliary_thresholds", action="store_false")
+    parser.set_defaults(use_checkpoint_auxiliary_thresholds=True)
     parser.add_argument("--tune-auxiliary-thresholds", action="store_true")
     parser.add_argument("--no-tune-auxiliary-thresholds", dest="tune_auxiliary_thresholds", action="store_false")
     parser.set_defaults(tune_auxiliary_thresholds=True)

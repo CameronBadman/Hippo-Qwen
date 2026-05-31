@@ -12,6 +12,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, random_split
 
+from python.selector.calibration import default_auxiliary_thresholds, tune_auxiliary_thresholds
 from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS, ContextSelectorDataset, auxiliary_labels, reason_label
 from python.selector.model import MultiSeedContextSelector, SelectorConfig, save_selector
 
@@ -146,6 +147,31 @@ def auxiliary_pos_weights(
     return torch.clamp(negatives / positives, max=max_weight).to(device)
 
 
+def calibrate_auxiliary_thresholds(
+    model: MultiSeedContextSelector,
+    loader: DataLoader,
+    device: torch.device,
+    enabled: bool,
+) -> dict[str, float]:
+    if not enabled:
+        return default_auxiliary_thresholds()
+    samples: dict[str, list[tuple[float, bool]]] = {label: [] for label in AUXILIARY_LABELS}
+    model.eval()
+    with torch.no_grad():
+        for batch in loader:
+            batch = {key: value.to(device) for key, value in batch.items()}
+            outputs = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+            scores = torch.sigmoid(outputs["auxiliary_logits"]).detach().cpu()
+            expected = (batch["auxiliary"] >= 0.5).detach().cpu()
+            mask = batch["mask"].detach().cpu().bool()
+            for idx, label in enumerate(AUXILIARY_LABELS):
+                label_scores = scores[:, :, idx][mask].tolist()
+                label_expected = expected[:, :, idx][mask].tolist()
+                samples[label].extend((float(score), bool(value)) for score, value in zip(label_scores, label_expected))
+    tuned = tune_auxiliary_thresholds(samples)
+    return {label: float(tuned["per_label"][label]["threshold"]) for label in AUXILIARY_LABELS}
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     dataset = ContextSelectorDataset(args.dataset, args.max_candidates, args.budget, args.feature_dim)
@@ -219,7 +245,10 @@ def train(args: argparse.Namespace) -> None:
             flush=True,
         )
 
-    save_selector(model, args.output)
+    auxiliary_thresholds = calibrate_auxiliary_thresholds(model, val_loader, device, args.calibrate_auxiliary_thresholds)
+    model.auxiliary_thresholds = auxiliary_thresholds
+    print("auxiliary_thresholds=" + ",".join(f"{label}:{threshold:.2f}" for label, threshold in auxiliary_thresholds.items()), flush=True)
+    save_selector(model, args.output, auxiliary_thresholds=auxiliary_thresholds)
     print(f"saved {args.output}", flush=True)
 
 
@@ -244,6 +273,9 @@ def main() -> None:
     parser.add_argument("--no-auxiliary-class-balance", dest="auxiliary_class_balance", action="store_false")
     parser.set_defaults(auxiliary_class_balance=True)
     parser.add_argument("--auxiliary-max-pos-weight", type=float, default=6.0)
+    parser.add_argument("--calibrate-auxiliary-thresholds", action="store_true")
+    parser.add_argument("--no-calibrate-auxiliary-thresholds", dest="calibrate_auxiliary_thresholds", action="store_false")
+    parser.set_defaults(calibrate_auxiliary_thresholds=True)
     parser.add_argument("--reason-class-balance", action="store_true")
     parser.add_argument("--no-reason-class-balance", dest="reason_class_balance", action="store_false")
     parser.set_defaults(reason_class_balance=False)

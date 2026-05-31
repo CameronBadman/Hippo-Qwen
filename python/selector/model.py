@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+from typing import Any
 
 import torch
 import torch.nn as nn
 
 from python.librarian.features import DEFAULT_DIMS
+from python.selector.calibration import default_auxiliary_thresholds
 from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS
 
 
@@ -29,6 +31,7 @@ class MultiSeedContextSelector(nn.Module):
     def __init__(self, config: SelectorConfig):
         super().__init__()
         self.config = config
+        self.auxiliary_thresholds = default_auxiliary_thresholds()
         token_dim = config.embedding_dim * 5 + config.feature_dim
         self.input = nn.Sequential(
             nn.Linear(token_dim, config.d_model),
@@ -72,10 +75,10 @@ class MultiSeedContextSelector(nn.Module):
         }
 
 
-def save_selector(model: MultiSeedContextSelector, path: str | Path) -> None:
+def save_selector(model: MultiSeedContextSelector, path: str | Path, **metadata: Any) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save({"config": asdict(model.config), "state_dict": model.state_dict()}, path)
+    torch.save({"config": asdict(model.config), "state_dict": model.state_dict(), "metadata": metadata}, path)
 
 
 def load_selector(path: str | Path, device: torch.device | str = "cpu") -> MultiSeedContextSelector:
@@ -85,5 +88,9 @@ def load_selector(path: str | Path, device: torch.device | str = "cpu") -> Multi
     allowed_missing = {"auxiliary_head.weight", "auxiliary_head.bias"}
     if set(missing) - allowed_missing or unexpected:
         raise RuntimeError(f"checkpoint state mismatch: missing={missing} unexpected={unexpected}")
+    metadata = checkpoint.get("metadata") or {}
+    thresholds = default_auxiliary_thresholds()
+    thresholds.update(metadata.get("auxiliary_thresholds") or {})
+    model.auxiliary_thresholds = thresholds
     model.eval()
     return model
