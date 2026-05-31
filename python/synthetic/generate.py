@@ -12,10 +12,31 @@ if __package__ is None or __package__ == "":
 from python.librarian.features import EDGE_TYPES, embed_text, heuristic_action
 
 
-PROJECTS = ["hippograph", "resume", "printer", "research-notes"]
-PREFERENCES = ["prefers concise answers", "wants source links", "likes Go runtimes", "avoids large dependencies"]
-TASKS = ["debugged retrieval", "updated deployment", "tested memory recall", "refined graph traversal"]
-NOISE = ["cooking pasta", "booking flights", "watching films", "garden planning"]
+PROJECTS = ["hippograph", "resume", "printer", "research-notes", "home-network", "colab-training"]
+PREFERENCES = [
+    "prefers concise answers",
+    "wants source links",
+    "likes Go runtimes",
+    "avoids large dependencies",
+    "needs reproducible commands",
+    "prefers visual debugging",
+]
+TASKS = [
+    "debugged retrieval",
+    "updated deployment",
+    "tested memory recall",
+    "refined graph traversal",
+    "reviewed API contracts",
+    "designed benchmark cases",
+]
+NOISE = [
+    "sourdough hydration ratios",
+    "hotel booking loyalty points",
+    "film camera lens adapters",
+    "garden soil nitrogen levels",
+    "running shoe sizing",
+    "coffee grinder burr alignment",
+]
 
 
 def build_history(seed: int, count: int) -> list[dict]:
@@ -25,12 +46,21 @@ def build_history(seed: int, count: int) -> list[dict]:
         project = rng.choice(PROJECTS)
         preference = rng.choice(PREFERENCES)
         task = rng.choice(TASKS)
+        style = rng.choice(
+            [
+                f"{project}: {task}. Preference: {preference}.",
+                f"While handling {project}, the user {task} and {preference}.",
+                f"Memory for {project}. Task was to {task}; user {preference}.",
+            ]
+        )
         rows.append(
             {
                 "id": f"synthetic_{index:04d}",
-                "text": f"User working on {project} {task}; user {preference}.",
+                "text": style,
                 "metadata": {"project": project},
                 "positive_edge_hints": [project, preference],
+                "preference": preference,
+                "task": task,
             }
         )
     return rows
@@ -51,18 +81,36 @@ def memory_card(row: dict, index: int) -> dict:
 
 
 def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
-    rows = build_history(seed, max(count * 2, candidates + 16))
+    rows = build_history(seed, max(count * 3, candidates + 64))
     cards = [memory_card(row, idx) for idx, row in enumerate(rows)]
     rng = random.Random(seed + 1000)
     cases = []
     for idx in range(count):
         anchor = cards[idx]
         same_project = [card for card in cards if card["id"] != anchor["id"] and card["cluster"] == anchor["cluster"]]
-        other = [card for card in cards if card["id"] != anchor["id"] and card["cluster"] != anchor["cluster"]]
-        chosen = rng.sample(same_project, min(len(same_project), candidates // 2))
-        chosen.extend(rng.sample(other, min(len(other), candidates - len(chosen))))
+        same_preference = [
+            card
+            for card, row in zip(cards, rows)
+            if card["id"] != anchor["id"]
+            and card["cluster"] != anchor["cluster"]
+            and row.get("preference") in anchor["text"]
+        ]
+        other = [
+            card
+            for card in cards
+            if card["id"] != anchor["id"]
+            and card["cluster"] != anchor["cluster"]
+            and card not in same_preference
+        ]
+        positive_target = max(1, candidates // 4)
+        hard_target = max(1, candidates // 8)
+        chosen = rng.sample(same_project, min(len(same_project), positive_target))
+        chosen.extend(rng.sample(same_preference, min(len(same_preference), hard_target)))
+        remaining_other = [card for card in other if card not in chosen]
+        other_target = max(0, candidates // 4 - len(chosen))
+        chosen.extend(rng.sample(remaining_other, min(len(remaining_other), other_target)))
         while len(chosen) < candidates:
-            noise_text = f"Unrelated note about {rng.choice(NOISE)} number {rng.randint(0, 9999)}."
+            noise_text = f"{rng.choice(NOISE)}. Reference {rng.randint(1000, 9999)}."
             chosen.append(
                 {
                     "id": f"noise_{idx}_{len(chosen)}",
