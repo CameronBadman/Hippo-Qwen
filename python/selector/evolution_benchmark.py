@@ -105,8 +105,8 @@ class MemoryState:
         signature = self.items.get(f"signature:{relationship_signature(row['anchor'], candidate)}", {})
         return float(memory.get("score_bias") or 0.0) + float(signature.get("score_bias") or 0.0)
 
-    def rerank(self, row: dict[str, Any], ranked: Ranked) -> Ranked:
-        adjusted = [(candidate_id, score + self.score_bias(row, candidate_id), text) for candidate_id, score, text in ranked]
+    def rerank(self, row: dict[str, Any], ranked: Ranked, bias_scale: float) -> Ranked:
+        adjusted = [(candidate_id, score + bias_scale * self.score_bias(row, candidate_id), text) for candidate_id, score, text in ranked]
         return sorted(adjusted, key=lambda item: (-item[1], item[0]))
 
     def summary(self) -> dict[str, Any]:
@@ -249,7 +249,7 @@ def metric_delta(evolved: dict[str, float], static: dict[str, float]) -> dict[st
     return {key: evolved.get(key, 0.0) - static.get(key, 0.0) for key in keys}
 
 
-def evaluate_online(rows: list[dict[str, Any]], scorers: dict[str, Scorer], top_k: int, budget: int) -> dict[str, Any]:
+def evaluate_online(rows: list[dict[str, Any]], scorers: dict[str, Scorer], top_k: int, budget: int, bias_scale: float) -> dict[str, Any]:
     results: dict[str, Any] = {}
     for name, scorer in scorers.items():
         state = MemoryState()
@@ -261,7 +261,7 @@ def evaluate_online(rows: list[dict[str, Any]], scorers: dict[str, Scorer], top_
         for row in rows:
             static_ranked = scorer(row)
             evolved_row = state.apply(row)
-            evolved_ranked = state.rerank(evolved_row, scorer(evolved_row))
+            evolved_ranked = state.rerank(evolved_row, scorer(evolved_row), bias_scale)
             static_metrics.append(evaluate_ranked(row, static_ranked, top_k, budget))
             evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
             merge_role_counts(static_roles, role_exposure(row, static_ranked, budget))
@@ -358,6 +358,7 @@ def main() -> None:
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     parser.add_argument("--output-dataset", default="")
+    parser.add_argument("--evolution-bias-scale", type=float, default=0.5)
     parser.add_argument("--cpu", action="store_true")
     args = parser.parse_args()
 
@@ -369,7 +370,8 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "top_k": args.top_k,
         "budget": args.budget,
-        "methods": evaluate_online(rows, build_scorers(args), args.top_k, args.budget),
+        "evolution_bias_scale": args.evolution_bias_scale,
+        "methods": evaluate_online(rows, build_scorers(args), args.top_k, args.budget, args.evolution_bias_scale),
     }
     body = json.dumps(result, indent=2)
     print(body)
