@@ -24,6 +24,7 @@ def collate(batch: list[dict]) -> dict:
         "features": torch.stack([item["features"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
         "select": torch.stack([item["select"] for item in batch]),
+        "reason": torch.stack([item["reason"] for item in batch]),
     }
 
 
@@ -70,6 +71,14 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, top_
     }
 
 
+def reason_metrics(reason_logits: torch.Tensor, reason: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+    valid = mask & (reason >= 0)
+    if not valid.any():
+        return {"reason_accuracy": 0.0}
+    predicted = reason_logits.argmax(dim=-1)
+    return {"reason_accuracy": float((predicted[valid] == reason[valid]).float().mean().detach().cpu().item())}
+
+
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
     dataset = ContextSelectorDataset(args.dataset, args.max_candidates, args.budget, args.feature_dim)
@@ -97,10 +106,12 @@ def train(args: argparse.Namespace) -> None:
         train_loss = 0.0
         for batch in train_loader:
             batch = {key: value.to(device) for key, value in batch.items()}
-            logits = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+            outputs = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+            logits = outputs["select_logits"]
             bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
             rank = ranking_loss(logits, batch["select"], batch["mask"])
-            loss = bce + args.rank_loss_weight * rank
+            reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]])
+            loss = bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -110,21 +121,27 @@ def train(args: argparse.Namespace) -> None:
         model.eval()
         val_losses = []
         val_metrics = []
+        val_reason = []
         with torch.no_grad():
             for batch in val_loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                logits = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+                outputs = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+                logits = outputs["select_logits"]
                 bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
                 rank = ranking_loss(logits, batch["select"], batch["mask"])
-                val_losses.append(float((bce + args.rank_loss_weight * rank).detach().cpu().item()))
+                reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]])
+                val_losses.append(float((bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss).detach().cpu().item()))
                 val_metrics.append(metrics(logits, batch["select"], batch["mask"], args.top_k))
+                val_reason.append(reason_metrics(outputs["reason_logits"], batch["reason"], batch["mask"]))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         precision = sum(item["precision_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         mrr = sum(item["mrr"] for item in val_metrics) / max(1, len(val_metrics))
+        reason_acc = sum(item["reason_accuracy"] for item in val_reason) / max(1, len(val_reason))
         print(
             f"epoch={epoch + 1} train_loss={train_loss / max(1, len(train_loader)):.4f} "
             f"val_loss={sum(val_losses) / max(1, len(val_losses)):.4f} "
-            f"val_recall@{args.top_k}={recall:.3f} val_precision@{args.top_k}={precision:.3f} val_mrr={mrr:.3f}",
+            f"val_recall@{args.top_k}={recall:.3f} val_precision@{args.top_k}={precision:.3f} "
+            f"val_mrr={mrr:.3f} val_reason_acc={reason_acc:.3f}",
             flush=True,
         )
 
@@ -147,6 +164,7 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--rank-loss-weight", type=float, default=0.25)
+    parser.add_argument("--reason-loss-weight", type=float, default=0.1)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)

@@ -21,6 +21,14 @@ from python.librarian.features import (
 )
 
 PREFERENCE_MARKERS = {"preference", "prefer", "prefers", "preferred", "wants", "likes", "avoids", "needs"}
+CONTEXT_REASONS = [
+    "same_context",
+    "preference_memory",
+    "cross_context_support",
+    "stale_or_superseded",
+    "wrong_context",
+]
+REASON_TO_ID = {name: idx for idx, name in enumerate(CONTEXT_REASONS)}
 
 
 class ContextSelectorDataset(Dataset):
@@ -50,6 +58,7 @@ class ContextSelectorDataset(Dataset):
         features = torch.zeros((self.max_candidates, self.feature_dim), dtype=torch.float32)
         mask = torch.zeros((self.max_candidates,), dtype=torch.bool)
         select = torch.zeros((self.max_candidates,), dtype=torch.float32)
+        reason = torch.full((self.max_candidates,), -100, dtype=torch.long)
 
         for idx, candidate in enumerate(candidates):
             ensure_embedding(candidate)
@@ -57,6 +66,7 @@ class ContextSelectorDataset(Dataset):
             features[idx] = torch.tensor(selector_features(query, query_embedding, anchor, candidate, self.budget_tokens, self.feature_dim))
             mask[idx] = True
             select[idx] = 1.0 if candidate["id"] in relevant else 0.0
+            reason[idx] = reason_label(anchor, candidate, candidate["id"] in relevant)
 
         return {
             "query": torch.tensor(query_embedding, dtype=torch.float32),
@@ -65,6 +75,7 @@ class ContextSelectorDataset(Dataset):
             "features": features,
             "mask": mask,
             "select": select,
+            "reason": reason,
             "ids": [candidate["id"] for candidate in candidates],
             "texts": [candidate.get("text", "") for candidate in candidates],
             "relevant_ids": relevant,
@@ -182,3 +193,25 @@ def context_features(
         "same_context_stale": cluster * state["stale_unused_flag"],
         "same_context_positive_state": cluster * positive_state,
     }
+
+
+def reason_label(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bool) -> int:
+    role = str(candidate.get("synthetic_role") or "")
+    if role in {"stale_negative", "stale_same_context_negative", "near_duplicate"}:
+        return REASON_TO_ID["stale_or_superseded"]
+    if role in {"cross_relevant"}:
+        return REASON_TO_ID["cross_context_support"]
+    if role in {"preference_relevant"}:
+        return REASON_TO_ID["preference_memory"]
+    if relevant:
+        return REASON_TO_ID["same_context"] if cluster_score(anchor, candidate) > 0 else REASON_TO_ID["cross_context_support"]
+    if role in {
+        "same_project_wrong_preference_negative",
+        "popular_wrong_context_negative",
+        "same_project_hard_negative",
+        "other_negative",
+        "noise_negative",
+        "background_negative",
+    }:
+        return REASON_TO_ID["wrong_context"]
+    return REASON_TO_ID["wrong_context"]

@@ -18,21 +18,31 @@ SELECTOR_ABLATIONS: dict[str, dict[str, Any]] = {
     "query_only_no_state": {
         "feature_dim": 8,
         "rank_loss_weight": 0.25,
+        "reason_loss_weight": 0.1,
         "query_only": True,
     },
     "multi_seed_no_state": {
         "feature_dim": 21,
         "rank_loss_weight": 0.25,
+        "reason_loss_weight": 0.1,
         "query_only": False,
     },
     "multi_seed_full": {
         "feature_dim": 31,
         "rank_loss_weight": 0.25,
+        "reason_loss_weight": 0.1,
+        "query_only": False,
+    },
+    "multi_seed_full_no_reason": {
+        "feature_dim": 31,
+        "rank_loss_weight": 0.25,
+        "reason_loss_weight": 0.0,
         "query_only": False,
     },
     "multi_seed_no_rank": {
         "feature_dim": 31,
         "rank_loss_weight": 0.0,
+        "reason_loss_weight": 0.1,
         "query_only": False,
     },
 }
@@ -95,6 +105,8 @@ def train_selector(args: argparse.Namespace, repo: Path, dataset: Path, name: st
         str(config["feature_dim"]),
         "--rank-loss-weight",
         str(config["rank_loss_weight"]),
+        "--reason-loss-weight",
+        str(config["reason_loss_weight"]),
         "--d-model",
         str(args.d_model),
         "--layers",
@@ -177,6 +189,10 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
     for name, result in summary["selectors"].items():
         metrics = result["metrics"]["context_selector"]
         lines.append(format_metric_row(name, metrics))
+    lines.extend(["", "## Reason Head", "", "| ablation | reason accuracy | labelled candidates |", "| --- | ---: | ---: |"])
+    for name, result in summary["selectors"].items():
+        reason = result.get("reason_metrics") or {}
+        lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('total', 0)} |")
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
