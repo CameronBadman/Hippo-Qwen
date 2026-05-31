@@ -131,6 +131,8 @@ writes threshold-sweep metrics to `summary.json` and `summary.md`.
 The context selector is a separate experiment for less greedy retrieval. It
 trains on the whole candidate set for a retrieval task and learns which memories
 belong in the final context, rather than scoring every edge independently.
+It uses only observable query, anchor, candidate, and memory-state features;
+the synthetic role labels are withheld from the model.
 
 ```bash
 python3 -m python.selector.train_selector \
@@ -146,4 +148,15 @@ python3 -m python.selector.benchmark_selector \
   --dataset data/synthetic/librarian_hard_cases.jsonl \
   --checkpoint artifacts/librarian/context_selector.pt \
   --limit 1000
+```
+
+Run selector ablations for query-only, multi-seed, no-state, and no-ranking-loss
+variants:
+
+```bash
+python3 -m python.selector.ablation_suite \
+  --work-dir artifacts/librarian/selector_ablation \
+  --cases 5000 \
+  --eval-limit 1000 \
+  --epochs 6
 ```

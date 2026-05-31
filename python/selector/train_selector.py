@@ -19,6 +19,7 @@ from python.selector.model import MultiSeedContextSelector, SelectorConfig, save
 def collate(batch: list[dict]) -> dict:
     return {
         "query": torch.stack([item["query"] for item in batch]),
+        "anchor": torch.stack([item["anchor"] for item in batch]),
         "candidates": torch.stack([item["candidates"] for item in batch]),
         "features": torch.stack([item["features"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
@@ -71,7 +72,7 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, top_
 
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
-    dataset = ContextSelectorDataset(args.dataset, args.max_candidates, args.budget)
+    dataset = ContextSelectorDataset(args.dataset, args.max_candidates, args.budget, args.feature_dim)
     val_count = max(1, int(len(dataset) * args.val_fraction))
     train_count = max(1, len(dataset) - val_count)
     train_set, val_set = random_split(dataset, [train_count, val_count])
@@ -85,6 +86,8 @@ def train(args: argparse.Namespace) -> None:
         dropout=args.dropout,
         max_candidates=args.max_candidates,
         budget_tokens=args.budget,
+        feature_dim=args.feature_dim,
+        use_anchor_seed=not args.query_only,
     )
     model = MultiSeedContextSelector(config).to(device)
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
@@ -94,7 +97,7 @@ def train(args: argparse.Namespace) -> None:
         train_loss = 0.0
         for batch in train_loader:
             batch = {key: value.to(device) for key, value in batch.items()}
-            logits = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
+            logits = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
             bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
             rank = ranking_loss(logits, batch["select"], batch["mask"])
             loss = bce + args.rank_loss_weight * rank
@@ -110,7 +113,7 @@ def train(args: argparse.Namespace) -> None:
         with torch.no_grad():
             for batch in val_loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
-                logits = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
+                logits = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
                 bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
                 rank = ranking_loss(logits, batch["select"], batch["mask"])
                 val_losses.append(float((bce + args.rank_loss_weight * rank).detach().cpu().item()))
@@ -138,6 +141,7 @@ def main() -> None:
     parser.add_argument("--max-candidates", type=int, default=32)
     parser.add_argument("--budget", type=int, default=90)
     parser.add_argument("--top-k", type=int, default=8)
+    parser.add_argument("--feature-dim", type=int, default=16)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--layers", type=int, default=4)
     parser.add_argument("--heads", type=int, default=4)
@@ -148,6 +152,7 @@ def main() -> None:
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--query-only", action="store_true")
     parser.add_argument("--cpu", action="store_true")
     train(parser.parse_args())
 

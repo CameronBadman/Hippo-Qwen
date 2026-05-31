@@ -19,10 +19,12 @@ def selector_scores(model, row: dict, budget: int) -> list[tuple[str, float, str
     dataset = ContextSelectorDataset.__new__(ContextSelectorDataset)
     dataset.max_candidates = model.config.max_candidates
     dataset.budget_tokens = budget
+    dataset.feature_dim = model.config.feature_dim
     dataset.rows = [row]
     item = dataset[0]
     batch = {
         "query": item["query"].unsqueeze(0),
+        "anchor": item["anchor"].unsqueeze(0),
         "candidates": item["candidates"].unsqueeze(0),
         "features": item["features"].unsqueeze(0),
         "mask": item["mask"].unsqueeze(0),
@@ -30,7 +32,7 @@ def selector_scores(model, row: dict, budget: int) -> list[tuple[str, float, str
     device = next(model.parameters()).device
     with torch.no_grad():
         batch = {key: value.to(device) for key, value in batch.items()}
-        logits = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
+        logits = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
         probs = torch.sigmoid(logits)[0].detach().cpu().tolist()
     scored = [(candidate_id, float(probs[idx]), item["texts"][idx]) for idx, candidate_id in enumerate(item["ids"])]
     return sorted(scored, key=lambda entry: (-entry[1], entry[0]))

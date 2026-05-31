@@ -12,20 +12,21 @@ from python.librarian.features import DEFAULT_DIMS
 @dataclass
 class SelectorConfig:
     embedding_dim: int = DEFAULT_DIMS
-    feature_dim: int = 8
+    feature_dim: int = 16
     d_model: int = 128
     num_layers: int = 4
     num_heads: int = 4
     dropout: float = 0.1
     max_candidates: int = 32
     budget_tokens: int = 90
+    use_anchor_seed: bool = True
 
 
 class MultiSeedContextSelector(nn.Module):
     def __init__(self, config: SelectorConfig):
         super().__init__()
         self.config = config
-        token_dim = config.embedding_dim * 3 + config.feature_dim
+        token_dim = config.embedding_dim * 5 + config.feature_dim
         self.input = nn.Sequential(
             nn.Linear(token_dim, config.d_model),
             nn.LayerNorm(config.d_model),
@@ -45,13 +46,18 @@ class MultiSeedContextSelector(nn.Module):
     def forward(
         self,
         query: torch.Tensor,
+        anchor: torch.Tensor,
         candidates: torch.Tensor,
         features: torch.Tensor,
         mask: torch.Tensor,
     ) -> torch.Tensor:
+        if not self.config.use_anchor_seed:
+            anchor = query
         query_expanded = query.unsqueeze(1).expand(-1, candidates.shape[1], -1)
-        diff = candidates - query_expanded
-        tokens = torch.cat([query_expanded, candidates, diff, features], dim=-1)
+        anchor_expanded = anchor.unsqueeze(1).expand(-1, candidates.shape[1], -1)
+        query_diff = candidates - query_expanded
+        anchor_diff = candidates - anchor_expanded
+        tokens = torch.cat([query_expanded, anchor_expanded, candidates, query_diff, anchor_diff, features], dim=-1)
         hidden = self.input(tokens)
         hidden = self.encoder(hidden, src_key_padding_mask=~mask.bool())
         return self.select_head(hidden).squeeze(-1)
