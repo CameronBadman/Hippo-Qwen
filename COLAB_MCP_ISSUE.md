@@ -7,6 +7,10 @@ MCP transport for the `colab` server is closed. This blocks tool calls such as
 opening the Colab connection URL, checking Colab status, running cells, or
 starting notebook jobs from Codex.
 
+Current practical conclusion: when this happens, the easiest reliable fix is to
+restart the Codex instance so the MCP host relaunches the Colab connector and
+reattaches stdio transport from startup.
+
 This does **not** block the HippoGraph repo itself. The neighborhood transformer
 training code has been added and pushed, but Colab cannot be controlled through
 the MCP tools until the bridge/client transport is reconnected.
@@ -92,7 +96,7 @@ inside this repo shell.
 
 Likely recovery actions:
 
-1. Restart the Codex client/session MCP server configuration.
+1. Restart the Codex instance when Colab MCP is needed.
 2. Ensure the `colab` MCP server is launched by the MCP host with stdio attached.
 3. Retry:
 
@@ -132,4 +136,3 @@ Latest pushed commit containing the transformer training stack:
 ```text
 37ccbcd Add neighborhood transformer training stack
 ```
-
