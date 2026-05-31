@@ -292,10 +292,7 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
             excluded.add(card_index)
 
         for slot in range(max(3, candidates // 6)):
-            text = (
-                f"{anchor['cluster']}: {anchor_task}. User {anchor_preference}. "
-                "Old approach that was ignored and should not be reused."
-            )
+            text = longitudinal_text(anchor["cluster"], anchor_task, anchor_preference, slot)
             chosen_roles.append(
                 (
                     generated_card(
@@ -316,10 +313,7 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
 
         for slot in range(max(3, candidates // 6)):
             wrong_project = rng.choice([project for project in PROJECTS if project != anchor["cluster"]])
-            text = (
-                f"{wrong_project}: {anchor_task}. User {anchor_preference}. "
-                "This was frequently useful in another context."
-            )
+            text = longitudinal_text(wrong_project, anchor_task, anchor_preference, slot)
             chosen_roles.append(
                 (
                     generated_card(
@@ -342,7 +336,7 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
 
         for slot in range(max(2, candidates // 8)):
             wrong_preference = rng.choice([preference for preference in PREFERENCES if preference != anchor_preference])
-            text = f"{anchor['cluster']}: {anchor_task}. User {wrong_preference}. Recent but conflicts with current preference."
+            text = longitudinal_text(anchor["cluster"], anchor_task, wrong_preference, slot)
             chosen_roles.append(
                 (
                     generated_card(
@@ -416,6 +410,15 @@ def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[
             "scenario": "longitudinal",
             "edge_types": EDGE_TYPES,
         }
+
+
+def longitudinal_text(project: str, task: str, preference: str, slot: int) -> str:
+    variants = [
+        f"{project}: {task}. Preference: {preference}.",
+        f"While handling {project}, the user {task} and {preference}.",
+        f"Memory for {project}. Task was to {task}; user {preference}.",
+    ]
+    return variants[slot % len(variants)]
 
 
 def build_cases(seed: int, count: int, candidates: int, scenario: str = "standard") -> list[dict]:
