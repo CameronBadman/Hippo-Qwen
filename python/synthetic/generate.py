@@ -4,6 +4,7 @@ import argparse
 import json
 import random
 import sys
+from collections.abc import Iterator
 from pathlib import Path
 
 if __package__ is None or __package__ == "":
@@ -80,35 +81,42 @@ def memory_card(row: dict, index: int) -> dict:
     }
 
 
-def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
+def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
     rows = build_history(seed, max(count * 3, candidates + 64))
     cards = [memory_card(row, idx) for idx, row in enumerate(rows)]
+    by_project: dict[str, list[int]] = {}
+    by_preference: dict[str, list[int]] = {}
+    for card_index, (card, row) in enumerate(zip(cards, rows)):
+        by_project.setdefault(card["cluster"], []).append(card_index)
+        by_preference.setdefault(row["preference"], []).append(card_index)
     rng = random.Random(seed + 1000)
-    cases = []
     for idx in range(count):
         anchor = cards[idx]
-        same_project = [card for card in cards if card["id"] != anchor["id"] and card["cluster"] == anchor["cluster"]]
-        same_preference = [
-            card
-            for card, row in zip(cards, rows)
-            if card["id"] != anchor["id"]
-            and card["cluster"] != anchor["cluster"]
-            and row.get("preference") in anchor["text"]
-        ]
-        other = [
-            card
-            for card in cards
-            if card["id"] != anchor["id"]
-            and card["cluster"] != anchor["cluster"]
-            and card not in same_preference
+        anchor_preference = rows[idx]["preference"]
+        excluded = {idx}
+        same_project_indexes = [card_index for card_index in by_project[anchor["cluster"]] if card_index != idx]
+        same_preference_indexes = [
+            card_index
+            for card_index in by_preference[anchor_preference]
+            if card_index != idx and cards[card_index]["cluster"] != anchor["cluster"]
         ]
         positive_target = max(1, candidates // 4)
         hard_target = max(1, candidates // 8)
-        chosen = rng.sample(same_project, min(len(same_project), positive_target))
-        chosen.extend(rng.sample(same_preference, min(len(same_preference), hard_target)))
-        remaining_other = [card for card in other if card not in chosen]
+        chosen_indexes = rng.sample(same_project_indexes, min(len(same_project_indexes), positive_target))
+        excluded.update(chosen_indexes)
+        preference_sample = rng.sample(same_preference_indexes, min(len(same_preference_indexes), hard_target))
+        chosen_indexes.extend(preference_sample)
+        excluded.update(preference_sample)
+        chosen = [cards[card_index] for card_index in chosen_indexes]
         other_target = max(0, candidates // 4 - len(chosen))
-        chosen.extend(rng.sample(remaining_other, min(len(remaining_other), other_target)))
+        for _ in range(other_target):
+            for _attempt in range(32):
+                card_index = rng.randrange(len(cards))
+                card = cards[card_index]
+                if card_index not in excluded and card["cluster"] != anchor["cluster"]:
+                    chosen.append(card)
+                    excluded.add(card_index)
+                    break
         while len(chosen) < candidates:
             noise_text = f"{rng.choice(NOISE)}. Reference {rng.randint(1000, 9999)}."
             chosen.append(
@@ -124,23 +132,24 @@ def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
             )
         rng.shuffle(chosen)
         actions = [heuristic_action(anchor, candidate) for candidate in chosen]
-        cases.append(
-            {
-                "anchor": anchor,
-                "candidates": chosen,
-                "labels": {
-                    "attach": [action["attach"] for action in actions],
-                    "edge_type": [action["edge_type_id"] for action in actions],
-                    "weight": [action["weight"] for action in actions],
-                    "confidence": [action["confidence"] for action in actions],
-                    "decay_rate": [action["decay_rate"] for action in actions],
-                    "importance_delta": [action["importance_delta"] for action in actions],
-                },
-                "teacher": "heuristic_v0",
-                "edge_types": EDGE_TYPES,
-            }
-        )
-    return cases
+        yield {
+            "anchor": anchor,
+            "candidates": chosen,
+            "labels": {
+                "attach": [action["attach"] for action in actions],
+                "edge_type": [action["edge_type_id"] for action in actions],
+                "weight": [action["weight"] for action in actions],
+                "confidence": [action["confidence"] for action in actions],
+                "decay_rate": [action["decay_rate"] for action in actions],
+                "importance_delta": [action["importance_delta"] for action in actions],
+            },
+            "teacher": "heuristic_v0",
+            "edge_types": EDGE_TYPES,
+        }
+
+
+def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
+    return list(iter_cases(seed, count, candidates))
 
 
 def main() -> None:
@@ -151,10 +160,10 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--format", choices=["cases", "memories"], default="cases")
     args = parser.parse_args()
-    rows = build_cases(args.seed, args.count, args.candidates) if args.format == "cases" else build_history(args.seed, args.count)
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
+        rows = iter_cases(args.seed, args.count, args.candidates) if args.format == "cases" else build_history(args.seed, args.count)
         for row in rows:
             handle.write(json.dumps(row) + "\n")
 
