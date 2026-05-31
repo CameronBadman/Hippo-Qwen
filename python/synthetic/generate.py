@@ -38,6 +38,7 @@ NOISE = [
     "running shoe sizing",
     "coffee grinder burr alignment",
 ]
+RELEVANT_ROLES = {"relevant", "cross_relevant", "longitudinal_relevant", "preference_relevant"}
 
 
 def build_history(seed: int, count: int) -> list[dict]:
@@ -210,7 +211,7 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
         chosen = [item[0] for item in chosen_roles]
         roles = [item[1] for item in chosen_roles]
         actions = [action_for_role(anchor, candidate, role) for candidate, role in chosen_roles]
-        relevant_ids = [candidate["id"] for candidate, role in chosen_roles if role in ("relevant", "cross_relevant")]
+        relevant_ids = [candidate["id"] for candidate, role in chosen_roles if role in RELEVANT_ROLES]
         yield {
             "anchor": anchor,
             "candidates": chosen,
@@ -234,19 +235,203 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
         }
 
 
-def build_cases(seed: int, count: int, candidates: int) -> list[dict]:
-    return list(iter_cases(seed, count, candidates))
+def iter_longitudinal_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
+    rows = build_history(seed, max(count * 4, candidates + 128))
+    cards = [memory_card(row, idx) for idx, row in enumerate(rows)]
+    by_project: dict[str, list[int]] = {}
+    by_preference: dict[str, list[int]] = {}
+    for card_index, (card, row) in enumerate(zip(cards, rows)):
+        by_project.setdefault(card["cluster"], []).append(card_index)
+        by_preference.setdefault(row["preference"], []).append(card_index)
+
+    rng = random.Random(seed + 4000)
+    for idx in range(count):
+        anchor = cards[idx]
+        anchor_preference = rows[idx]["preference"]
+        anchor_task = rows[idx]["task"]
+        excluded = {idx}
+        chosen_roles: list[tuple[dict, str]] = []
+
+        same_project_indexes = [card_index for card_index in by_project[anchor["cluster"]] if card_index != idx]
+        same_preference_indexes = [
+            card_index
+            for card_index in by_preference[anchor_preference]
+            if card_index != idx and cards[card_index]["cluster"] != anchor["cluster"]
+        ]
+
+        project_positive_target = max(2, candidates // 7)
+        preference_positive_target = max(1, candidates // 10)
+        for card_index in rng.sample(same_project_indexes, min(len(same_project_indexes), project_positive_target)):
+            card = dict(cards[card_index])
+            card.update(
+                {
+                    "age_days": rng.choice([1, 3, 7, 14]),
+                    "use_count": rng.choice([8, 13, 21, 34]),
+                    "evidence_count": rng.choice([3, 5, 8]),
+                    "last_outcome": "helpful",
+                    "importance": max(float(card.get("importance") or 0.5), 0.65),
+                    "synthetic_role": "longitudinal_relevant",
+                }
+            )
+            chosen_roles.append((card, "longitudinal_relevant"))
+            excluded.add(card_index)
+
+        for card_index in rng.sample(same_preference_indexes, min(len(same_preference_indexes), preference_positive_target)):
+            card = dict(cards[card_index])
+            card.update(
+                {
+                    "age_days": rng.choice([1, 7, 30]),
+                    "use_count": rng.choice([5, 13, 21]),
+                    "evidence_count": rng.choice([3, 5]),
+                    "last_outcome": "helpful",
+                    "importance": max(float(card.get("importance") or 0.5), 0.6),
+                    "synthetic_role": "preference_relevant",
+                }
+            )
+            chosen_roles.append((card, "preference_relevant"))
+            excluded.add(card_index)
+
+        for slot in range(max(3, candidates // 6)):
+            text = (
+                f"{anchor['cluster']}: {anchor_task}. User {anchor_preference}. "
+                "Old approach that was ignored and should not be reused."
+            )
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        text,
+                        "stale_same_context_negative",
+                        idx,
+                        slot,
+                        age_days=365,
+                        use_count=0,
+                        evidence_count=0,
+                        last_outcome="ignored",
+                        importance=0.25,
+                    ),
+                    "stale_same_context_negative",
+                )
+            )
+
+        for slot in range(max(3, candidates // 6)):
+            wrong_project = rng.choice([project for project in PROJECTS if project != anchor["cluster"]])
+            text = (
+                f"{wrong_project}: {anchor_task}. User {anchor_preference}. "
+                "This was frequently useful in another context."
+            )
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        text,
+                        "popular_wrong_context_negative",
+                        idx,
+                        slot,
+                        cluster=wrong_project,
+                        project=wrong_project,
+                        age_days=7,
+                        use_count=55,
+                        evidence_count=13,
+                        last_outcome="helpful",
+                        importance=0.8,
+                    ),
+                    "popular_wrong_context_negative",
+                )
+            )
+
+        for slot in range(max(2, candidates // 8)):
+            wrong_preference = rng.choice([preference for preference in PREFERENCES if preference != anchor_preference])
+            text = f"{anchor['cluster']}: {anchor_task}. User {wrong_preference}. Recent but conflicts with current preference."
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        text,
+                        "same_project_wrong_preference_negative",
+                        idx,
+                        slot,
+                        age_days=3,
+                        use_count=13,
+                        evidence_count=5,
+                        last_outcome="helpful",
+                        importance=0.7,
+                    ),
+                    "same_project_wrong_preference_negative",
+                )
+            )
+
+        duplicate_text = f"{anchor['text']} Repeated capture with no extra evidence."
+        chosen_roles.append(
+            (
+                generated_card(
+                    anchor,
+                    duplicate_text,
+                    "near_duplicate",
+                    idx,
+                    0,
+                    age_days=1,
+                    use_count=0,
+                    evidence_count=0,
+                    importance=0.2,
+                ),
+                "near_duplicate",
+            )
+        )
+
+        while len(chosen_roles) < candidates:
+            card_index = rng.randrange(len(cards))
+            if card_index in excluded:
+                continue
+            card = dict(cards[card_index])
+            card["synthetic_role"] = "background_negative"
+            chosen_roles.append((card, "background_negative"))
+            excluded.add(card_index)
+
+        chosen_roles = chosen_roles[:candidates]
+        rng.shuffle(chosen_roles)
+        chosen = [item[0] for item in chosen_roles]
+        roles = [item[1] for item in chosen_roles]
+        actions = [action_for_role(anchor, candidate, role) for candidate, role in chosen_roles]
+        relevant_ids = [candidate["id"] for candidate, role in chosen_roles if role in RELEVANT_ROLES]
+        yield {
+            "anchor": anchor,
+            "candidates": chosen,
+            "labels": {
+                "attach": [action["attach"] for action in actions],
+                "rank": [action["rank"] for action in actions],
+                "edge_type": [action["edge_type_id"] for action in actions],
+                "weight": [action["weight"] for action in actions],
+                "confidence": [action["confidence"] for action in actions],
+                "decay_rate": [action["decay_rate"] for action in actions],
+                "importance_delta": [action["importance_delta"] for action in actions],
+            },
+            "retrieval_task": {
+                "query": "Find memories useful for the user's current work and durable preferences.",
+                "relevant_ids": relevant_ids,
+                "budget": 90,
+            },
+            "teacher": "synthetic_longitudinal_v1",
+            "schema_version": 3,
+            "scenario": "longitudinal",
+            "edge_types": EDGE_TYPES,
+        }
+
+
+def build_cases(seed: int, count: int, candidates: int, scenario: str = "standard") -> list[dict]:
+    iterator = iter_longitudinal_cases(seed, count, candidates) if scenario == "longitudinal" else iter_cases(seed, count, candidates)
+    return list(iterator)
 
 
 def action_for_role(anchor: dict, candidate: dict, role: str) -> dict:
     action = heuristic_action(anchor, candidate)
-    if role in ("relevant", "cross_relevant"):
+    if role in RELEVANT_ROLES:
         action["attach"] = 1.0
         action["rank"] = 1.0
         action["connect_score"] = max(action["connect_score"], 0.68)
         action["confidence"] = max(action["confidence"], 0.68)
         action["weight"] = max(action["weight"], 0.8)
-        if role == "cross_relevant":
+        if role in ("cross_relevant", "preference_relevant"):
             action["edge_type"] = "preference"
             action["edge_type_id"] = EDGE_TYPE_TO_ID["preference"]
             action["decay_rate"] = 0.005
@@ -268,7 +453,7 @@ def action_for_role(anchor: dict, candidate: dict, role: str) -> dict:
     action["weight"] = min(action["weight"], 0.25)
     action["confidence"] = min(action["confidence"], 0.25)
     action["importance_delta"] = min(action["importance_delta"], 0.0)
-    if role == "stale_negative":
+    if role in ("stale_negative", "stale_same_context_negative"):
         action["decay_rate"] = 0.04
     return action
 
@@ -279,12 +464,20 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--candidates", type=int, default=32)
     parser.add_argument("--seed", type=int, default=7)
+    parser.add_argument("--scenario", choices=["standard", "longitudinal"], default="standard")
     parser.add_argument("--format", choices=["cases", "memories"], default="cases")
     args = parser.parse_args()
     path = Path(args.output)
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:
-        rows = iter_cases(args.seed, args.count, args.candidates) if args.format == "cases" else build_history(args.seed, args.count)
+        if args.format == "cases":
+            rows = (
+                iter_longitudinal_cases(args.seed, args.count, args.candidates)
+                if args.scenario == "longitudinal"
+                else iter_cases(args.seed, args.count, args.candidates)
+            )
+        else:
+            rows = build_history(args.seed, args.count)
         for row in rows:
             handle.write(json.dumps(row) + "\n")
 

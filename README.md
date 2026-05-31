@@ -160,3 +160,8 @@ python3 -m python.selector.ablation_suite \
   --eval-limit 1000 \
   --epochs 6
 ```
+
+By default this uses the `longitudinal` synthetic scenario, which is designed to
+stress the non-greedy selector: generic queries, stale same-context negatives,
+popular wrong-context negatives, and memory-state features such as use count,
+evidence count, and last outcome.

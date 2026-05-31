@@ -21,17 +21,17 @@ SELECTOR_ABLATIONS: dict[str, dict[str, Any]] = {
         "query_only": True,
     },
     "multi_seed_no_state": {
-        "feature_dim": 8,
+        "feature_dim": 14,
         "rank_loss_weight": 0.25,
         "query_only": False,
     },
     "multi_seed_full": {
-        "feature_dim": 16,
+        "feature_dim": 21,
         "rank_loss_weight": 0.25,
         "query_only": False,
     },
     "multi_seed_no_rank": {
-        "feature_dim": 16,
+        "feature_dim": 21,
         "rank_loss_weight": 0.0,
         "query_only": False,
     },
@@ -59,6 +59,8 @@ def generate_dataset(args: argparse.Namespace, repo: Path, dataset: Path) -> Non
             str(args.candidates),
             "--seed",
             str(args.seed),
+            "--scenario",
+            args.scenario,
         ],
         repo,
     )
@@ -153,6 +155,7 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
         f"- candidates: `{summary['candidates']}`",
         f"- top_k: `{summary['top_k']}`",
         f"- budget: `{summary['budget']}`",
+        f"- scenario: `{summary['scenario']}`",
         "",
         "## Retrieval Baselines",
         "",
@@ -198,6 +201,7 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
+    parser.add_argument("--scenario", choices=["standard", "longitudinal"], default="longitudinal")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu", action="store_true")
@@ -223,6 +227,7 @@ def main() -> None:
         "candidates": args.candidates,
         "top_k": args.top_k,
         "budget": args.budget,
+        "scenario": args.scenario,
         "dataset": str(dataset),
         "checkpoints": checkpoints,
         "baselines": baselines,

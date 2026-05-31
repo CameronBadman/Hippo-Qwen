@@ -82,15 +82,21 @@ def selector_features(
     state = state_features(anchor, candidate)
     candidate_len = max(1, len(tokens(candidate.get("text", ""))))
     anchor_len = max(1, len(tokens(anchor.get("text", ""))))
+    query_len = max(1, len(tokens(query)))
+    metadata = candidate.get("metadata") or {}
     features = [
         cosine(query_embedding, candidate["embedding"]),
         jaccard(query, candidate.get("text", "")),
+        float(candidate.get("importance") or 0.5),
+        min(candidate_len / max(1, budget_tokens), 1.0),
+        min(candidate_len / 64.0, 1.0),
+        min(query_len, candidate_len) / max(query_len, candidate_len),
+        1.0 if metadata.get("project") else 0.0,
+        1.0 if candidate.get("cluster") else 0.0,
         cosine(anchor["embedding"], candidate["embedding"]),
         jaccard(anchor.get("text", ""), candidate.get("text", "")),
         metadata_score(anchor, candidate),
         cluster_score(anchor, candidate),
-        float(candidate.get("importance") or 0.5),
-        min(candidate_len / max(1, budget_tokens), 1.0),
         float(anchor.get("importance") or 0.5),
         min(anchor_len, candidate_len) / max(anchor_len, candidate_len),
         state["candidate_age_norm"],
