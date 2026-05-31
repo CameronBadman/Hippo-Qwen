@@ -9,7 +9,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from python.benchmarks.benchmark_librarian import average_metrics, evaluate_ranked, load_rows
-from python.selector.dataset import CONTEXT_REASONS, ContextSelectorDataset
+from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS, ContextSelectorDataset
 from python.selector.model import load_selector
 
 
@@ -71,6 +71,42 @@ def reason_report(model, row: dict, budget: int) -> dict:
     return {"total": total, "correct": correct, "confusion": confusion}
 
 
+def auxiliary_report(model, row: dict, budget: int) -> dict[str, dict[str, int]]:
+    import torch
+
+    dataset = ContextSelectorDataset.__new__(ContextSelectorDataset)
+    dataset.max_candidates = model.config.max_candidates
+    dataset.budget_tokens = budget
+    dataset.feature_dim = model.config.feature_dim
+    dataset.rows = [row]
+    item = dataset[0]
+    batch = {
+        "query": item["query"].unsqueeze(0),
+        "anchor": item["anchor"].unsqueeze(0),
+        "candidates": item["candidates"].unsqueeze(0),
+        "features": item["features"].unsqueeze(0),
+        "mask": item["mask"].unsqueeze(0),
+    }
+    device = next(model.parameters()).device
+    with torch.no_grad():
+        batch = {key: value.to(device) for key, value in batch.items()}
+        outputs = model(batch["query"], batch["anchor"], batch["candidates"], batch["features"], batch["mask"])
+        predicted = torch.sigmoid(outputs["auxiliary_logits"])[0].detach().cpu() >= 0.5
+    valid = item["mask"]
+    expected = item["auxiliary"] >= 0.5
+    report: dict[str, dict[str, int]] = {}
+    for idx, label in enumerate(AUXILIARY_LABELS):
+        pred = predicted[valid, idx]
+        exp = expected[valid, idx]
+        report[label] = {
+            "tp": int((pred & exp).sum().item()),
+            "fp": int((pred & ~exp).sum().item()),
+            "fn": int((~pred & exp).sum().item()),
+            "tn": int((~pred & ~exp).sum().item()),
+        }
+    return report
+
+
 def run(args: argparse.Namespace) -> dict:
     import torch
 
@@ -80,6 +116,7 @@ def run(args: argparse.Namespace) -> dict:
     metrics = []
     reason_totals = {"total": 0, "correct": 0}
     confusion: dict[str, dict[str, int]] = {}
+    auxiliary_totals = {label: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for label in AUXILIARY_LABELS}
     for row in rows:
         ranked = selector_scores(model, row, args.budget)
         metrics.append(evaluate_ranked(row, ranked, args.top_k, args.budget))
@@ -90,6 +127,10 @@ def run(args: argparse.Namespace) -> dict:
             confusion.setdefault(expected, {})
             for predicted, count in predicted_counts.items():
                 confusion[expected][predicted] = confusion[expected].get(predicted, 0) + count
+        auxiliary = auxiliary_report(model, row, args.budget)
+        for label, counts in auxiliary.items():
+            for key, count in counts.items():
+                auxiliary_totals[label][key] += count
     return {
         "dataset": args.dataset,
         "checkpoint": args.checkpoint,
@@ -98,6 +139,7 @@ def run(args: argparse.Namespace) -> dict:
         "budget": args.budget,
         "metrics": {"context_selector": average_metrics(metrics)},
         "reason_metrics": summarize_reasons(reason_totals, confusion),
+        "auxiliary_metrics": summarize_auxiliary(auxiliary_totals),
     }
 
 
@@ -115,6 +157,43 @@ def summarize_reasons(reason_totals: dict[str, int], confusion: dict[str, dict[s
         "correct": reason_totals["correct"],
         "total": reason_totals["total"],
         "confusion": confusion,
+    }
+
+
+def summarize_auxiliary(totals: dict[str, dict[str, int]]) -> dict:
+    per_label = {}
+    correct = 0
+    total = 0
+    macro_f1 = 0.0
+    labelled = 0
+    for label in AUXILIARY_LABELS:
+        counts = totals[label]
+        tp = counts["tp"]
+        fp = counts["fp"]
+        fn = counts["fn"]
+        tn = counts["tn"]
+        label_total = tp + fp + fn + tn
+        precision = tp / max(1, tp + fp)
+        recall = tp / max(1, tp + fn)
+        f1 = 2.0 * precision * recall / max(1e-6, precision + recall)
+        per_label[label] = {
+            "precision": precision,
+            "recall": recall,
+            "f1": f1,
+            "support": tp + fn,
+            "tp": tp,
+            "fp": fp,
+            "fn": fn,
+            "tn": tn,
+        }
+        correct += tp + tn
+        total += label_total
+        macro_f1 += f1
+        labelled += 1
+    return {
+        "bit_accuracy": correct / max(1, total),
+        "macro_f1": macro_f1 / max(1, labelled),
+        "per_label": per_label,
     }
 
 

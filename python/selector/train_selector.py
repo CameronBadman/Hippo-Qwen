@@ -12,7 +12,7 @@ import torch.nn.functional as F
 from torch.optim import AdamW
 from torch.utils.data import DataLoader, random_split
 
-from python.selector.dataset import CONTEXT_REASONS, ContextSelectorDataset, reason_label
+from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS, ContextSelectorDataset, reason_label
 from python.selector.model import MultiSeedContextSelector, SelectorConfig, save_selector
 
 
@@ -25,6 +25,7 @@ def collate(batch: list[dict]) -> dict:
         "mask": torch.stack([item["mask"] for item in batch]),
         "select": torch.stack([item["select"] for item in batch]),
         "reason": torch.stack([item["reason"] for item in batch]),
+        "auxiliary": torch.stack([item["auxiliary"] for item in batch]),
     }
 
 
@@ -79,6 +80,32 @@ def reason_metrics(reason_logits: torch.Tensor, reason: torch.Tensor, mask: torc
     return {"reason_accuracy": float((predicted[valid] == reason[valid]).float().mean().detach().cpu().item())}
 
 
+def auxiliary_loss(auxiliary_logits: torch.Tensor, auxiliary: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    valid = mask.bool()
+    if not valid.any():
+        return auxiliary_logits.sum() * 0
+    return F.binary_cross_entropy_with_logits(auxiliary_logits[valid], auxiliary[valid])
+
+
+def auxiliary_metrics(auxiliary_logits: torch.Tensor, auxiliary: torch.Tensor, mask: torch.Tensor) -> dict[str, float]:
+    valid = mask.bool()
+    if not valid.any():
+        return {"auxiliary_macro_f1": 0.0}
+    predicted = torch.sigmoid(auxiliary_logits[valid]) >= 0.5
+    expected = auxiliary[valid] >= 0.5
+    f1_scores = []
+    for idx in range(len(AUXILIARY_LABELS)):
+        pred = predicted[:, idx]
+        exp = expected[:, idx]
+        tp = (pred & exp).sum().float()
+        fp = (pred & ~exp).sum().float()
+        fn = (~pred & exp).sum().float()
+        precision = tp / torch.clamp(tp + fp, min=1.0)
+        recall = tp / torch.clamp(tp + fn, min=1.0)
+        f1_scores.append(2.0 * precision * recall / torch.clamp(precision + recall, min=1e-6))
+    return {"auxiliary_macro_f1": float(torch.stack(f1_scores).mean().detach().cpu().item())}
+
+
 def reason_class_weights(dataset: ContextSelectorDataset, device: torch.device, enabled: bool) -> torch.Tensor | None:
     if not enabled:
         return None
@@ -126,7 +153,8 @@ def train(args: argparse.Namespace) -> None:
             bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
             rank = ranking_loss(logits, batch["select"], batch["mask"])
             reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]], weight=reason_weights)
-            loss = bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss
+            aux = auxiliary_loss(outputs["auxiliary_logits"], batch["auxiliary"], batch["mask"])
+            loss = bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss + args.auxiliary_loss_weight * aux
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -137,6 +165,7 @@ def train(args: argparse.Namespace) -> None:
         val_losses = []
         val_metrics = []
         val_reason = []
+        val_auxiliary = []
         with torch.no_grad():
             for batch in val_loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
@@ -145,18 +174,21 @@ def train(args: argparse.Namespace) -> None:
                 bce = F.binary_cross_entropy_with_logits(logits[batch["mask"]], batch["select"][batch["mask"]])
                 rank = ranking_loss(logits, batch["select"], batch["mask"])
                 reason_loss = F.cross_entropy(outputs["reason_logits"][batch["mask"]], batch["reason"][batch["mask"]], weight=reason_weights)
-                val_losses.append(float((bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss).detach().cpu().item()))
+                aux = auxiliary_loss(outputs["auxiliary_logits"], batch["auxiliary"], batch["mask"])
+                val_losses.append(float((bce + args.rank_loss_weight * rank + args.reason_loss_weight * reason_loss + args.auxiliary_loss_weight * aux).detach().cpu().item()))
                 val_metrics.append(metrics(logits, batch["select"], batch["mask"], args.top_k))
                 val_reason.append(reason_metrics(outputs["reason_logits"], batch["reason"], batch["mask"]))
+                val_auxiliary.append(auxiliary_metrics(outputs["auxiliary_logits"], batch["auxiliary"], batch["mask"]))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         precision = sum(item["precision_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         mrr = sum(item["mrr"] for item in val_metrics) / max(1, len(val_metrics))
         reason_acc = sum(item["reason_accuracy"] for item in val_reason) / max(1, len(val_reason))
+        aux_macro_f1 = sum(item["auxiliary_macro_f1"] for item in val_auxiliary) / max(1, len(val_auxiliary))
         print(
             f"epoch={epoch + 1} train_loss={train_loss / max(1, len(train_loader)):.4f} "
             f"val_loss={sum(val_losses) / max(1, len(val_losses)):.4f} "
             f"val_recall@{args.top_k}={recall:.3f} val_precision@{args.top_k}={precision:.3f} "
-            f"val_mrr={mrr:.3f} val_reason_acc={reason_acc:.3f}",
+            f"val_mrr={mrr:.3f} val_reason_acc={reason_acc:.3f} val_aux_macro_f1={aux_macro_f1:.3f}",
             flush=True,
         )
 
@@ -180,6 +212,7 @@ def main() -> None:
     parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--rank-loss-weight", type=float, default=0.25)
     parser.add_argument("--reason-loss-weight", type=float, default=0.1)
+    parser.add_argument("--auxiliary-loss-weight", type=float, default=0.05)
     parser.add_argument("--reason-class-balance", action="store_true")
     parser.add_argument("--no-reason-class-balance", dest="reason_class_balance", action="store_false")
     parser.set_defaults(reason_class_balance=False)

@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 
 from python.librarian.features import DEFAULT_DIMS
-from python.selector.dataset import CONTEXT_REASONS
+from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS
 
 
 @dataclass
@@ -22,6 +22,7 @@ class SelectorConfig:
     budget_tokens: int = 90
     use_anchor_seed: bool = True
     num_reasons: int = len(CONTEXT_REASONS)
+    num_auxiliary_labels: int = len(AUXILIARY_LABELS)
 
 
 class MultiSeedContextSelector(nn.Module):
@@ -45,6 +46,7 @@ class MultiSeedContextSelector(nn.Module):
         self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
         self.select_head = nn.Linear(config.d_model, 1)
         self.reason_head = nn.Linear(config.d_model, config.num_reasons)
+        self.auxiliary_head = nn.Linear(config.d_model, config.num_auxiliary_labels)
 
     def forward(
         self,
@@ -66,6 +68,7 @@ class MultiSeedContextSelector(nn.Module):
         return {
             "select_logits": self.select_head(hidden).squeeze(-1),
             "reason_logits": self.reason_head(hidden),
+            "auxiliary_logits": self.auxiliary_head(hidden),
         }
 
 
@@ -78,6 +81,9 @@ def save_selector(model: MultiSeedContextSelector, path: str | Path) -> None:
 def load_selector(path: str | Path, device: torch.device | str = "cpu") -> MultiSeedContextSelector:
     checkpoint = torch.load(path, map_location=device)
     model = MultiSeedContextSelector(SelectorConfig(**checkpoint["config"])).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
+    missing, unexpected = model.load_state_dict(checkpoint["state_dict"], strict=False)
+    allowed_missing = {"auxiliary_head.weight", "auxiliary_head.bias"}
+    if set(missing) - allowed_missing or unexpected:
+        raise RuntimeError(f"checkpoint state mismatch: missing={missing} unexpected={unexpected}")
     model.eval()
     return model

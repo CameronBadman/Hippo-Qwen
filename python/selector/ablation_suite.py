@@ -19,30 +19,35 @@ SELECTOR_ABLATIONS: dict[str, dict[str, Any]] = {
         "feature_dim": 8,
         "rank_loss_weight": 0.25,
         "reason_loss_weight": 0.1,
+        "auxiliary_loss_weight": 0.05,
         "query_only": True,
     },
     "multi_seed_no_state": {
         "feature_dim": 21,
         "rank_loss_weight": 0.25,
         "reason_loss_weight": 0.1,
+        "auxiliary_loss_weight": 0.05,
         "query_only": False,
     },
     "multi_seed_full": {
         "feature_dim": 31,
         "rank_loss_weight": 0.25,
         "reason_loss_weight": 0.1,
+        "auxiliary_loss_weight": 0.05,
         "query_only": False,
     },
-    "multi_seed_full_no_reason": {
+    "multi_seed_full_no_explainers": {
         "feature_dim": 31,
         "rank_loss_weight": 0.25,
         "reason_loss_weight": 0.0,
+        "auxiliary_loss_weight": 0.0,
         "query_only": False,
     },
     "multi_seed_no_rank": {
         "feature_dim": 31,
         "rank_loss_weight": 0.0,
         "reason_loss_weight": 0.1,
+        "auxiliary_loss_weight": 0.05,
         "query_only": False,
     },
 }
@@ -107,6 +112,8 @@ def train_selector(args: argparse.Namespace, repo: Path, dataset: Path, name: st
         str(config["rank_loss_weight"]),
         "--reason-loss-weight",
         str(config["reason_loss_weight"]),
+        "--auxiliary-loss-weight",
+        str(config["auxiliary_loss_weight"]),
         "--d-model",
         str(args.d_model),
         "--layers",
@@ -193,6 +200,10 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
     for name, result in summary["selectors"].items():
         reason = result.get("reason_metrics") or {}
         lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('macro_recall', 0.0):.4f} | {reason.get('total', 0)} |")
+    lines.extend(["", "## Auxiliary Multi-Label Head", "", "| ablation | bit accuracy | macro f1 |", "| --- | ---: | ---: |"])
+    for name, result in summary["selectors"].items():
+        auxiliary = result.get("auxiliary_metrics") or {}
+        lines.append(f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | {auxiliary.get('macro_f1', 0.0):.4f} |")
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 

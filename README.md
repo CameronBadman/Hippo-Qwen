@@ -132,7 +132,10 @@ The context selector is a separate experiment for less greedy retrieval. It
 trains on the whole candidate set for a retrieval task and learns which memories
 belong in the final context, rather than scoring every edge independently.
 It uses only observable query, anchor, candidate, and memory-state features;
-the synthetic role labels are withheld from the model.
+the synthetic role labels are withheld from the model. The training objective
+also includes optional explanation heads: a single reason class and a multi-label
+auxiliary head for relevance, context match, preference match/conflict, stale
+duplicates, and wrong-context decisions.
 
 ```bash
 python3 -m python.selector.train_selector \
@@ -151,7 +154,8 @@ python3 -m python.selector.benchmark_selector \
 ```
 
 Run selector ablations for query-only, multi-seed, no-state, and no-ranking-loss
-variants:
+variants. The generated summaries include retrieval metrics, reason-head macro
+recall, and auxiliary-head macro F1:
 
 ```bash
 python3 -m python.selector.ablation_suite \

@@ -29,6 +29,15 @@ CONTEXT_REASONS = [
     "wrong_context",
 ]
 REASON_TO_ID = {name: idx for idx, name in enumerate(CONTEXT_REASONS)}
+AUXILIARY_LABELS = [
+    "relevant",
+    "same_context",
+    "preference_match",
+    "preference_conflict",
+    "cross_context",
+    "stale_or_duplicate",
+    "wrong_context",
+]
 
 
 class ContextSelectorDataset(Dataset):
@@ -59,14 +68,17 @@ class ContextSelectorDataset(Dataset):
         mask = torch.zeros((self.max_candidates,), dtype=torch.bool)
         select = torch.zeros((self.max_candidates,), dtype=torch.float32)
         reason = torch.full((self.max_candidates,), -100, dtype=torch.long)
+        auxiliary = torch.zeros((self.max_candidates, len(AUXILIARY_LABELS)), dtype=torch.float32)
 
         for idx, candidate in enumerate(candidates):
             ensure_embedding(candidate)
             candidate_embeddings[idx] = torch.tensor(candidate["embedding"], dtype=torch.float32)
             features[idx] = torch.tensor(selector_features(query, query_embedding, anchor, candidate, self.budget_tokens, self.feature_dim))
             mask[idx] = True
-            select[idx] = 1.0 if candidate["id"] in relevant else 0.0
-            reason[idx] = reason_label(anchor, candidate, candidate["id"] in relevant)
+            is_relevant = candidate["id"] in relevant
+            select[idx] = 1.0 if is_relevant else 0.0
+            reason[idx] = reason_label(anchor, candidate, is_relevant)
+            auxiliary[idx] = torch.tensor(auxiliary_labels(anchor, candidate, is_relevant), dtype=torch.float32)
 
         return {
             "query": torch.tensor(query_embedding, dtype=torch.float32),
@@ -76,6 +88,7 @@ class ContextSelectorDataset(Dataset):
             "mask": mask,
             "select": select,
             "reason": reason,
+            "auxiliary": auxiliary,
             "ids": [candidate["id"] for candidate in candidates],
             "texts": [candidate.get("text", "") for candidate in candidates],
             "relevant_ids": relevant,
@@ -215,3 +228,24 @@ def reason_label(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bo
     }:
         return REASON_TO_ID["wrong_context"]
     return REASON_TO_ID["wrong_context"]
+
+
+def auxiliary_labels(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bool) -> list[float]:
+    role = str(candidate.get("synthetic_role") or "")
+    same_context = cluster_score(anchor, candidate) > 0
+    stale_or_duplicate = role in {"stale_negative", "stale_same_context_negative", "near_duplicate"}
+    cross_context = bool(str(anchor.get("cluster") or "") and str(candidate.get("cluster") or "") and anchor.get("cluster") != candidate.get("cluster"))
+    preference = preference_features(anchor.get("text", ""), candidate.get("text", ""))
+    preference_match = role in {"cross_relevant", "preference_relevant"} or preference["overlap"] > 0.0
+    preference_conflict = role == "same_project_wrong_preference_negative" or (same_context and preference["conflict"] > 0.0)
+    wrong_context = not relevant and not stale_or_duplicate
+    values = {
+        "relevant": relevant,
+        "same_context": same_context,
+        "preference_match": preference_match,
+        "preference_conflict": preference_conflict,
+        "cross_context": cross_context,
+        "stale_or_duplicate": stale_or_duplicate,
+        "wrong_context": wrong_context,
+    }
+    return [1.0 if values[label] else 0.0 for label in AUXILIARY_LABELS]
