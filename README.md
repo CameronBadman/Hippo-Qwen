@@ -157,7 +157,8 @@ python3 -m python.selector.benchmark_selector \
 
 Run selector ablations for query-only, multi-seed, no-state, and no-ranking-loss
 variants. The generated summaries include retrieval metrics, reason-head macro
-recall, and auxiliary-head macro F1:
+recall, auxiliary-head macro F1, and per-role exposure rates showing which
+synthetic decoys enter top-k or budgeted context:
 
 ```bash
 python3 -m python.selector.ablation_suite \
@@ -171,6 +172,20 @@ By default this uses the `longitudinal` synthetic scenario, which is designed to
 stress the non-greedy selector: generic queries, stale same-context negatives,
 popular wrong-context negatives, and memory-state features such as use count,
 evidence count, and last outcome.
+
+Use `--scenario adversarial` for a harder stress test with contradictory
+preferences, high-similarity stale memories, protected old positives, lexical
+decoys, popular wrong-project memories, and near duplicates:
+
+```bash
+python3 -m python.selector.temporal_evaluation \
+  --work-dir artifacts/librarian/adversarial_eval \
+  --scenario adversarial \
+  --cases 8000 \
+  --train-fraction 0.75 \
+  --eval-limit 1000 \
+  --epochs 6
+```
 
 Run a temporal evaluation that trains on earlier generated cases and tests on
 later cases:

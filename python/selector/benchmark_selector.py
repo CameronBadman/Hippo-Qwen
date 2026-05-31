@@ -9,6 +9,7 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from python.benchmarks.benchmark_librarian import average_metrics, evaluate_ranked, load_rows
+from python.librarian.features import tokens
 from python.selector.calibration import default_auxiliary_thresholds, summarize_auxiliary, tune_auxiliary_thresholds
 from python.selector.dataset import AUXILIARY_LABELS, CONTEXT_REASONS, ContextSelectorDataset
 from python.selector.model import load_selector
@@ -37,6 +38,41 @@ def selector_scores(model, row: dict, budget: int) -> list[tuple[str, float, str
         probs = torch.sigmoid(outputs["select_logits"])[0].detach().cpu().tolist()
     scored = [(candidate_id, float(probs[idx]), item["texts"][idx]) for idx, candidate_id in enumerate(item["ids"])]
     return sorted(scored, key=lambda entry: (-entry[1], entry[0]))
+
+
+def role_exposure(row: dict, ranked: list[tuple[str, float, str]], top_k: int, default_budget: int) -> dict[str, dict[str, int]]:
+    relevant = relevant_ids_for_row(row)
+    candidates = row.get("candidates", [])
+    roles = {candidate["id"]: str(candidate.get("synthetic_role") or "history") for candidate in candidates}
+    totals: dict[str, dict[str, int]] = {}
+    for candidate in candidates:
+        role = roles[candidate["id"]]
+        totals.setdefault(role, {"total": 0, "relevant": 0, "top_k": 0, "budget": 0})
+        totals[role]["total"] += 1
+        if candidate["id"] in relevant:
+            totals[role]["relevant"] += 1
+
+    for candidate_id, _, _ in ranked[:top_k]:
+        role = roles.get(candidate_id, "unknown")
+        totals.setdefault(role, {"total": 0, "relevant": 0, "top_k": 0, "budget": 0})
+        totals[role]["top_k"] += 1
+
+    budget = int((row.get("retrieval_task") or {}).get("budget") or default_budget)
+    used = 0
+    for candidate_id, _, text in ranked:
+        cost = max(1, len(tokens(text)))
+        if used + cost > budget:
+            break
+        role = roles.get(candidate_id, "unknown")
+        totals.setdefault(role, {"total": 0, "relevant": 0, "top_k": 0, "budget": 0})
+        totals[role]["budget"] += 1
+        used += cost
+    return totals
+
+
+def relevant_ids_for_row(row: dict) -> set[str]:
+    task = row.get("retrieval_task") or {}
+    return set(task.get("relevant_ids") or [])
 
 
 def reason_report(model, row: dict, budget: int) -> dict:
@@ -122,6 +158,7 @@ def run(args: argparse.Namespace) -> dict:
     confusion: dict[str, dict[str, int]] = {}
     auxiliary_totals = {label: {"tp": 0, "fp": 0, "fn": 0, "tn": 0} for label in AUXILIARY_LABELS}
     auxiliary_samples: dict[str, list[tuple[float, bool]]] = {label: [] for label in AUXILIARY_LABELS}
+    role_totals: dict[str, dict[str, int]] = {}
     if args.use_checkpoint_auxiliary_thresholds:
         auxiliary_thresholds = getattr(model, "auxiliary_thresholds", None) or default_auxiliary_thresholds(args.auxiliary_threshold)
     else:
@@ -129,6 +166,11 @@ def run(args: argparse.Namespace) -> dict:
     for row in rows:
         ranked = selector_scores(model, row, args.budget)
         metrics.append(evaluate_ranked(row, ranked, args.top_k, args.budget))
+        exposure = role_exposure(row, ranked, args.top_k, args.budget)
+        for role, counts in exposure.items():
+            role_totals.setdefault(role, {"total": 0, "relevant": 0, "top_k": 0, "budget": 0})
+            for key, count in counts.items():
+                role_totals[role][key] += count
         report = reason_report(model, row, args.budget)
         reason_totals["total"] += report["total"]
         reason_totals["correct"] += report["correct"]
@@ -155,6 +197,7 @@ def run(args: argparse.Namespace) -> dict:
         "metrics": {"context_selector": average_metrics(metrics)},
         "reason_metrics": summarize_reasons(reason_totals, confusion),
         "auxiliary_metrics": auxiliary_metrics,
+        "role_metrics": summarize_roles(role_totals),
     }
 
 
@@ -173,6 +216,22 @@ def summarize_reasons(reason_totals: dict[str, int], confusion: dict[str, dict[s
         "total": reason_totals["total"],
         "confusion": confusion,
     }
+
+
+def summarize_roles(role_totals: dict[str, dict[str, int]]) -> dict[str, dict[str, float | int]]:
+    summary = {}
+    for role, counts in sorted(role_totals.items()):
+        total = max(1, counts["total"])
+        summary[role] = {
+            "total": counts["total"],
+            "relevant": counts["relevant"],
+            "top_k": counts["top_k"],
+            "budget": counts["budget"],
+            "relevant_rate": counts["relevant"] / total,
+            "top_k_rate": counts["top_k"] / total,
+            "budget_rate": counts["budget"] / total,
+        }
+    return summary
 
 
 def main() -> None:

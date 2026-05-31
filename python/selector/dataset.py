@@ -210,7 +210,7 @@ def context_features(
 
 def reason_label(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bool) -> int:
     role = str(candidate.get("synthetic_role") or "")
-    if role in {"stale_negative", "stale_same_context_negative", "near_duplicate"}:
+    if role in {"stale_negative", "stale_same_context_negative", "stale_high_similarity_negative", "near_duplicate"}:
         return REASON_TO_ID["stale_or_superseded"]
     if role in {"cross_relevant"}:
         return REASON_TO_ID["cross_context_support"]
@@ -220,7 +220,10 @@ def reason_label(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bo
         return REASON_TO_ID["same_context"] if cluster_score(anchor, candidate) > 0 else REASON_TO_ID["cross_context_support"]
     if role in {
         "same_project_wrong_preference_negative",
+        "contradicted_preference_negative",
         "popular_wrong_context_negative",
+        "popular_wrong_project_negative",
+        "lexical_decoy_negative",
         "same_project_hard_negative",
         "other_negative",
         "noise_negative",
@@ -233,11 +236,13 @@ def reason_label(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bo
 def auxiliary_labels(anchor: dict[str, Any], candidate: dict[str, Any], relevant: bool) -> list[float]:
     role = str(candidate.get("synthetic_role") or "")
     same_context = cluster_score(anchor, candidate) > 0
-    stale_or_duplicate = role in {"stale_negative", "stale_same_context_negative", "near_duplicate"}
+    stale_or_duplicate = role in {"stale_negative", "stale_same_context_negative", "stale_high_similarity_negative", "near_duplicate"}
     cross_context = bool(str(anchor.get("cluster") or "") and str(candidate.get("cluster") or "") and anchor.get("cluster") != candidate.get("cluster"))
     preference = preference_features(anchor.get("text", ""), candidate.get("text", ""))
     preference_match = role in {"cross_relevant", "preference_relevant"} or preference["overlap"] > 0.0
-    preference_conflict = role == "same_project_wrong_preference_negative" or (same_context and preference["conflict"] > 0.0)
+    preference_conflict = role in {"same_project_wrong_preference_negative", "contradicted_preference_negative"} or (
+        same_context and preference["conflict"] > 0.0
+    )
     wrong_context = not relevant and not stale_or_duplicate
     values = {
         "relevant": relevant,

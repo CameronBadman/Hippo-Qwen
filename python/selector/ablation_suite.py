@@ -211,6 +211,14 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
             f"| {name} | {auxiliary.get('bit_accuracy', 0.0):.4f} | "
             f"{auxiliary.get('macro_f1', 0.0):.4f} | {tuned.get('macro_f1', 0.0):.4f} |"
         )
+    lines.extend(["", "## Role Exposure", "", "| ablation | role | relevant rate | top-k rate | budget rate | total |", "| --- | --- | ---: | ---: | ---: | ---: |"])
+    for name, result in summary["selectors"].items():
+        roles = result.get("role_metrics") or {}
+        for role, metrics in sorted(roles.items(), key=lambda item: (-item[1].get("top_k_rate", 0.0), item[0])):
+            lines.append(
+                f"| {name} | {role} | {metrics.get('relevant_rate', 0.0):.4f} | "
+                f"{metrics.get('top_k_rate', 0.0):.4f} | {metrics.get('budget_rate', 0.0):.4f} | {metrics.get('total', 0)} |"
+            )
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
@@ -235,7 +243,7 @@ def main() -> None:
     parser.add_argument("--heads", type=int, default=4)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
-    parser.add_argument("--scenario", choices=["standard", "longitudinal"], default="longitudinal")
+    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial"], default="longitudinal")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--cpu", action="store_true")
