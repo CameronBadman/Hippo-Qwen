@@ -97,12 +97,24 @@ def run(args: argparse.Namespace) -> dict:
         "top_k": args.top_k,
         "budget": args.budget,
         "metrics": {"context_selector": average_metrics(metrics)},
-        "reason_metrics": {
-            "accuracy": reason_totals["correct"] / max(1, reason_totals["total"]),
-            "correct": reason_totals["correct"],
-            "total": reason_totals["total"],
-            "confusion": confusion,
-        },
+        "reason_metrics": summarize_reasons(reason_totals, confusion),
+    }
+
+
+def summarize_reasons(reason_totals: dict[str, int], confusion: dict[str, dict[str, int]]) -> dict:
+    per_class_recall = {}
+    for expected in CONTEXT_REASONS:
+        predicted_counts = confusion.get(expected, {})
+        total = sum(predicted_counts.values())
+        if total > 0:
+            per_class_recall[expected] = predicted_counts.get(expected, 0) / total
+    return {
+        "accuracy": reason_totals["correct"] / max(1, reason_totals["total"]),
+        "macro_recall": sum(per_class_recall.values()) / max(1, len(per_class_recall)),
+        "per_class_recall": per_class_recall,
+        "correct": reason_totals["correct"],
+        "total": reason_totals["total"],
+        "confusion": confusion,
     }
 
 

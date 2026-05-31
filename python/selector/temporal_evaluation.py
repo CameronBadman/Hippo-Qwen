@@ -86,10 +86,10 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
     for name, result in summary["selectors"].items():
         lines.append(format_metric_row(name, result["metrics"]["context_selector"]))
 
-    lines.extend(["", "## Reason Head", "", "| ablation | reason accuracy | labelled candidates |", "| --- | ---: | ---: |"])
+    lines.extend(["", "## Reason Head", "", "| ablation | reason accuracy | macro recall | labelled candidates |", "| --- | ---: | ---: | ---: |"])
     for name, result in summary["selectors"].items():
         reason = result.get("reason_metrics") or {}
-        lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('total', 0)} |")
+        lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('macro_recall', 0.0):.4f} | {reason.get('total', 0)} |")
 
     lines.extend(["", "## Error Highlights", ""])
     for name, result in summary["error_analysis"].items():

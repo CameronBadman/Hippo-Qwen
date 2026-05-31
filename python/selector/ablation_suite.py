@@ -189,10 +189,10 @@ def write_summary(summary: dict[str, Any], output_dir: Path) -> None:
     for name, result in summary["selectors"].items():
         metrics = result["metrics"]["context_selector"]
         lines.append(format_metric_row(name, metrics))
-    lines.extend(["", "## Reason Head", "", "| ablation | reason accuracy | labelled candidates |", "| --- | ---: | ---: |"])
+    lines.extend(["", "## Reason Head", "", "| ablation | reason accuracy | macro recall | labelled candidates |", "| --- | ---: | ---: | ---: |"])
     for name, result in summary["selectors"].items():
         reason = result.get("reason_metrics") or {}
-        lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('total', 0)} |")
+        lines.append(f"| {name} | {reason.get('accuracy', 0.0):.4f} | {reason.get('macro_recall', 0.0):.4f} | {reason.get('total', 0)} |")
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
