@@ -206,6 +206,23 @@ python3 -m python.selector.evolution_benchmark \
 Pass `--checkpoint artifacts/librarian/temporal_eval/multi_seed_full.pt` to
 include the transformer context selector in the same static-vs-evolved loop.
 
+To train the selector on the same evolved state it sees online, expand a case
+file with simulated feedback first:
+
+```bash
+python3 -m python.selector.evolve_dataset \
+  --input artifacts/librarian/adversarial_eval/train_cases.jsonl \
+  --output artifacts/librarian/adversarial_eval/train_cases_evolved.jsonl \
+  --passes 2 \
+  --feedback-scorer heuristic_graph
+
+python3 -m python.selector.train_selector \
+  --dataset artifacts/librarian/adversarial_eval/train_cases_evolved.jsonl \
+  --output artifacts/librarian/adversarial_eval/multi_seed_full_evolved.pt \
+  --feature-dim 31 \
+  --epochs 6
+```
+
 Run a temporal evaluation that trains on earlier generated cases and tests on
 later cases:
 
