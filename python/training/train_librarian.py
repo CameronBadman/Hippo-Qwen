@@ -21,7 +21,9 @@ def masked_mean(values: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
     return masked.sum() / mask.float().sum().clamp(min=1.0)
 
 
-def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, float]]:
+def compute_loss(
+    outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor], rank_loss_weight: float = 0.25
+) -> tuple[torch.Tensor, dict[str, float]]:
     mask = batch["mask"]
     attach_loss = F.binary_cross_entropy_with_logits(outputs["attach_logits"][mask], batch["attach"][mask])
     rank_loss = pairwise_ranking_loss(outputs["attach_logits"], batch["rank"], mask)
@@ -35,7 +37,15 @@ def compute_loss(outputs: dict[str, torch.Tensor], batch: dict[str, torch.Tensor
     else:
         zero = outputs["attach_logits"].sum() * 0
         edge_loss = weight_loss = confidence_loss = decay_loss = importance_loss = zero
-    total = attach_loss + 0.35 * edge_loss + 0.25 * rank_loss + weight_loss + confidence_loss + decay_loss + importance_loss
+    total = (
+        attach_loss
+        + 0.35 * edge_loss
+        + rank_loss_weight * rank_loss
+        + weight_loss
+        + confidence_loss
+        + decay_loss
+        + importance_loss
+    )
     metrics = {
         "loss": float(total.detach().cpu().item()),
         "attach_loss": float(attach_loss.detach().cpu().item()),
@@ -129,7 +139,7 @@ def train(args: argparse.Namespace) -> None:
         for batch in train_loader:
             batch = {key: value.to(device) for key, value in batch.items()}
             outputs = model(batch["anchor"], batch["candidates"], batch["pair_features"], batch["mask"])
-            loss, _ = compute_loss(outputs, batch)
+            loss, _ = compute_loss(outputs, batch, args.rank_loss_weight)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -145,7 +155,7 @@ def train(args: argparse.Namespace) -> None:
             for batch in val_loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
                 outputs = model(batch["anchor"], batch["candidates"], batch["pair_features"], batch["mask"])
-                loss, _ = compute_loss(outputs, batch)
+                loss, _ = compute_loss(outputs, batch, args.rank_loss_weight)
                 val_losses.append(float(loss.detach().cpu().item()))
                 val_accs.append(accuracy(outputs, batch))
                 rank = ranking_metrics(outputs, batch)
@@ -180,6 +190,7 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--rank-loss-weight", type=float, default=0.25)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--cpu", action="store_true")

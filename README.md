@@ -111,3 +111,17 @@ python3 -m python.benchmarks.benchmark_librarian \
   --output-json artifacts/librarian/benchmark.json \
   --output-md artifacts/librarian/benchmark.md
 ```
+
+Run the full local-first evaluation suite:
+
+```bash
+python3 -m python.benchmarks.evaluation_suite \
+  --work-dir artifacts/librarian/eval_suite \
+  --cases 5000 \
+  --eval-limit 1000 \
+  --epochs 6
+```
+
+The suite generates hard cases, trains the full transformer plus ablations
+without state features and without ranking loss, runs retrieval benchmarks, and
+writes threshold-sweep metrics to `summary.json` and `summary.md`.
