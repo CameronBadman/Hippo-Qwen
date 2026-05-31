@@ -226,6 +226,21 @@ python3 -m python.selector.train_selector \
   --epochs 6
 ```
 
+Run a cross-seed regression to compare raw selector training against
+evolved-state-augmented selector training:
+
+```bash
+python3 -m python.selector.evolved_state_regression \
+  --work-dir artifacts/librarian/evolved_state_regression \
+  --seeds 51,53,55 \
+  --cases 5000 \
+  --epochs 4
+```
+
+The regression writes per-seed checkpoints and aggregate `summary.json` /
+`summary.md` reports. By default it evaluates `always@0`, which means online
+memory-state mutation is enabled but selector post-rank graph bias remains off.
+
 Run a temporal evaluation that trains on earlier generated cases and tests on
 later cases:
 
