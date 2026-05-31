@@ -226,7 +226,7 @@ def iter_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
             "retrieval_task": {
                 "query": f"Find memories useful for {anchor['cluster']} when the user {anchor_task} and {anchor_preference}.",
                 "relevant_ids": relevant_ids,
-                "budget": 900,
+                "budget": 90,
             },
             "teacher": "synthetic_retrieval_v1",
             "schema_version": 2,

@@ -78,3 +78,36 @@ python3 -m python.training.train_librarian \
 The first model target is imitation of the heuristic librarian. Qwen teacher
 labels can replace the synthetic labels later without changing the model or
 service contract.
+
+Generate harder local-first cases with retrieval labels:
+
+```bash
+python3 python/synthetic/generate.py \
+  --output data/synthetic/librarian_hard_cases.jsonl \
+  --count 12000 \
+  --candidates 32
+```
+
+The current synthetic schema includes hard negatives, cross-project positives,
+weak near-duplicates, compact memory-state features, and a `retrieval_task`
+section for benchmarking retrieval under a context budget.
+
+Run the benchmark without a model:
+
+```bash
+python3 -m python.benchmarks.benchmark_librarian \
+  --dataset data/synthetic/librarian_hard_cases.jsonl \
+  --limit 1000 \
+  --output-md artifacts/librarian/benchmark.md
+```
+
+Run it with a trained checkpoint:
+
+```bash
+python3 -m python.benchmarks.benchmark_librarian \
+  --dataset data/synthetic/librarian_hard_cases.jsonl \
+  --checkpoint artifacts/librarian/neighborhood_transformer.pt \
+  --limit 1000 \
+  --output-json artifacts/librarian/benchmark.json \
+  --output-md artifacts/librarian/benchmark.md
+```
