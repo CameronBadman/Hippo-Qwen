@@ -125,3 +125,25 @@ python3 -m python.benchmarks.evaluation_suite \
 The suite generates hard cases, trains the full transformer plus ablations
 without state features and without ranking loss, runs retrieval benchmarks, and
 writes threshold-sweep metrics to `summary.json` and `summary.md`.
+
+## Multi-Seed Context Selector
+
+The context selector is a separate experiment for less greedy retrieval. It
+trains on the whole candidate set for a retrieval task and learns which memories
+belong in the final context, rather than scoring every edge independently.
+
+```bash
+python3 -m python.selector.train_selector \
+  --dataset data/synthetic/librarian_hard_cases.jsonl \
+  --output artifacts/librarian/context_selector.pt \
+  --epochs 6
+```
+
+Benchmark it:
+
+```bash
+python3 -m python.selector.benchmark_selector \
+  --dataset data/synthetic/librarian_hard_cases.jsonl \
+  --checkpoint artifacts/librarian/context_selector.pt \
+  --limit 1000
+```
