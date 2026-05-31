@@ -187,6 +187,23 @@ python3 -m python.selector.temporal_evaluation \
   --epochs 6
 ```
 
+Run the online memory-evolution benchmark to compare static retrieval against
+retrieval after simulated helpful/ignored/corrected feedback updates. The
+evolved path mutates memory state fields and learns graph-bias signatures from
+observable relationships such as project match, preference relation, stale
+status, and duplicate-like text:
+
+```bash
+python3 -m python.selector.evolution_benchmark \
+  --scenario adversarial \
+  --cases 2000 \
+  --output-json artifacts/librarian/evolution/summary.json \
+  --output-md artifacts/librarian/evolution/summary.md
+```
+
+Pass `--checkpoint artifacts/librarian/temporal_eval/multi_seed_full.pt` to
+include the transformer context selector in the same static-vs-evolved loop.
+
 Run a temporal evaluation that trains on earlier generated cases and tests on
 later cases:
 
