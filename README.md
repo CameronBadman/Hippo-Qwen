@@ -165,3 +165,24 @@ By default this uses the `longitudinal` synthetic scenario, which is designed to
 stress the non-greedy selector: generic queries, stale same-context negatives,
 popular wrong-context negatives, and memory-state features such as use count,
 evidence count, and last outcome.
+
+Run a temporal evaluation that trains on earlier generated cases and tests on
+later cases:
+
+```bash
+python3 -m python.selector.temporal_evaluation \
+  --work-dir artifacts/librarian/temporal_eval \
+  --cases 8000 \
+  --train-fraction 0.75 \
+  --eval-limit 1000 \
+  --epochs 6
+```
+
+Inspect selector failures by synthetic role:
+
+```bash
+python3 -m python.selector.error_analysis \
+  --dataset artifacts/librarian/temporal_eval/eval_cases.jsonl \
+  --checkpoint artifacts/librarian/temporal_eval/multi_seed_full.pt \
+  --output-md artifacts/librarian/temporal_eval/multi_seed_full_errors.md
+```
