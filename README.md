@@ -43,11 +43,38 @@ collisions. The non-`/api` routes remain available for curl and compatibility.
 
 ## Python Librarian Placeholder
 
-The Python service mirrors the future PyTorch model contract:
+The Python service mirrors the PyTorch model contract:
 
 ```bash
 python3 python/librarian/service.py --addr 127.0.0.1 --port 8090
 ```
 
-It is intentionally heuristic for now. Later it will load the trained
-neighborhood transformer artifact.
+Without a checkpoint it uses the heuristic librarian. With a checkpoint it
+loads the trained neighborhood transformer:
+
+```bash
+python3 python/librarian/service.py \
+  --checkpoint artifacts/librarian/neighborhood_transformer.pt
+```
+
+Generate heuristic-labeled synthetic cases:
+
+```bash
+python3 python/synthetic/generate.py \
+  --output data/synthetic/librarian_cases.jsonl \
+  --count 5000 \
+  --candidates 32
+```
+
+Train in Colab or another PyTorch environment:
+
+```bash
+python3 -m python.training.train_librarian \
+  --dataset data/synthetic/librarian_cases.jsonl \
+  --output artifacts/librarian/neighborhood_transformer.pt \
+  --epochs 8
+```
+
+The first model target is imitation of the heuristic librarian. Qwen teacher
+labels can replace the synthetic labels later without changing the model or
+service contract.

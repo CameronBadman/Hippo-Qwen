@@ -2,65 +2,26 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
-import re
+import sys
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from pathlib import Path
 from typing import Any
 
-TOKEN_RE = re.compile(r"[a-z0-9]+")
+if __package__ is None or __package__ == "":
+    sys.path.append(str(Path(__file__).resolve().parents[2]))
 
+from python.librarian.inference import score_with_heuristic
 
-def tokens(text: str) -> set[str]:
-    return set(TOKEN_RE.findall(text.lower()))
-
-
-def jaccard(left: str, right: str) -> float:
-    a = tokens(left)
-    b = tokens(right)
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
-def cosine(a: list[float], b: list[float]) -> float:
-    if not a or len(a) != len(b):
-        return 0.0
-    dot = sum(x * y for x, y in zip(a, b))
-    na = math.sqrt(sum(x * x for x in a))
-    nb = math.sqrt(sum(y * y for y in b))
-    if na == 0 or nb == 0:
-        return 0.0
-    return dot / (na * nb)
+MODEL = None
+THRESHOLD = 0.5
 
 
 def score_neighborhood(payload: dict[str, Any]) -> dict[str, Any]:
-    anchor = payload["anchor"]
-    candidates = payload.get("candidates", [])
-    actions = []
-    for candidate in candidates:
-        semantic = cosine(anchor.get("embedding", []), candidate.get("embedding", []))
-        lexical = jaccard(anchor.get("text", ""), candidate.get("text", ""))
-        score = 0.65 * semantic + 0.35 * lexical
-        if score < 0.25:
-            continue
-        edge_type = "same_topic" if lexical > 0.15 else "used_with"
-        actions.append(
-            {
-                "candidate_id": candidate["id"],
-                "connect_score": score,
-                "edge_type": edge_type,
-                "weight": min(1.2, 0.2 + score),
-                "decay_rate": 0.02,
-                "importance_delta": max(-0.04, min(0.08, (score - 0.5) * 0.08)),
-            }
-        )
-    actions.sort(key=lambda item: (-item["connect_score"], item["candidate_id"]))
-    actions = actions[:8]
-    return {
-        "actions": actions,
-        "create_new_cluster": len(actions) == 0,
-        "new_cluster_score": 1.0 - (actions[0]["connect_score"] if actions else 0.0),
-    }
+    if MODEL is not None:
+        from python.librarian.inference import score_with_model
+
+        return score_with_model(MODEL, payload, threshold=THRESHOLD)
+    return score_with_heuristic(payload)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -91,15 +52,27 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main() -> None:
+    global MODEL, THRESHOLD
     parser = argparse.ArgumentParser()
     parser.add_argument("--addr", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8090)
+    parser.add_argument("--checkpoint", default="")
+    parser.add_argument("--threshold", type=float, default=0.5)
     args = parser.parse_args()
+    THRESHOLD = args.threshold
+    if args.checkpoint:
+        import torch
+
+        from python.librarian.model import load_checkpoint
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        MODEL = load_checkpoint(args.checkpoint, device=device)
+        print(f"loaded librarian checkpoint {args.checkpoint} on {device}", flush=True)
     server = HTTPServer((args.addr, args.port), Handler)
-    print(f"librarian placeholder listening on http://{args.addr}:{args.port}", flush=True)
+    mode = "model" if MODEL is not None else "heuristic"
+    print(f"librarian {mode} service listening on http://{args.addr}:{args.port}", flush=True)
     server.serve_forever()
 
 
 if __name__ == "__main__":
     main()
-
