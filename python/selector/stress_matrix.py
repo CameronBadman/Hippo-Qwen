@@ -15,6 +15,108 @@ if __package__ is None or __package__ == "":
 
 METRICS = ("recall_at_k", "context_precision", "context_recall", "noise", "mrr")
 PHASES = ("static", "evolved", "second_half_delta")
+DEFAULT_QUALITY_GATES = (
+    {
+        "name": "adversarial_recall_gain",
+        "scenario": "adversarial",
+        "corruption": "*",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "recall_at_k",
+        "op": ">=",
+        "threshold": 0.01,
+        "description": "Evolved-state training should recover more relevant memories in adversarial retrieval.",
+    },
+    {
+        "name": "adversarial_precision_non_negative",
+        "scenario": "adversarial",
+        "corruption": "*",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "context_precision",
+        "op": ">=",
+        "threshold": 0.0,
+        "description": "Adversarial gains should not come from lower precision.",
+    },
+    {
+        "name": "adversarial_noise_reduction",
+        "scenario": "adversarial",
+        "corruption": "*",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "noise",
+        "op": "<=",
+        "threshold": 0.0,
+        "description": "Adversarial gains should not add irrelevant memories.",
+    },
+    {
+        "name": "adversarial_strong_noise_reduction",
+        "scenario": "adversarial",
+        "corruption": "strong",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "noise",
+        "op": "<=",
+        "threshold": -0.2,
+        "description": "Strong corruption should show a material noise reduction.",
+    },
+    {
+        "name": "preference_clean_precision_floor",
+        "scenario": "preference_shift",
+        "corruption": "none",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "context_precision",
+        "op": ">=",
+        "threshold": -0.02,
+        "description": "Clean preference-shift should not lose meaningful precision when baseline is near ceiling.",
+    },
+    {
+        "name": "preference_clean_noise_ceiling",
+        "scenario": "preference_shift",
+        "corruption": "none",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "noise",
+        "op": "<=",
+        "threshold": 0.05,
+        "description": "Clean preference-shift should not add much noise when baseline is already strong.",
+    },
+    {
+        "name": "preference_mild_precision_floor",
+        "scenario": "preference_shift",
+        "corruption": "mild",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "context_precision",
+        "op": ">=",
+        "threshold": -0.02,
+        "description": "Mild preference-shift corruption should not lose meaningful precision.",
+    },
+    {
+        "name": "preference_mild_noise_ceiling",
+        "scenario": "preference_shift",
+        "corruption": "mild",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "noise",
+        "op": "<=",
+        "threshold": 0.05,
+        "description": "Mild preference-shift corruption should not add much noise.",
+    },
+    {
+        "name": "preference_strong_recall_gain",
+        "scenario": "preference_shift",
+        "corruption": "strong",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "recall_at_k",
+        "op": ">=",
+        "threshold": 0.02,
+        "description": "Strong preference-shift corruption should regain recall.",
+    },
+    {
+        "name": "preference_strong_noise_reduction",
+        "scenario": "preference_shift",
+        "corruption": "strong",
+        "metric_group": "delta_evolved_state_minus_raw",
+        "metric": "noise",
+        "op": "<=",
+        "threshold": 0.0,
+        "description": "Strong preference-shift corruption should reduce noise.",
+    },
+)
 
 
 def parse_csv(value: str) -> list[str]:
@@ -211,8 +313,96 @@ def score_run(row: dict[str, Any]) -> float:
     )
 
 
+def gate_matches(row: dict[str, Any], gate: dict[str, Any]) -> bool:
+    scenario = gate["scenario"]
+    corruption = gate["corruption"]
+    return (
+        (scenario == "*" or scenario == row["scenario"])
+        and (corruption == "*" or corruption == row["eval_state_corruption"])
+    )
+
+
+def gate_value(row: dict[str, Any], gate: dict[str, Any]) -> float:
+    metric_group = gate["metric_group"]
+    metric = gate["metric"]
+    return float(row[metric_group][metric]["mean"])
+
+
+def gate_passes(value: float, gate: dict[str, Any]) -> bool:
+    threshold = float(gate["threshold"])
+    op = gate["op"]
+    if op == ">=":
+        return value >= threshold
+    if op == "<=":
+        return value <= threshold
+    raise ValueError(f"unsupported gate operator: {op}")
+
+
+def evaluate_quality_gates(row: dict[str, Any], gates: tuple[dict[str, Any], ...]) -> dict[str, Any]:
+    checks = []
+    for gate in gates:
+        if not gate_matches(row, gate):
+            continue
+        value = gate_value(row, gate)
+        checks.append(
+            {
+                "name": gate["name"],
+                "metric_group": gate["metric_group"],
+                "metric": gate["metric"],
+                "op": gate["op"],
+                "threshold": gate["threshold"],
+                "value": value,
+                "passed": gate_passes(value, gate),
+                "description": gate["description"],
+            }
+        )
+    failed = [check for check in checks if not check["passed"]]
+    return {
+        "passed": not failed,
+        "checks": checks,
+        "failed": failed,
+    }
+
+
+def quality_gate_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    total_checks = sum(len(row["quality_gates"]["checks"]) for row in rows)
+    failed_checks = [
+        {
+            "scenario": row["scenario"],
+            "eval_state_corruption": row["eval_state_corruption"],
+            **check,
+        }
+        for row in rows
+        for check in row["quality_gates"]["failed"]
+    ]
+    failed_runs = [
+        {
+            "scenario": row["scenario"],
+            "eval_state_corruption": row["eval_state_corruption"],
+            "failed_checks": [check["name"] for check in row["quality_gates"]["failed"]],
+        }
+        for row in rows
+        if not row["quality_gates"]["passed"]
+    ]
+    return {
+        "passed": not failed_checks,
+        "total_checks": total_checks,
+        "passed_checks": total_checks - len(failed_checks),
+        "failed_checks": failed_checks,
+        "failed_runs": failed_runs,
+    }
+
+
+def quality_status(row: dict[str, Any]) -> str:
+    gates = row.get("quality_gates", {})
+    if not gates.get("checks"):
+        return "n/a"
+    return "pass" if gates.get("passed") else "fail"
+
+
 def write_markdown(report: dict[str, Any], output: Path) -> None:
     rows = report["runs"]
+    quality = report["quality_gate_summary"]
     lines = [
         "# Selector Stress Matrix",
         "",
@@ -222,17 +412,18 @@ def write_markdown(report: dict[str, Any], output: Path) -> None:
         f"- cases per seed: `{report['cases']}`",
         f"- eval limit per seed: `{report['eval_limit']}`",
         f"- evolved variant: `{report['evolved_variant']}`",
+        f"- quality gates: `{quality['passed_checks']}/{quality['total_checks']} passed`",
         "",
         "## Aggregate",
         "",
-        "| scenario | corruption | raw evolved recall | trained evolved recall | precision delta | noise delta | second-half precision gain | second-half noise gain | score |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| scenario | corruption | gate | raw evolved recall | trained evolved recall | precision delta | noise delta | second-half precision gain | second-half noise gain | score |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for row in rows:
         delta = row["delta_evolved_state_minus_raw"]
         second_half = row["second_half_delta_gain"]
         lines.append(
-            f"| {row['scenario']} | {row['eval_state_corruption']} | "
+            f"| {row['scenario']} | {row['eval_state_corruption']} | {quality_status(row)} | "
             f"{row['raw_evolved']['recall_at_k']['mean']:.4f} +/- {row['raw_evolved']['recall_at_k']['std']:.4f} | "
             f"{row['evolved_state_trained']['recall_at_k']['mean']:.4f} +/- {row['evolved_state_trained']['recall_at_k']['std']:.4f} | "
             f"{delta['context_precision']['mean']:+.4f} +/- {delta['context_precision']['std']:.4f} | "
@@ -247,12 +438,36 @@ def write_markdown(report: dict[str, Any], output: Path) -> None:
     lines.extend(
         [
             "",
+            "## Quality Gates",
+            "",
+            f"- overall: `{'pass' if quality['passed'] else 'fail'}`",
+            f"- checks: `{quality['passed_checks']}/{quality['total_checks']}` passed",
+        ]
+    )
+    if quality["failed_checks"]:
+        lines.extend(
+            [
+                "",
+                "| scenario | corruption | gate | value | required |",
+                "| --- | --- | --- | ---: | ---: |",
+            ]
+        )
+        for failure in quality["failed_checks"]:
+            lines.append(
+                f"| {failure['scenario']} | {failure['eval_state_corruption']} | "
+                f"{failure['name']} | {failure['value']:+.4f} | "
+                f"{failure['op']} {failure['threshold']:+.4f} |"
+            )
+    lines.extend(
+        [
+            "",
             "## Readout",
             "",
             f"- best score: `{best['scenario']}` / `{best['eval_state_corruption']}` at `{best['score']:+.4f}`",
             f"- weakest precision delta: `{weakest['scenario']}` / `{weakest['eval_state_corruption']}` at `{weakest['delta_evolved_state_minus_raw']['context_precision']['mean']:+.4f}`",
             "",
             "Positive precision and recall deltas mean evolved-state training improved the selector over raw training. Negative noise delta means it selected fewer irrelevant memories.",
+            "Quality gates turn those metrics into pass/fail criteria for promotion decisions.",
         ]
     )
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -304,6 +519,7 @@ def main() -> None:
             summary_path = run_regression(args, repo, scenario, corruption)
             row = compact_summary(summary_path)
             row["score"] = score_run(row)
+            row["quality_gates"] = evaluate_quality_gates(row, DEFAULT_QUALITY_GATES)
             rows.append(row)
 
     best_by_score = max(rows, key=lambda row: row["score"])
@@ -322,6 +538,8 @@ def main() -> None:
         "candidates": args.candidates,
         "evolved_variant": args.evolved_variant,
         "selector_post_rank_bias": args.selector_post_rank_bias,
+        "quality_gates": list(DEFAULT_QUALITY_GATES),
+        "quality_gate_summary": quality_gate_summary(rows),
         "runs": rows,
         "best_by_score": best_by_score,
         "weakest_by_precision_delta": weakest_by_precision_delta,

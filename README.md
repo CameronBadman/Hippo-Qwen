@@ -286,9 +286,12 @@ python3 -m python.selector.stress_matrix \
 
 The matrix reuses `evolved_state_regression`, writes one subdirectory per
 scenario/corruption pair, and produces `stress_matrix_summary.json` plus
-`stress_matrix_summary.md` with recall, precision, noise, and second-half drift
-readouts. `progress.jsonl` records condition start/finish events so a Colab run
-can be inspected even if notebook stdout stalls.
+`stress_matrix_summary.md` with recall, precision, noise, second-half drift, and
+quality-gate readouts. The gates turn stress results into promotion criteria:
+adversarial cases must improve recall without adding noise, and preference-shift
+cases must avoid regressing clean or mildly corrupted baselines. `progress.jsonl`
+records condition start/finish events so a Colab run can be inspected even if
+notebook stdout stalls.
 
 Inspect selector failures by synthetic role:
 
