@@ -208,6 +208,10 @@ include the transformer context selector in the same static-vs-evolved loop.
 For selector checkpoints, post-rank graph bias is disabled by default so the
 benchmark measures evolved memory state as model input; pass
 `--selector-post-rank-bias` only when explicitly testing external reranking.
+`always` applies and updates online memory state for every row. The
+`uncertainty_gated` and `low_confidence_only` policies only apply/update that
+state when the current ranking looks weak, and reports split `state_applied_rate`
+from `bias_applied_rate` so drift-control runs can be inspected directly.
 
 To train the selector on the same evolved state it sees online, expand a case
 file with simulated feedback first:
@@ -240,6 +244,9 @@ python3 -m python.selector.evolved_state_regression \
 The regression writes per-seed checkpoints and aggregate `summary.json` /
 `summary.md` reports. By default it evaluates `always@0`, which means online
 memory-state mutation is enabled but selector post-rank graph bias remains off.
+To test selective memory growth, use
+`--evolution-policies off,uncertainty_gated --evolved-variant uncertainty_gated@0`
+or the corresponding `low_confidence_only@0` variant.
 Use `--scenario preference_shift` to stress changing user preferences, where
 old high-use memories conflict with newer corrections. Use
 `--eval-state-corruption mild` or `--eval-state-corruption strong` to perturb

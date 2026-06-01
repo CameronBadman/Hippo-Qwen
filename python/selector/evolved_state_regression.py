@@ -220,6 +220,12 @@ def run_evolution_benchmark(args: argparse.Namespace, repo: Path, eval_path: Pat
             args.evolution_policies,
             "--evolution-bias-scales",
             args.evolution_bias_scales,
+            "--gate-margin",
+            str(args.gate_margin),
+            "--low-confidence-score",
+            str(args.low_confidence_score),
+            "--low-spread",
+            str(args.low_spread),
             "--top-k",
             str(args.top_k),
             "--budget",
@@ -247,6 +253,8 @@ def extract_selector_metrics(result: dict[str, Any], evolved_variant: str) -> di
         "evolved": {key: float(evolved.get(key, 0.0)) for key in TRACKED_METRICS},
         "second_half_delta": {key: float(second_delta.get(key, 0.0)) for key in TRACKED_METRICS},
         "applied_rate": float(variant.get("applied_rate", 0.0)),
+        "state_applied_rate": float(variant.get("state_applied_rate", variant.get("applied_rate", 0.0))),
+        "bias_applied_rate": float(variant.get("bias_applied_rate", 0.0)),
         "bias_enabled": bool(variant.get("bias_enabled", False)),
     }
 
@@ -401,6 +409,9 @@ def main() -> None:
     parser.add_argument("--evolution-policies", default="off,always")
     parser.add_argument("--evolution-bias-scales", default="0")
     parser.add_argument("--evolved-variant", default="always@0")
+    parser.add_argument("--gate-margin", type=float, default=0.03)
+    parser.add_argument("--low-confidence-score", type=float, default=0.72)
+    parser.add_argument("--low-spread", type=float, default=0.18)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--d-model", type=int, default=128)
@@ -436,6 +447,9 @@ def main() -> None:
         "evolution_policies": args.evolution_policies,
         "evolution_bias_scales": args.evolution_bias_scales,
         "evolved_variant": args.evolved_variant,
+        "gate_margin": args.gate_margin,
+        "low_confidence_score": args.low_confidence_score,
+        "low_spread": args.low_spread,
         "selector_post_rank_bias": args.selector_post_rank_bias,
         "runs": runs,
         "aggregate": aggregate(runs),

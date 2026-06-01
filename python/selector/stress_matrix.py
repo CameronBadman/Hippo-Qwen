@@ -232,6 +232,12 @@ def run_regression(args: argparse.Namespace, repo: Path, scenario: str, corrupti
         args.evolution_bias_scales,
         "--evolved-variant",
         args.evolved_variant,
+        "--gate-margin",
+        str(args.gate_margin),
+        "--low-confidence-score",
+        str(args.low_confidence_score),
+        "--low-spread",
+        str(args.low_spread),
         "--epochs",
         str(args.epochs),
         "--batch-size",
@@ -489,6 +495,9 @@ def main() -> None:
     parser.add_argument("--evolution-policies", default="off,always")
     parser.add_argument("--evolution-bias-scales", default="0")
     parser.add_argument("--evolved-variant", default="always@0")
+    parser.add_argument("--gate-margin", type=float, default=0.03)
+    parser.add_argument("--low-confidence-score", type=float, default=0.72)
+    parser.add_argument("--low-spread", type=float, default=0.18)
     parser.add_argument("--epochs", type=int, default=4)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--d-model", type=int, default=128)
@@ -537,6 +546,9 @@ def main() -> None:
         "eval_limit": args.eval_limit,
         "candidates": args.candidates,
         "evolved_variant": args.evolved_variant,
+        "gate_margin": args.gate_margin,
+        "low_confidence_score": args.low_confidence_score,
+        "low_spread": args.low_spread,
         "selector_post_rank_bias": args.selector_post_rank_bias,
         "quality_gates": list(DEFAULT_QUALITY_GATES),
         "quality_gate_summary": quality_gate_summary(rows),

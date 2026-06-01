@@ -274,23 +274,28 @@ def confidence_features(ranked: Ranked, top_k: int) -> dict[str, float]:
     }
 
 
-def policy_bias_scale(
+def policy_allows_evolution(
     policy: str,
-    bias_scale: float,
     confidence: dict[str, float],
     gate_margin: float,
     low_confidence_score: float,
     low_spread: float,
-) -> float:
-    if policy == "off" or bias_scale <= 0.0:
-        return 0.0
+) -> bool:
+    if policy == "off":
+        return False
     if policy == "always":
-        return bias_scale
+        return True
     if policy == "uncertainty_gated":
-        return bias_scale if confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4 else 0.0
+        return confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4
     if policy == "low_confidence_only":
-        return bias_scale if confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread else 0.0
+        return confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread
     raise ValueError(f"unknown evolution policy: {policy}")
+
+
+def policy_bias_scale(policy_enabled: bool, bias_scale: float, allow_bias: bool) -> float:
+    if not policy_enabled or not allow_bias or bias_scale <= 0.0:
+        return 0.0
+    return bias_scale
 
 
 def evaluate_variant(
@@ -319,6 +324,8 @@ def evaluate_variant(
             "bias_scale": bias_scale,
             "bias_enabled": False,
             "applied_rate": 0.0,
+            "state_applied_rate": 0.0,
+            "bias_applied_rate": 0.0,
             "evolved": summarize_windows(metrics),
             "feedback": {},
             "state": {"memories_touched": 0, "signatures_touched": 0, "feedback": {}},
@@ -331,29 +338,33 @@ def evaluate_variant(
     evolved_roles: dict[str, dict[str, int]] = {}
     feedback = Counter()
     confidence_items = []
-    applied_count = 0
+    state_applied_count = 0
+    bias_applied_count = 0
     for row in rows:
-        evolved_row = state.apply(row)
-        base_ranked = scorer(evolved_row)
+        baseline_ranked = scorer(row)
+        confidence = confidence_features(baseline_ranked, top_k)
+        state_enabled = policy_allows_evolution(policy, confidence, gate_margin, low_confidence_score, low_spread)
+        evolved_row = state.apply(row) if state_enabled else row
+        base_ranked = scorer(evolved_row) if state_enabled else baseline_ranked
         confidence = confidence_features(base_ranked, top_k)
-        effective_scale = (
-            policy_bias_scale(policy, bias_scale, confidence, gate_margin, low_confidence_score, low_spread)
-            if allow_bias
-            else 0.0
-        )
+        effective_scale = policy_bias_scale(state_enabled, bias_scale, allow_bias)
         evolved_ranked = state.rerank(evolved_row, base_ranked, effective_scale)
         evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
         merge_role_counts(evolved_roles, role_exposure(row, evolved_ranked, budget))
-        feedback.update(apply_feedback(state, evolved_row, evolved_ranked, budget))
+        if state_enabled:
+            feedback.update(apply_feedback(state, evolved_row, evolved_ranked, budget))
+            state_applied_count += 1
         confidence_items.append(confidence)
         if effective_scale > 0.0:
-            applied_count += 1
+            bias_applied_count += 1
 
     return {
         "policy": policy,
         "bias_scale": bias_scale,
         "bias_enabled": allow_bias,
-        "applied_rate": applied_count / max(1, len(rows)),
+        "applied_rate": state_applied_count / max(1, len(rows)),
+        "state_applied_rate": state_applied_count / max(1, len(rows)),
+        "bias_applied_rate": bias_applied_count / max(1, len(rows)),
         "evolved": summarize_windows(evolved_metrics),
         "feedback": dict(sorted(feedback.items())),
         "state": state.summary(),
@@ -477,13 +488,13 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- bias scales: `{', '.join(str(item) for item in result['evolution_bias_scales'])}`",
         f"- selector post-rank bias: `{result['selector_post_rank_bias']}`",
         "",
-        "| method | policy | scale | bias | applied | recall@k | context precision | context recall | noise |",
-        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: |",
+        "| method | policy | scale | bias | state applied | bias applied | recall@k | context precision | context recall | noise |",
+        "| --- | --- | ---: | --- | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, item in result["methods"].items():
         static = item["static"]["overall"]
         lines.append(
-            f"| {name} | static | 0 | off | 0.0000 | {static.get('recall_at_k', 0.0):.4f} | "
+            f"| {name} | static | 0 | off | 0.0000 | 0.0000 | {static.get('recall_at_k', 0.0):.4f} | "
             f"{static.get('context_precision', 0.0):.4f} | {static.get('context_recall', 0.0):.4f} | "
             f"{static.get('noise', 0.0):.2f} |"
         )
@@ -491,7 +502,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             metrics = variant["evolved"]["overall"]
             bias = "on" if variant.get("bias_enabled") else "off"
             lines.append(
-                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | {bias} | {variant.get('applied_rate', 0.0):.4f} | "
+                f"| {name} | {variant['policy']} | {variant['bias_scale']:g} | {bias} | "
+                f"{variant.get('state_applied_rate', variant.get('applied_rate', 0.0)):.4f} | "
+                f"{variant.get('bias_applied_rate', 0.0):.4f} | "
                 f"{metrics.get('recall_at_k', 0.0):.4f} | "
                 f"{metrics.get('context_precision', 0.0):.4f} | {metrics.get('context_recall', 0.0):.4f} | "
                 f"{metrics.get('noise', 0.0):.2f} |"
