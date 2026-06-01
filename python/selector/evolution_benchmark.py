@@ -37,7 +37,7 @@ STALE_PREFERENCE_MARKERS = (
     "no longer",
     "obsolete",
 )
-EVOLUTION_POLICIES = {"off", "always", "uncertainty_gated", "low_confidence_only", "risk_aware"}
+EVOLUTION_POLICIES = {"off", "always", "uncertainty_gated", "low_confidence_only", "risk_aware", "risk_rescue"}
 
 
 class MemoryState:
@@ -399,6 +399,24 @@ def policy_allows_evolution(
         if weak_selector or ambiguous_low_ceiling:
             return True
         return False
+    if policy == "risk_rescue":
+        uncertain = confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4
+        weak = confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread
+        if risk["preference_change_query"] <= 0.0:
+            return uncertain or weak
+
+        current_context_thin = risk["current_preference_count"] < 3.0 or risk["current_preference_rate"] < 0.55
+        damaged_selector = (
+            confidence["top_score"] <= low_confidence_score + 0.15
+            or confidence["score_spread"] <= max(low_spread * 2.0, 0.36)
+            or (confidence["cutoff_margin"] <= gate_margin and confidence["cutoff_crowding"] >= 6.0)
+        )
+        stale_conflict = (
+            risk["stale_pressure"] >= 4.0
+            and risk["positive_old_state_count"] >= 2.0
+            and confidence["top_score"] <= low_confidence_score + 0.15
+        )
+        return current_context_thin and (damaged_selector or stale_conflict)
     raise ValueError(f"unknown evolution policy: {policy}")
 
 

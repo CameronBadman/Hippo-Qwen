@@ -197,7 +197,7 @@ status, and duplicate-like text:
 python3 -m python.selector.evolution_benchmark \
   --scenario adversarial \
   --cases 2000 \
-  --evolution-policies off,always,uncertainty_gated,low_confidence_only,risk_aware \
+  --evolution-policies off,always,uncertainty_gated,low_confidence_only,risk_aware,risk_rescue \
   --evolution-bias-scales 0,0.1,0.25,0.5,1.0 \
   --output-json artifacts/librarian/evolution/summary.json \
   --output-md artifacts/librarian/evolution/summary.md
@@ -217,6 +217,10 @@ state when the selected context already has current-preference evidence, and
 only applies state on those rows when selector confidence is genuinely weak.
 This is intended to prevent clean preference-shift runs from collapsing into
 always-on memory mutation while still leaving a path for corrupted-state runs.
+`risk_rescue` is a less conservative diagnostic policy: preference-change rows
+can still apply state when current-preference evidence is thin and the selector
+confidence looks damaged, so strong-corruption experiments can test limited
+online repair without returning to always-on mutation.
 
 To train the selector on the same evolved state it sees online, expand a case
 file with simulated feedback first:
@@ -251,7 +255,8 @@ The regression writes per-seed checkpoints and aggregate `summary.json` /
 memory-state mutation is enabled but selector post-rank graph bias remains off.
 To test selective memory growth, use
 `--evolution-policies off,uncertainty_gated --evolved-variant uncertainty_gated@0`
-or the corresponding `low_confidence_only@0` / `risk_aware@0` variant.
+or the corresponding `low_confidence_only@0`, `risk_aware@0`, or
+`risk_rescue@0` variant.
 Use `--scenario preference_shift` to stress changing user preferences, where
 old high-use memories conflict with newer corrections. Use
 `--eval-state-corruption mild` or `--eval-state-corruption strong` to perturb
