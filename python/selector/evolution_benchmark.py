@@ -18,7 +18,26 @@ from python.synthetic.generate import build_cases
 Ranked = list[tuple[str, float, str]]
 Scorer = Callable[[dict[str, Any]], Ranked]
 PREFERENCE_MARKERS = {"preference", "prefer", "prefers", "preferred", "wants", "likes", "avoids", "needs"}
-EVOLUTION_POLICIES = {"off", "always", "uncertainty_gated", "low_confidence_only"}
+CURRENT_PREFERENCE_MARKERS = (
+    "updated preference",
+    "current preference",
+    "current correction",
+    "latest preference",
+    "preference changed",
+    "user now",
+    "now ",
+)
+STALE_PREFERENCE_MARKERS = (
+    "old preference:",
+    "old preference.",
+    "used to",
+    "before the change",
+    "before the correction",
+    "superseded",
+    "no longer",
+    "obsolete",
+)
+EVOLUTION_POLICIES = {"off", "always", "uncertainty_gated", "low_confidence_only", "risk_aware"}
 
 
 class MemoryState:
@@ -274,9 +293,82 @@ def confidence_features(ranked: Ranked, top_k: int) -> dict[str, float]:
     }
 
 
+def contains_any(text: str, markers: tuple[str, ...]) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in markers)
+
+
+def preference_change_query(row: dict[str, Any]) -> bool:
+    anchor_text = str((row.get("anchor") or {}).get("text") or "")
+    query_text = str((row.get("retrieval_task") or {}).get("query") or "")
+    text = f"{anchor_text} {query_text}".lower()
+    return (
+        "preference changed" in text
+        or "current preference" in text
+        or "updated preference" in text
+        or "not the old preference" in text
+        or (" used to " in text and " current " in text)
+    )
+
+
+def state_risk_features(row: dict[str, Any], ranked: Ranked, default_budget: int) -> dict[str, float]:
+    candidates = {candidate["id"]: candidate for candidate in row.get("candidates", [])}
+    included = budgeted_ids(row, ranked, default_budget)
+    if not included:
+        return {
+            "included_count": 0.0,
+            "current_preference_count": 0.0,
+            "stale_preference_count": 0.0,
+            "positive_old_state_count": 0.0,
+            "cross_context_count": 0.0,
+            "stale_pressure": 0.0,
+            "current_preference_rate": 0.0,
+            "preference_change_query": 1.0 if preference_change_query(row) else 0.0,
+        }
+
+    anchor_cluster = str((row.get("anchor") or {}).get("cluster") or "")
+    current_count = 0
+    stale_count = 0
+    positive_old_count = 0
+    cross_context_count = 0
+    for candidate_id in included:
+        candidate = candidates.get(candidate_id, {})
+        text = str(candidate.get("text") or "")
+        same_context = bool(anchor_cluster and str(candidate.get("cluster") or "") == anchor_cluster)
+        current = same_context and contains_any(text, CURRENT_PREFERENCE_MARKERS)
+        stale = contains_any(text, STALE_PREFERENCE_MARKERS)
+        age_days = float(candidate.get("age_days") or 0.0)
+        use_count = float(candidate.get("use_count") or 0.0)
+        evidence_count = float(candidate.get("evidence_count") or 0.0)
+        last_outcome = str(candidate.get("last_outcome") or "")
+        positive_old = same_context and not current and age_days >= 90 and (use_count >= 21 or evidence_count >= 8 or last_outcome == "helpful")
+        if current:
+            current_count += 1
+        if stale:
+            stale_count += 1
+        if positive_old:
+            positive_old_count += 1
+        if anchor_cluster and str(candidate.get("cluster") or "") and str(candidate.get("cluster") or "") != anchor_cluster:
+            cross_context_count += 1
+
+    included_count = len(included)
+    stale_pressure = stale_count + positive_old_count
+    return {
+        "included_count": float(included_count),
+        "current_preference_count": float(current_count),
+        "stale_preference_count": float(stale_count),
+        "positive_old_state_count": float(positive_old_count),
+        "cross_context_count": float(cross_context_count),
+        "stale_pressure": float(stale_pressure),
+        "current_preference_rate": current_count / max(1, included_count),
+        "preference_change_query": 1.0 if preference_change_query(row) else 0.0,
+    }
+
+
 def policy_allows_evolution(
     policy: str,
     confidence: dict[str, float],
+    risk: dict[str, float],
     gate_margin: float,
     low_confidence_score: float,
     low_spread: float,
@@ -289,6 +381,24 @@ def policy_allows_evolution(
         return confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4
     if policy == "low_confidence_only":
         return confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread
+    if policy == "risk_aware":
+        if risk["preference_change_query"] <= 0.0:
+            uncertain = confidence["cutoff_margin"] <= gate_margin or confidence["cutoff_crowding"] >= 4
+            weak = confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread
+            return uncertain or weak
+
+        has_current_context = risk["current_preference_count"] >= 2.0 or risk["current_preference_rate"] >= 0.25
+        weak_selector = confidence["top_score"] <= low_confidence_score or confidence["score_spread"] <= low_spread
+        ambiguous_low_ceiling = (
+            confidence["cutoff_margin"] <= gate_margin
+            and confidence["cutoff_crowding"] >= 6.0
+            and confidence["top_score"] <= low_confidence_score + 0.08
+        )
+        if has_current_context:
+            return False
+        if weak_selector or ambiguous_low_ceiling:
+            return True
+        return False
     raise ValueError(f"unknown evolution policy: {policy}")
 
 
@@ -314,11 +424,13 @@ def evaluate_variant(
         metrics = []
         roles: dict[str, dict[str, int]] = {}
         confidence_items = []
+        risk_items = []
         for row in rows:
             ranked = scorer(row)
             metrics.append(evaluate_ranked(row, ranked, top_k, budget))
             merge_role_counts(roles, role_exposure(row, ranked, budget))
             confidence_items.append(confidence_features(ranked, top_k))
+            risk_items.append(state_risk_features(row, ranked, budget))
         return {
             "policy": policy,
             "bias_scale": bias_scale,
@@ -330,6 +442,9 @@ def evaluate_variant(
             "feedback": {},
             "state": {"memories_touched": 0, "signatures_touched": 0, "feedback": {}},
             "confidence": average_metrics(confidence_items),
+            "state_risk": average_metrics(risk_items),
+            "decision_confidence": average_metrics(confidence_items),
+            "decision_state_risk": average_metrics(risk_items),
             "evolved_role_metrics": summarize_role_counts(roles),
         }
 
@@ -338,17 +453,24 @@ def evaluate_variant(
     evolved_roles: dict[str, dict[str, int]] = {}
     feedback = Counter()
     confidence_items = []
+    risk_items = []
+    decision_confidence_items = []
+    decision_risk_items = []
     state_applied_count = 0
     bias_applied_count = 0
     for row in rows:
         baseline_ranked = scorer(row)
         confidence = confidence_features(baseline_ranked, top_k)
-        state_enabled = policy_allows_evolution(policy, confidence, gate_margin, low_confidence_score, low_spread)
+        risk = state_risk_features(row, baseline_ranked, budget)
+        decision_confidence_items.append(confidence)
+        decision_risk_items.append(risk)
+        state_enabled = policy_allows_evolution(policy, confidence, risk, gate_margin, low_confidence_score, low_spread)
         evolved_row = state.apply(row) if state_enabled else row
         base_ranked = scorer(evolved_row) if state_enabled else baseline_ranked
         confidence = confidence_features(base_ranked, top_k)
         effective_scale = policy_bias_scale(state_enabled, bias_scale, allow_bias)
         evolved_ranked = state.rerank(evolved_row, base_ranked, effective_scale)
+        risk = state_risk_features(row, evolved_ranked, budget)
         evolved_metrics.append(evaluate_ranked(row, evolved_ranked, top_k, budget))
         merge_role_counts(evolved_roles, role_exposure(row, evolved_ranked, budget))
         if state_enabled:
@@ -357,6 +479,7 @@ def evaluate_variant(
         confidence_items.append(confidence)
         if effective_scale > 0.0:
             bias_applied_count += 1
+        risk_items.append(risk)
 
     return {
         "policy": policy,
@@ -369,6 +492,9 @@ def evaluate_variant(
         "feedback": dict(sorted(feedback.items())),
         "state": state.summary(),
         "confidence": average_metrics(confidence_items),
+        "state_risk": average_metrics(risk_items),
+        "decision_confidence": average_metrics(decision_confidence_items),
+        "decision_state_risk": average_metrics(decision_risk_items),
         "evolved_role_metrics": summarize_role_counts(evolved_roles),
     }
 

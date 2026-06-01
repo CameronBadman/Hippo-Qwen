@@ -197,7 +197,7 @@ status, and duplicate-like text:
 python3 -m python.selector.evolution_benchmark \
   --scenario adversarial \
   --cases 2000 \
-  --evolution-policies off,always,uncertainty_gated,low_confidence_only \
+  --evolution-policies off,always,uncertainty_gated,low_confidence_only,risk_aware \
   --evolution-bias-scales 0,0.1,0.25,0.5,1.0 \
   --output-json artifacts/librarian/evolution/summary.json \
   --output-md artifacts/librarian/evolution/summary.md
@@ -212,6 +212,11 @@ benchmark measures evolved memory state as model input; pass
 `uncertainty_gated` and `low_confidence_only` policies only apply/update that
 state when the current ranking looks weak, and reports split `state_applied_rate`
 from `bias_applied_rate` so drift-control runs can be inspected directly.
+`risk_aware` adds a budget-level guard for preference-change queries: it blocks
+state when the selected context already has current-preference evidence, and
+only applies state on those rows when selector confidence is genuinely weak.
+This is intended to prevent clean preference-shift runs from collapsing into
+always-on memory mutation while still leaving a path for corrupted-state runs.
 
 To train the selector on the same evolved state it sees online, expand a case
 file with simulated feedback first:
@@ -246,7 +251,7 @@ The regression writes per-seed checkpoints and aggregate `summary.json` /
 memory-state mutation is enabled but selector post-rank graph bias remains off.
 To test selective memory growth, use
 `--evolution-policies off,uncertainty_gated --evolved-variant uncertainty_gated@0`
-or the corresponding `low_confidence_only@0` variant.
+or the corresponding `low_confidence_only@0` / `risk_aware@0` variant.
 Use `--scenario preference_shift` to stress changing user preferences, where
 old high-use memories conflict with newer corrections. Use
 `--eval-state-corruption mild` or `--eval-state-corruption strong` to perturb
