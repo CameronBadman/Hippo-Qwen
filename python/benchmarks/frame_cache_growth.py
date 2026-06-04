@@ -99,6 +99,7 @@ def hierarchy_args(args: argparse.Namespace) -> SimpleNamespace:
         graph_seed_count=args.hierarchy_graph_seed_count,
         graph_depth=args.hierarchy_graph_depth,
         cache_size=args.hierarchy_cache_size,
+        semantic_dims=args.hierarchy_semantic_dims,
         promotion_bias=args.hierarchy_promotion_bias,
         promotion_scale=args.hierarchy_promotion_scale,
         return_limit=args.hierarchy_return_limit,
@@ -322,6 +323,7 @@ def main() -> None:
     parser.add_argument("--hierarchy-graph-seed-count", type=int, default=8)
     parser.add_argument("--hierarchy-graph-depth", type=int, default=2)
     parser.add_argument("--hierarchy-cache-size", type=int, default=256)
+    parser.add_argument("--hierarchy-semantic-dims", type=int, default=128)
     parser.add_argument("--hierarchy-promotion-bias", type=float, default=0.0)
     parser.add_argument("--hierarchy-promotion-scale", type=float, default=1.0)
     parser.add_argument("--hierarchy-stable-growth", action=argparse.BooleanOptionalAction, default=True)

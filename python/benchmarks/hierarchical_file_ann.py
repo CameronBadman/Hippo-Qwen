@@ -173,6 +173,28 @@ def activation_coverage(query_mask: int, candidate_mask: int) -> float:
     return (query_mask & candidate_mask).bit_count() / max(1, query_mask.bit_count())
 
 
+def cosine_prefix(a: list[float], b: list[float], max_dims: int) -> float:
+    if not a or not b:
+        return 0.0
+    dims = min(len(a), len(b))
+    if max_dims > 0:
+        dims = min(dims, max_dims)
+    if dims <= 0:
+        return 0.0
+    dot = 0.0
+    left_norm = 0.0
+    right_norm = 0.0
+    for index in range(dims):
+        left = float(a[index])
+        right = float(b[index])
+        dot += left * right
+        left_norm += left * left
+        right_norm += right * right
+    if left_norm <= 0.0 or right_norm <= 0.0:
+        return 0.0
+    return dot / math.sqrt(left_norm * right_norm)
+
+
 def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, output_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     row = ensure_backend_embeddings(row, backend)
@@ -339,12 +361,12 @@ class LazyNodeStore:
         return node
 
 
-def score_node(row: dict[str, Any], query_text: str, query_embedding: list[float], query_mask: int, node: dict[str, Any]) -> float:
+def score_node(row: dict[str, Any], query_text: str, query_embedding: list[float], query_mask: int, node: dict[str, Any], semantic_dims: int) -> float:
     anchor = row["anchor"]
     lexical = jaccard(query_text, f"{node.get('text', '')} {node.get('summary', '')}")
     same_cluster = 1.0 if str(anchor.get("cluster") or "").lower() == str(node.get("cluster") or "").lower() else 0.0
     if node.get("node_type") == "memory":
-        semantic = cosine(query_embedding, node.get("embedding") or [])
+        semantic = cosine_prefix(query_embedding, node.get("embedding") or [], semantic_dims)
         activation = activation_overlap(query_mask, activation_mask_for_text(node.get("text") or ""))
         child_penalty = 0.0
         state = state_score(node)
@@ -434,12 +456,12 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                 visited_ids.add(node_id)
                 node = store.read(node_id)
                 basin_nodes_scored += 1
-                scored.append((node_id, score_node(row, query_text, query_embedding, query_mask, node), node))
+                scored.append((node_id, score_node(row, query_text, query_embedding, query_mask, node, args.semantic_dims), node))
                 promoted_ids = unique_limited(node.get("promoted_children") or [], args.promoted_per_basin)
                 for promoted_id in promoted_ids:
                     promoted = store.read(promoted_id)
                     promoted_scored += 1
-                    score = score_node(row, query_text, query_embedding, query_mask, promoted) + 0.03 * (LEVEL_TOPIC - level + 1)
+                    score = score_node(row, query_text, query_embedding, query_mask, promoted, args.semantic_dims) + 0.03 * (LEVEL_TOPIC - level + 1)
                     prior = leaf_scores.get(promoted_id)
                     if prior is None or score > prior[0]:
                         leaf_scores[promoted_id] = (score, promoted.get("text", ""))
@@ -459,7 +481,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         leaf_frontier = frontier if args.stable_growth else frontier[: args.max_leaf_reads]
         for node_id in leaf_frontier:
             node = store.read(node_id)
-            score = score_node(row, query_text, query_embedding, query_mask, node)
+            score = score_node(row, query_text, query_embedding, query_mask, node, args.semantic_dims)
             prior = leaf_scores.get(node_id)
             if prior is None or score > prior[0]:
                 leaf_scores[node_id] = (score, node.get("text", ""))
@@ -492,7 +514,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                         * (0.70 + 0.30 * float(edge.get("confidence") or 0.5))
                         / (1.25 + depth)
                     )
-                    target_score = score_node(row, query_text, query_embedding, query_mask, target)
+                    target_score = score_node(row, query_text, query_embedding, query_mask, target, args.semantic_dims)
                     score = 0.58 * current_score + 0.42 * target_score + hop_gain
                     prior = leaf_scores.get(target_id)
                     if prior is None or score > prior[0]:
@@ -904,6 +926,7 @@ def main() -> None:
     parser.add_argument("--graph-seed-count", type=int, default=8)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--cache-size", type=int, default=256)
+    parser.add_argument("--semantic-dims", type=int, default=128)
     parser.add_argument("--promotion-bias", type=float, default=0.0)
     parser.add_argument("--promotion-scale", type=float, default=1.0)
     parser.add_argument("--compact-limit", type=int, default=3)
