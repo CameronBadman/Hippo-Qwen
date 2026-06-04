@@ -175,6 +175,27 @@ This benchmark reports final context quality, pre-graph candidate-set
 size/precision at score thresholds and top-N cutoffs, and calibrated basin
 strategies with per-query graph-expansion latency.
 
+Run the file-backed hierarchical ANN prototype when testing a hippocampus-style
+coarse-to-fine traversal. It writes a binary node heap (`nodes.hgb`) plus a
+small offset index, lazily seeks/decompresses only visited nodes, and exposes a
+promotion heuristic knob for making important/helpful memories appear at higher
+levels:
+
+```bash
+python3 -m python.benchmarks.hierarchical_file_ann \
+  --cases 20 \
+  --pool-size 10000 \
+  --beam-width 4 \
+  --promotion-bias 0.0 \
+  --output-json artifacts/hippocampus/hierarchical_file_ann.json \
+  --output-md artifacts/hippocampus/hierarchical_file_ann.md
+```
+
+Use `--promotion-bias` to increase or decrease the deterministic chance that a
+memory is promoted into higher-level basins. The report includes precision,
+context recall, path success, binary file reads, unique nodes read, cache hits,
+lazy edge expansions, latency, and promotion rate.
+
 Run the full local-first evaluation suite:
 
 ```bash
