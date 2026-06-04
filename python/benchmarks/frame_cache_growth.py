@@ -6,12 +6,14 @@ import random
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ensure_backend_embeddings
+from python.benchmarks.hierarchical_file_ann import hierarchical_search, write_lazy_index
 from python.benchmarks.large_pool_retrieval import build_large_pool_case
 from python.librarian.frame_builder import (
     FrameBuilderConfig,
@@ -74,6 +76,73 @@ def stable_prefix(before: list[str], after: list[str], relevant: set[str], limit
     return len([memory_id for memory_id in before_relevant if memory_id in after_top]) / len(before_relevant)
 
 
+def frame_precision_at_k(frame: dict[str, Any], top_k: int) -> float:
+    labels = [float(label) for label in frame.get("labels", [])[:top_k]]
+    mask = [float(value) for value in frame.get("mask", [])[:top_k]]
+    selected = [label for label, active in zip(labels, mask) if active > 0.0]
+    if not selected:
+        return 0.0
+    return sum(1.0 for label in selected if label >= 0.5) / len(selected)
+
+
+def candidate_lookup(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(candidate["id"]): dict(candidate) for candidate in row.get("candidates", [])}
+
+
+def hierarchy_args(args: argparse.Namespace) -> SimpleNamespace:
+    return SimpleNamespace(
+        beam_width=args.hierarchy_beam_width,
+        max_frontier=args.hierarchy_max_frontier,
+        max_children_per_basin=args.hierarchy_max_children_per_basin,
+        max_leaf_reads=args.hierarchy_max_leaf_reads,
+        promoted_per_basin=args.hierarchy_promoted_per_basin,
+        graph_seed_count=args.hierarchy_graph_seed_count,
+        graph_depth=args.hierarchy_graph_depth,
+        cache_size=args.hierarchy_cache_size,
+        promotion_bias=args.hierarchy_promotion_bias,
+        promotion_scale=args.hierarchy_promotion_scale,
+        return_limit=args.hierarchy_return_limit,
+        stable_growth=args.hierarchy_stable_growth,
+        stable_basin_floor=args.hierarchy_stable_basin_floor,
+        stable_max_basins=args.hierarchy_stable_max_basins,
+    )
+
+
+def select_index_seed_ids(
+    row: dict[str, Any],
+    backend: Any,
+    work_dir: Path,
+    args: argparse.Namespace,
+    offset: int,
+) -> tuple[list[str], dict[str, float], dict[str, float]]:
+    hargs = hierarchy_args(args)
+    case_dir = work_dir / f"case_{offset:05d}"
+    meta = write_lazy_index(row, backend, case_dir, hargs)
+    ranked, search_stats, _ = hierarchical_search(row, backend, meta, hargs)
+    seeds = ranked[: max(1, args.graph_seed_count)]
+    return [memory_id for memory_id, _, _ in seeds], {memory_id: score for memory_id, score, _ in ranked}, {
+        "index_build_ms": float(meta.get("build_latency_ms") or 0.0),
+        "index_seed_ms": float(search_stats.get("latency_ms") or 0.0),
+        "index_file_reads": float(search_stats.get("file_reads") or 0.0),
+        "index_unique_nodes_read": float(search_stats.get("unique_nodes_read") or 0.0),
+        "index_final_candidate_count": float(search_stats.get("final_candidate_count") or 0.0),
+    }
+
+
+def select_query_seeds(
+    row: dict[str, Any],
+    backend: Any,
+    config: FrameBuilderConfig,
+    work_dir: Path,
+    args: argparse.Namespace,
+    offset: int,
+) -> tuple[list[str], dict[str, float], dict[str, float]]:
+    if args.seed_source == "full_scan":
+        seed_ids, base_scores, seed_ms = select_seed_ids(row, config)
+        return seed_ids, base_scores, {"seed_selection_ms": seed_ms}
+    return select_index_seed_ids(row, backend, work_dir, args, offset)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     backend = build_embedding_backend(args)
     config = FrameBuilderConfig(
@@ -87,15 +156,24 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if cache_path.exists() and args.reset_cache:
         cache_path.unlink()
     cache = FrameCache(cache_path)
+    work_dir = Path(args.work_dir)
     rows_for_training = []
     metrics: dict[str, list[float]] = {
         "background_cache_build_ms": [],
         "seed_selection_ms": [],
+        "index_build_ms": [],
+        "index_seed_ms": [],
+        "index_file_reads": [],
+        "index_unique_nodes_read": [],
+        "index_final_candidate_count": [],
         "live_frame_ms": [],
         "cached_frame_ms": [],
         "live_frame_recall": [],
         "cached_frame_recall": [],
+        "live_frame_precision_at_k": [],
+        "cached_frame_precision_at_k": [],
         "growth_cached_frame_recall": [],
+        "growth_cached_frame_precision_at_k": [],
         "growth_relevant_stability": [],
         "cache_hits": [],
         "cache_misses": [],
@@ -107,20 +185,32 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         row = ensure_backend_embeddings(row, backend)
         build_stats = populate_frame_cache(row, cache, config)
         metrics["background_cache_build_ms"].append(build_stats["cache_build_ms"])
+        lookup = candidate_lookup(row)
 
         live_started = time.perf_counter()
         live_frame = build_live_graph_frame(row, config)
         metrics["live_frame_ms"].append((time.perf_counter() - live_started) * 1000.0)
 
-        seed_ids, base_scores, seed_selection_ms = select_seed_ids(row, config)
-        metrics["seed_selection_ms"].append(seed_selection_ms)
-        cached_frame, cached_stats = build_cached_graph_frame(row, cache, config, seed_ids=seed_ids, base_scores=base_scores)
+        seed_ids, base_scores, seed_stats = select_query_seeds(row, backend, config, work_dir, args, offset)
+        for key, value in seed_stats.items():
+            if key in metrics:
+                metrics[key].append(value)
+        cached_frame, cached_stats = build_cached_graph_frame(
+            row,
+            cache,
+            config,
+            seed_ids=seed_ids,
+            base_scores=base_scores,
+            candidate_lookup=lookup,
+        )
         metrics["cached_frame_ms"].append(cached_stats["cache_query_ms"])
         metrics["cache_hits"].append(cached_stats["cache_hits"])
         metrics["cache_misses"].append(cached_stats["cache_misses"])
         metrics["merged_candidates"].append(cached_stats["merged_candidates"])
         metrics["live_frame_recall"].append(frame_recall(live_frame))
         metrics["cached_frame_recall"].append(frame_recall(cached_frame))
+        metrics["live_frame_precision_at_k"].append(frame_precision_at_k(live_frame, args.top_k))
+        metrics["cached_frame_precision_at_k"].append(frame_precision_at_k(cached_frame, args.top_k))
         rows_for_training.append(cached_frame)
 
         if args.growth_noise > 0:
@@ -129,10 +219,18 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             grown_candidates.extend(make_growth_noise(row, args.growth_noise, args.seed + offset))
             grown_row["candidates"] = grown_candidates
             grown_row = ensure_backend_embeddings(grown_row, backend)
-            grown_seed_ids, grown_base_scores, _ = select_seed_ids(grown_row, config)
-            grown_frame, _ = build_cached_graph_frame(grown_row, cache, config, seed_ids=grown_seed_ids, base_scores=grown_base_scores)
+            grown_seed_ids, grown_base_scores, _ = select_query_seeds(grown_row, backend, config, work_dir, args, offset + args.cases)
+            grown_frame, _ = build_cached_graph_frame(
+                grown_row,
+                cache,
+                config,
+                seed_ids=grown_seed_ids,
+                base_scores=grown_base_scores,
+                candidate_lookup=candidate_lookup(grown_row),
+            )
             relevant = set((row.get("retrieval_task") or {}).get("relevant_ids") or [])
             metrics["growth_cached_frame_recall"].append(frame_recall(grown_frame))
+            metrics["growth_cached_frame_precision_at_k"].append(frame_precision_at_k(grown_frame, args.top_k))
             metrics["growth_relevant_stability"].append(
                 stable_prefix(cached_frame.get("ids", []), grown_frame.get("ids", []), relevant, args.top_k)
             )
@@ -155,6 +253,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases": args.cases,
         "pool_size": args.pool_size,
         "frame_size": args.frame_size,
+        "seed_source": args.seed_source,
         "growth_noise": args.growth_noise,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "cache": cache.stats(),
@@ -183,6 +282,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- cases: `{result['cases']}`",
         f"- pool_size: `{result['pool_size']}`",
         f"- frame_size: `{result['frame_size']}`",
+        f"- seed_source: `{result['seed_source']}`",
         f"- growth_noise: `{result['growth_noise']}`",
         f"- cache_records: `{result['cache']['frame_count']}`",
         "",
@@ -208,9 +308,25 @@ def main() -> None:
     parser.add_argument("--hide-role-features", action="store_true")
     parser.add_argument("--seed", type=int, default=31000)
     parser.add_argument("--cache-path", default="artifacts/frame_cache/frame_cache.sqlite")
+    parser.add_argument("--work-dir", default="artifacts/frame_cache/hierarchical_seed")
     parser.add_argument("--reset-cache", action="store_true")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--train-models", default="")
+    parser.add_argument("--seed-source", choices=["full_scan", "hierarchical"], default="full_scan")
+    parser.add_argument("--hierarchy-return-limit", type=int, default=256)
+    parser.add_argument("--hierarchy-beam-width", type=int, default=4)
+    parser.add_argument("--hierarchy-max-frontier", type=int, default=256)
+    parser.add_argument("--hierarchy-max-children-per-basin", type=int, default=128)
+    parser.add_argument("--hierarchy-max-leaf-reads", type=int, default=384)
+    parser.add_argument("--hierarchy-promoted-per-basin", type=int, default=32)
+    parser.add_argument("--hierarchy-graph-seed-count", type=int, default=8)
+    parser.add_argument("--hierarchy-graph-depth", type=int, default=2)
+    parser.add_argument("--hierarchy-cache-size", type=int, default=256)
+    parser.add_argument("--hierarchy-promotion-bias", type=float, default=0.0)
+    parser.add_argument("--hierarchy-promotion-scale", type=float, default=1.0)
+    parser.add_argument("--hierarchy-stable-growth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--hierarchy-stable-basin-floor", type=float, default=0.16)
+    parser.add_argument("--hierarchy-stable-max-basins", type=int, default=0)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")

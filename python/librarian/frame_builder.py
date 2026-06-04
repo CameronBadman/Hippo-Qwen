@@ -172,11 +172,15 @@ def build_cached_graph_frame(
     config: FrameBuilderConfig,
     seed_ids: list[str] | None = None,
     base_scores: dict[str, float] | None = None,
+    candidate_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[dict[str, Any], dict[str, float]]:
     started = time.perf_counter()
     qvec = query_embedding(row)
-    candidates = [dict(candidate) for candidate in row.get("candidates", [])]
-    by_id = {candidate["id"]: candidate for candidate in candidates}
+    if candidate_lookup is None:
+        candidates = [dict(candidate) for candidate in row.get("candidates", [])]
+        by_id = {candidate["id"]: candidate for candidate in candidates}
+    else:
+        by_id = candidate_lookup
     if seed_ids is None:
         seed_ids, base_scores, seed_selection_ms = select_seed_ids(row, config)
     else:
