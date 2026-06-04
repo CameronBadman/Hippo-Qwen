@@ -185,7 +185,8 @@ levels:
 python3 -m python.benchmarks.hierarchical_file_ann \
   --cases 20 \
   --pool-size 10000 \
-  --beam-width 4 \
+  --stable-growth \
+  --growth-noise-count 8 \
   --promotion-bias 0.0 \
   --determinism-repeats 3 \
   --output-json artifacts/hippocampus/hierarchical_file_ann.json \
@@ -196,6 +197,10 @@ Use `--promotion-bias` to increase or decrease the deterministic chance that a
 memory is promoted into higher-level basins. The report includes precision,
 context recall, path success, binary file reads, unique nodes read, cache hits,
 lazy edge expansions, latency, promotion rate, and repeated-query determinism.
+With stable growth enabled, basin routing uses fixed keys plus monotonic
+activation masks and absolute inclusion gates, so new unrelated nodes should add
+candidates rather than evict previously reachable relevant memories. Use
+`--growth-noise-count` to test that property directly.
 
 Run the full local-first evaluation suite:
 

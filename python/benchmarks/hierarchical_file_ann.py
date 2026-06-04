@@ -32,9 +32,9 @@ from python.librarian.features import (
     activation_mask_for_text,
     clamp,
     cosine,
+    embed_text,
     fnv1a64,
     jaccard,
-    normalize,
     tokens,
 )
 
@@ -50,19 +50,6 @@ NODE_HEADER = struct.Struct("<II")
 
 def stable_unit(value: str) -> float:
     return (fnv1a64(value) % 10_000_000) / 10_000_000.0
-
-
-def mean_embedding(vectors: list[list[float]]) -> list[float]:
-    if not vectors:
-        return []
-    dims = len(vectors[0])
-    total = [0.0] * dims
-    for vector in vectors:
-        if len(vector) != dims:
-            continue
-        for idx, value in enumerate(vector):
-            total[idx] += value
-    return normalize([value / max(1, len(vectors)) for value in total])
 
 
 def project_key(card: dict[str, Any]) -> str:
@@ -134,12 +121,19 @@ def sort_ids_by_priority(ids: list[str], cards: dict[str, dict[str, Any]], bias:
     return sorted(ids, key=lambda node_id: (-memory_priority(cards[node_id], bias, scale), node_id))
 
 
-def basin_text(kind: str, key: str, count: int) -> str:
-    return f"{kind} memory basin {key} containing {count} memories"
+def basin_text(kind: str, key: str) -> str:
+    return f"{kind} memory basin {key}"
 
 
-def make_basin_node(node_id: str, level: int, kind: str, key: str, children: list[str], embeddings: list[list[float]]) -> dict[str, Any]:
-    text = basin_text(kind, key, len(children))
+def activation_union(cards: list[dict[str, Any]]) -> int:
+    mask = 0
+    for card in cards:
+        mask |= activation_mask_for_text(f"{card.get('text', '')} {card.get('summary', '')}")
+    return mask
+
+
+def make_basin_node(node_id: str, level: int, kind: str, key: str, children: list[str], child_cards: list[dict[str, Any]]) -> dict[str, Any]:
+    text = basin_text(kind, key)
     return {
         "id": node_id,
         "node_type": "basin",
@@ -148,7 +142,8 @@ def make_basin_node(node_id: str, level: int, kind: str, key: str, children: lis
         "key": key,
         "text": text,
         "summary": "",
-        "embedding": mean_embedding(embeddings),
+        "embedding": embed_text(text),
+        "routing_mask": activation_union(child_cards),
         "importance": 0.5,
         "cluster": key.split(":")[0],
         "metadata": {"project": key.split(":")[0]},
@@ -171,7 +166,14 @@ def decode_node_record(frame: bytes, raw_size: int) -> dict[str, Any]:
     return json.loads(raw.decode("utf-8"))
 
 
+def activation_coverage(query_mask: int, candidate_mask: int) -> float:
+    if not query_mask or not candidate_mask:
+        return 0.0
+    return (query_mask & candidate_mask).bit_count() / max(1, query_mask.bit_count())
+
+
 def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, output_dir: Path, args: argparse.Namespace) -> dict[str, Any]:
+    started = time.perf_counter()
     row = ensure_backend_embeddings(row, backend)
     output_dir.mkdir(parents=True, exist_ok=True)
     nodes_path = output_dir / "nodes.hgb"
@@ -212,7 +214,7 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
             "route",
             f"{project}:{topic}:{route}",
             ids,
-            [memory_cards[node_id]["embedding"] for node_id in ids],
+            [memory_cards[node_id] for node_id in ids],
         )
 
     level1_nodes: dict[tuple[str, str], dict[str, Any]] = {}
@@ -220,28 +222,28 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
         project, topic = key
         child_keys = sorted(route_key(memory_cards[node_id]) for node_id in ids)
         child_ids = [f"basin:l2:{project}:{topic}:{route}" for route in OrderedDict.fromkeys(child_keys)]
-        child_embeddings = [level2_nodes[(project, topic, route)]["embedding"] for route in OrderedDict.fromkeys(child_keys)]
+        child_cards = [level2_nodes[(project, topic, route)] for route in OrderedDict.fromkeys(child_keys)]
         level1_nodes[key] = make_basin_node(
             f"basin:l1:{project}:{topic}",
             LEVEL_PROJECT,
             "topic",
             f"{project}:{topic}",
             child_ids,
-            child_embeddings,
+            child_cards,
         )
 
     level0_nodes: dict[str, dict[str, Any]] = {}
     for project, ids in project_groups.items():
         topics = sorted(topic_key(memory_cards[node_id]) for node_id in ids)
         child_ids = [f"basin:l1:{project}:{topic}" for topic in OrderedDict.fromkeys(topics)]
-        child_embeddings = [level1_nodes[(project, topic)]["embedding"] for topic in OrderedDict.fromkeys(topics)]
+        child_cards = [level1_nodes[(project, topic)] for topic in OrderedDict.fromkeys(topics)]
         level0_nodes[project] = make_basin_node(
             f"basin:l0:{project}",
             LEVEL_ROOT,
             "project",
             project,
             child_ids,
-            child_embeddings,
+            child_cards,
         )
 
     promoted_count = 0
@@ -288,6 +290,9 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
         "promotion_scale": args.promotion_scale,
     }
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    meta["build_latency_ms"] = (time.perf_counter() - started) * 1000.0
+    meta["node_store_bytes"] = nodes_path.stat().st_size
+    meta["index_bytes"] = meta_path.stat().st_size
     return meta
 
 
@@ -335,17 +340,20 @@ class LazyNodeStore:
 
 def score_node(row: dict[str, Any], query_text: str, query_embedding: list[float], query_mask: int, node: dict[str, Any]) -> float:
     anchor = row["anchor"]
-    semantic = cosine(query_embedding, node.get("embedding") or [])
     lexical = jaccard(query_text, f"{node.get('text', '')} {node.get('summary', '')}")
-    activation = activation_overlap(query_mask, activation_mask_for_text(node.get("text") or ""))
     same_cluster = 1.0 if str(anchor.get("cluster") or "").lower() == str(node.get("cluster") or "").lower() else 0.0
-    child_penalty = 0.012 * math.log1p(float(node.get("child_count") or len(node.get("children") or [])))
     if node.get("node_type") == "memory":
+        semantic = cosine(query_embedding, node.get("embedding") or [])
+        activation = activation_overlap(query_mask, activation_mask_for_text(node.get("text") or ""))
+        child_penalty = 0.0
         state = state_score(node)
         promotion = 0.06 * float(node.get("importance") or 0.5)
     else:
+        semantic = 0.0
+        activation = activation_coverage(query_mask, int(node.get("routing_mask") or 0))
+        child_penalty = 0.0
         state = 0.0
-        promotion = 0.025 * min(1.0, len(node.get("promoted_children") or []) / 12.0)
+        promotion = 0.0
     return (
         0.36 * semantic
         + 0.22 * lexical
@@ -371,6 +379,31 @@ def unique_limited(ids: list[str], limit: int) -> list[str]:
     return out
 
 
+def unique_ids(ids: list[str], limit: int = 0) -> list[str]:
+    out = []
+    seen = set()
+    for node_id in ids:
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        out.append(node_id)
+        if limit > 0 and len(out) >= limit:
+            break
+    return out
+
+
+def keep_basin_candidates(scored: list[tuple[str, float, dict[str, Any]]], args: argparse.Namespace) -> list[tuple[str, float, dict[str, Any]]]:
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    if not args.stable_growth:
+        return scored[: args.beam_width]
+    kept = [item for item in scored if item[1] >= args.stable_basin_floor]
+    if not kept:
+        return scored[: args.beam_width]
+    if args.stable_max_basins > 0:
+        return kept[: args.stable_max_basins]
+    return kept
+
+
 def ranked_signature(ranked: Ranked) -> list[tuple[str, float]]:
     return [(node_id, round(float(score), 12)) for node_id, score, _ in ranked]
 
@@ -388,6 +421,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         basin_nodes_scored = 0
         promoted_scored = 0
         edge_expansions = 0
+        edge_source_scores: dict[str, tuple[float, str]] = {}
         visited_ids: set[str] = set()
         for level in [LEVEL_ROOT, LEVEL_PROJECT, LEVEL_TOPIC]:
             scored: list[tuple[str, float, dict[str, Any]]] = []
@@ -406,27 +440,38 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                     prior = leaf_scores.get(promoted_id)
                     if prior is None or score > prior[0]:
                         leaf_scores[promoted_id] = (score, promoted.get("text", ""))
-            scored.sort(key=lambda item: (-item[1], item[0]))
-            kept = scored[: args.beam_width]
+                    if promoted.get("edges"):
+                        prior_source = edge_source_scores.get(promoted_id)
+                        if prior_source is None or score > prior_source[0]:
+                            edge_source_scores[promoted_id] = (score, promoted.get("text", ""))
+            kept = keep_basin_candidates(scored, args)
             next_ids: list[str] = []
             for _, _, node in kept:
                 child_ids = list(node.get("children") or [])
-                if level == LEVEL_TOPIC:
+                if level == LEVEL_TOPIC and not args.stable_growth:
                     child_ids = child_ids[: args.max_children_per_basin]
                 next_ids.extend(child_ids)
-            frontier = unique_limited(next_ids, args.max_frontier)
+            frontier = unique_ids(next_ids, 0 if args.stable_growth else args.max_frontier)
 
-        for node_id in frontier[: args.max_leaf_reads]:
+        leaf_frontier = frontier if args.stable_growth else frontier[: args.max_leaf_reads]
+        for node_id in leaf_frontier:
             node = store.read(node_id)
             score = score_node(row, query_text, query_embedding, query_mask, node)
             prior = leaf_scores.get(node_id)
             if prior is None or score > prior[0]:
                 leaf_scores[node_id] = (score, node.get("text", ""))
+            if node.get("edges"):
+                prior_source = edge_source_scores.get(node_id)
+                if prior_source is None or score > prior_source[0]:
+                    edge_source_scores[node_id] = (score, node.get("text", ""))
 
-        frontier_edges = [
-            (node_id, score, [node_id])
-            for node_id, (score, _) in sorted(leaf_scores.items(), key=lambda item: (-item[1][0], item[0]))[: args.graph_seed_count]
-        ]
+        edge_seed_items = edge_source_scores if args.stable_growth else leaf_scores
+        edge_seed_limit = 0 if args.stable_growth else args.graph_seed_count
+        frontier_edges = []
+        for node_id, (score, _) in sorted(edge_seed_items.items(), key=lambda item: (-item[1][0], item[0])):
+            frontier_edges.append((node_id, score, [node_id]))
+            if edge_seed_limit > 0 and len(frontier_edges) >= edge_seed_limit:
+                break
         for depth in range(args.graph_depth):
             next_frontier: list[tuple[str, float, list[str]]] = []
             for current_id, current_score, path in frontier_edges:
@@ -472,11 +517,74 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         "edge_expansions": float(edge_expansions),
         "final_candidate_count": float(len(ranked)),
     }
-    return ranked[: args.return_limit], stats
+    if args.return_limit > 0:
+        return ranked[: args.return_limit], stats
+    return ranked, stats
 
 
 def flatten(prefix: str, values: dict[str, float]) -> dict[str, float]:
     return {f"{prefix}_{key}": float(value) for key, value in values.items()}
+
+
+def make_growth_noise(row: dict[str, Any], backend: CachedEmbeddingBackend, seed: int, count: int) -> list[dict[str, Any]]:
+    cards = []
+    texts = []
+    project = project_key(row.get("anchor") or {})
+    query = str((row.get("retrieval_task") or {}).get("query") or row.get("anchor", {}).get("text") or "")
+    for index in range(count):
+        text = (
+            f"{project}: growth-noise-{seed}-{index} mentions current lookup terms: {query}. "
+            f"This is an unrelated maintenance decoy with random ticket {900000 + seed * 17 + index}."
+        )
+        texts.append(text)
+        cards.append(
+            {
+                "id": f"growth_noise_{seed}_{index}",
+                "text": text,
+                "summary": "",
+                "embedding": [],
+                "importance": 0.25,
+                "cluster": project,
+                "metadata": {"project": project},
+                "age_days": 1,
+                "use_count": 0,
+                "evidence_count": 0,
+                "last_outcome": "",
+                "protected": False,
+                "synthetic_role": "growth_noise",
+            }
+        )
+    if cards:
+        for card, embedding in zip(cards, backend.embed_many(texts)):
+            card["embedding"] = embedding
+    return cards
+
+
+def maybe_limit_ranked(ranked: Ranked, limit: int) -> Ranked:
+    if limit > 0:
+        return ranked[:limit]
+    return ranked
+
+
+def growth_stability_metrics(base: Ranked, grown: Ranked, row: dict[str, Any], top_n: int) -> dict[str, float]:
+    relevant = set((row.get("retrieval_task") or {}).get("relevant_ids") or [])
+    base_ids = [node_id for node_id, _, _ in base]
+    grown_ids = [node_id for node_id, _, _ in grown]
+    base_set = set(base_ids)
+    grown_set = set(grown_ids)
+    base_relevant = relevant & base_set
+    retained_relevant = base_relevant & grown_set
+    protected_base = set(base_ids[:top_n]) if top_n > 0 else base_set
+    protected_retained = protected_base & grown_set
+    return {
+        "relevant_retention": 1.0 if not base_relevant else len(retained_relevant) / len(base_relevant),
+        "relevant_dropped": float(len(base_relevant - grown_set)),
+        "topn_retention": len(protected_retained) / max(1, len(protected_base)),
+        "topn_dropped": float(len(protected_base - grown_set)),
+        "candidate_growth": float(len(grown_ids) - len(base_ids)),
+        "base_candidates": float(len(base_ids)),
+        "grown_candidates": float(len(grown_ids)),
+    }
 
 
 def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir: Path, args: argparse.Namespace) -> dict[str, float]:
@@ -492,13 +600,17 @@ def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir
             repeat_latency_ms += repeated_stats["latency_ms"]
             if ranked_signature(repeated) != expected:
                 determinism_mismatches += 1
-    sparse = sparse_basin_scores(row, backend)[: args.return_limit]
-    vector = vector_scores_with_backend(row, backend)[: args.return_limit]
+    sparse = maybe_limit_ranked(sparse_basin_scores(row, backend), args.return_limit)
+    vector = maybe_limit_ranked(vector_scores_with_backend(row, backend), args.return_limit)
     flat: dict[str, float] = {
         "memory_count": float(meta["memory_count"]),
         "basin_count": float(meta["basin_count"]),
         "promoted_count": float(meta["promoted_count"]),
         "promotion_rate": float(meta["promoted_count"]) / max(1.0, float(meta["memory_count"])),
+        "index_build_latency_ms": float(meta["build_latency_ms"]),
+        "index_node_store_bytes": float(meta["node_store_bytes"]),
+        "index_sidecar_bytes": float(meta["index_bytes"]),
+        "index_bytes_per_memory": (float(meta["node_store_bytes"]) + float(meta["index_bytes"])) / max(1.0, float(meta["memory_count"])),
         "deterministic": 1.0 if determinism_mismatches == 0 else 0.0,
         "determinism_mismatches": float(determinism_mismatches),
         "determinism_repeats": float(args.determinism_repeats),
@@ -508,6 +620,13 @@ def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir
     flat.update(flatten("hierarchical_multihop", multihop_metrics(row, hierarchical, args.top_k, args.budget)))
     flat.update(flatten("hierarchical_context_exposure", context_decoy_metrics(row, hierarchical, args.budget)))
     flat.update(flatten("hierarchical_io", io_stats))
+    if args.growth_noise_count > 0:
+        grown_row = dict(row)
+        grown_row["candidates"] = list(row.get("candidates") or []) + make_growth_noise(row, backend, args.seed, args.growth_noise_count)
+        grown_meta = write_lazy_index(grown_row, backend, case_dir / "growth", args)
+        grown, grown_io = hierarchical_search(grown_row, backend, grown_meta, args)
+        flat.update(flatten("growth_stability", growth_stability_metrics(hierarchical, grown, row, args.stability_top_n)))
+        flat.update(flatten("growth_io", grown_io))
     flat.update(flatten("sparse_retrieval", evaluate_ranked(row, sparse, args.top_k, args.budget)))
     flat.update(flatten("sparse_multihop", multihop_metrics(row, sparse, args.top_k, args.budget)))
     flat.update(flatten("vector_retrieval", evaluate_ranked(row, vector, args.top_k, args.budget)))
@@ -528,6 +647,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         rows.append(evaluate_case(row, backend, case_dir, args))
     keys = sorted(rows[0]) if rows else []
     averages = {key: sum(row[key] for row in rows) / max(1, len(rows)) for key in keys}
+    quantile_keys = [
+        "hierarchical_io_latency_ms",
+        "hierarchical_io_file_reads",
+        "hierarchical_io_final_candidate_count",
+        "hierarchical_retrieval_context_precision",
+        "hierarchical_retrieval_context_recall",
+        "index_build_latency_ms",
+        "index_bytes_per_memory",
+        "growth_stability_relevant_retention",
+        "growth_stability_topn_retention",
+    ]
     return {
         "benchmark": "hierarchical_file_ann",
         "embedding_backend": backend.name,
@@ -535,6 +665,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases": args.cases,
         "pool_size": args.pool_size,
         "seed": args.seed,
+        "stable_growth": args.stable_growth,
+        "stable_basin_floor": args.stable_basin_floor,
+        "growth_noise_count": args.growth_noise_count,
         "beam_width": args.beam_width,
         "max_children_per_basin": args.max_children_per_basin,
         "max_leaf_reads": args.max_leaf_reads,
@@ -543,7 +676,26 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "determinism_repeats": args.determinism_repeats,
         "elapsed_seconds": round(time.time() - started, 2),
         "averages": averages,
+        "quantiles": {key: quantiles([row[key] for row in rows if key in row]) for key in quantile_keys},
         "rows": rows if args.include_rows else [],
+    }
+
+
+def quantiles(values: list[float]) -> dict[str, float]:
+    if not values:
+        return {}
+    ordered = sorted(values)
+
+    def pick(q: float) -> float:
+        index = min(len(ordered) - 1, max(0, int(math.ceil(q * len(ordered)) - 1)))
+        return float(ordered[index])
+
+    return {
+        "min": float(ordered[0]),
+        "p50": pick(0.50),
+        "p95": pick(0.95),
+        "p99": pick(0.99),
+        "max": float(ordered[-1]),
     }
 
 
@@ -555,6 +707,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- backend: `{result['embedding_backend']}`",
         f"- cases: `{result['cases']}`",
         f"- pool_size: `{result['pool_size']}`",
+        f"- stable_growth: `{result['stable_growth']}`",
+        f"- stable_basin_floor: `{result['stable_basin_floor']}`",
+        f"- growth_noise_count: `{result['growth_noise_count']}`",
         f"- beam_width: `{result['beam_width']}`",
         f"- max_children_per_basin: `{result['max_children_per_basin']}`",
         f"- promotion_bias: `{result['promotion_bias']}`",
@@ -598,6 +753,25 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"| latency ms | {avg.get('hierarchical_io_latency_ms', 0.0):.2f} |",
         f"| promoted links | {avg.get('promoted_count', 0.0):.2f} |",
         f"| promotion rate | {avg.get('promotion_rate', 0.0):.4f} |",
+        f"| build latency ms | {avg.get('index_build_latency_ms', 0.0):.2f} |",
+        f"| bytes per memory | {avg.get('index_bytes_per_memory', 0.0):.2f} |",
+        "",
+        "| Latency Quantiles | min | p50 | p95 | p99 | max |",
+        "| --- | ---: | ---: | ---: | ---: | ---: |",
+    ]
+    for key in [
+        "hierarchical_io_latency_ms",
+        "hierarchical_io_file_reads",
+        "hierarchical_io_final_candidate_count",
+        "index_build_latency_ms",
+    ]:
+        q = result.get("quantiles", {}).get(key, {})
+        lines.append(
+            f"| {key} | {q.get('min', 0.0):.2f} | {q.get('p50', 0.0):.2f} | "
+            f"{q.get('p95', 0.0):.2f} | {q.get('p99', 0.0):.2f} | {q.get('max', 0.0):.2f} |"
+        )
+    lines.extend(
+        [
         "",
         "| Determinism | value |",
         "| --- | ---: |",
@@ -605,7 +779,17 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"| repeat mismatches | {avg.get('determinism_mismatches', 0.0):.2f} |",
         f"| repeat latency ms | {avg.get('determinism_repeat_latency_ms', 0.0):.2f} |",
         "",
-    ]
+        "| Growth Stability | value |",
+        "| --- | ---: |",
+        f"| relevant retention | {avg.get('growth_stability_relevant_retention', 0.0):.4f} |",
+        f"| relevant dropped | {avg.get('growth_stability_relevant_dropped', 0.0):.2f} |",
+        f"| topN retention | {avg.get('growth_stability_topn_retention', 0.0):.4f} |",
+        f"| topN dropped | {avg.get('growth_stability_topn_dropped', 0.0):.2f} |",
+        f"| candidate growth | {avg.get('growth_stability_candidate_growth', 0.0):.2f} |",
+        f"| grown latency ms | {avg.get('growth_io_latency_ms', 0.0):.2f} |",
+        "",
+        ]
+    )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
 
@@ -618,7 +802,7 @@ def main() -> None:
     parser.add_argument("--work-dir", default="artifacts/hippocampus/hierarchical_file_ann")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
-    parser.add_argument("--return-limit", type=int, default=128)
+    parser.add_argument("--return-limit", type=int, default=0)
     parser.add_argument("--beam-width", type=int, default=4)
     parser.add_argument("--max-frontier", type=int, default=256)
     parser.add_argument("--max-children-per-basin", type=int, default=128)
@@ -630,6 +814,11 @@ def main() -> None:
     parser.add_argument("--promotion-bias", type=float, default=0.0)
     parser.add_argument("--promotion-scale", type=float, default=1.0)
     parser.add_argument("--determinism-repeats", type=int, default=1)
+    parser.add_argument("--stable-growth", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--stable-basin-floor", type=float, default=0.16)
+    parser.add_argument("--stable-max-basins", type=int, default=0)
+    parser.add_argument("--growth-noise-count", type=int, default=1)
+    parser.add_argument("--stability-top-n", type=int, default=64)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
