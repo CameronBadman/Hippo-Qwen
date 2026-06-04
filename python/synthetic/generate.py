@@ -955,32 +955,32 @@ def iter_associative_multihop_cases(seed: int, count: int, candidates: int) -> I
         target = generated_card(
             anchor,
             (
-                f"{answer_tag}: durable resolution says the user {preference}; "
-                f"apply this when making the final decision."
+                f"{answer_tag}: accepted resolution from the linked handoff. "
+                f"Use option B from the connected note; ignore standalone decoys."
             ),
             "associative_target_relevant",
             idx,
             0,
             age_days=7,
-            use_count=21,
-            evidence_count=8,
+            use_count=3,
+            evidence_count=2,
             last_outcome="helpful",
-            importance=0.84,
+            importance=0.58,
         )
         support = generated_card(
             anchor,
             (
-                f"{answer_tag} support: previous successful answer followed the "
-                f"{preference} constraint and avoided unrelated implementation churn."
+                f"Option B detail: previous successful answer followed the {preference} "
+                f"constraint and avoided unrelated implementation churn."
             ),
             "associative_support_relevant",
             idx,
             0,
             age_days=14,
-            use_count=8,
-            evidence_count=5,
+            use_count=2,
+            evidence_count=2,
             last_outcome="helpful",
-            importance=0.72,
+            importance=0.56,
         )
 
         chosen_roles: list[tuple[dict, str]] = [
