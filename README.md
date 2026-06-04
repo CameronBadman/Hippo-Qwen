@@ -213,6 +213,7 @@ python3 -m python.benchmarks.hard_memory_regression \
   --cases 10 \
   --pool-size 5000 \
   --growth-count 1000 \
+  --stable-max-basins 8 \
   --determinism-repeats 3 \
   --fail-on-regression \
   --output-json artifacts/hippocampus/hard_memory_regression.json \
@@ -223,7 +224,9 @@ The hard regression reports raw candidate volume, compacted context precision
 and recall, growth retention, top-N retention, repeated-query determinism, and
 p95 latency. Use the same `--embedding-backend hippo`,
 `--hippo-encoder-src`, and `--hippo-checkpoint` flags as the other benchmarks
-to run it with Hippo-encoder routing vectors.
+to run it with Hippo-encoder routing vectors. `--stable-max-basins 8` is the
+current quality-preserving pressure setting; lower basin or leaf caps are
+faster but can drop conflict-route recall under adversarial growth.
 
 Run the full local-first evaluation suite:
 
