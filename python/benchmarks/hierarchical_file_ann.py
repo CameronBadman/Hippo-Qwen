@@ -371,6 +371,10 @@ def unique_limited(ids: list[str], limit: int) -> list[str]:
     return out
 
 
+def ranked_signature(ranked: Ranked) -> list[tuple[str, float]]:
+    return [(node_id, round(float(score), 12)) for node_id, score, _ in ranked]
+
+
 def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, meta: dict[str, Any], args: argparse.Namespace) -> tuple[Ranked, dict[str, float]]:
     task = row.get("retrieval_task") or {}
     query_text = task.get("query") or row["anchor"]["text"]
@@ -479,6 +483,15 @@ def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir
     row = ensure_backend_embeddings(row, backend)
     meta = write_lazy_index(row, backend, case_dir, args)
     hierarchical, io_stats = hierarchical_search(row, backend, meta, args)
+    determinism_mismatches = 0
+    repeat_latency_ms = 0.0
+    if args.determinism_repeats > 1:
+        expected = ranked_signature(hierarchical)
+        for _ in range(args.determinism_repeats - 1):
+            repeated, repeated_stats = hierarchical_search(row, backend, meta, args)
+            repeat_latency_ms += repeated_stats["latency_ms"]
+            if ranked_signature(repeated) != expected:
+                determinism_mismatches += 1
     sparse = sparse_basin_scores(row, backend)[: args.return_limit]
     vector = vector_scores_with_backend(row, backend)[: args.return_limit]
     flat: dict[str, float] = {
@@ -486,6 +499,10 @@ def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir
         "basin_count": float(meta["basin_count"]),
         "promoted_count": float(meta["promoted_count"]),
         "promotion_rate": float(meta["promoted_count"]) / max(1.0, float(meta["memory_count"])),
+        "deterministic": 1.0 if determinism_mismatches == 0 else 0.0,
+        "determinism_mismatches": float(determinism_mismatches),
+        "determinism_repeats": float(args.determinism_repeats),
+        "determinism_repeat_latency_ms": repeat_latency_ms / max(1, args.determinism_repeats - 1),
     }
     flat.update(flatten("hierarchical_retrieval", evaluate_ranked(row, hierarchical, args.top_k, args.budget)))
     flat.update(flatten("hierarchical_multihop", multihop_metrics(row, hierarchical, args.top_k, args.budget)))
@@ -523,6 +540,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_leaf_reads": args.max_leaf_reads,
         "promotion_bias": args.promotion_bias,
         "promotion_scale": args.promotion_scale,
+        "determinism_repeats": args.determinism_repeats,
         "elapsed_seconds": round(time.time() - started, 2),
         "averages": averages,
         "rows": rows if args.include_rows else [],
@@ -541,6 +559,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- max_children_per_basin: `{result['max_children_per_basin']}`",
         f"- promotion_bias: `{result['promotion_bias']}`",
         f"- promotion_scale: `{result['promotion_scale']}`",
+        f"- determinism_repeats: `{result['determinism_repeats']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
         "| method | precision | recall | target ctx | path ctx | noise |",
@@ -580,6 +599,12 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"| promoted links | {avg.get('promoted_count', 0.0):.2f} |",
         f"| promotion rate | {avg.get('promotion_rate', 0.0):.4f} |",
         "",
+        "| Determinism | value |",
+        "| --- | ---: |",
+        f"| deterministic cases | {avg.get('deterministic', 0.0):.4f} |",
+        f"| repeat mismatches | {avg.get('determinism_mismatches', 0.0):.2f} |",
+        f"| repeat latency ms | {avg.get('determinism_repeat_latency_ms', 0.0):.2f} |",
+        "",
     ]
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines), encoding="utf-8")
@@ -604,6 +629,7 @@ def main() -> None:
     parser.add_argument("--cache-size", type=int, default=256)
     parser.add_argument("--promotion-bias", type=float, default=0.0)
     parser.add_argument("--promotion-scale", type=float, default=1.0)
+    parser.add_argument("--determinism-repeats", type=int, default=1)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")

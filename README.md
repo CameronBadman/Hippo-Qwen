@@ -187,6 +187,7 @@ python3 -m python.benchmarks.hierarchical_file_ann \
   --pool-size 10000 \
   --beam-width 4 \
   --promotion-bias 0.0 \
+  --determinism-repeats 3 \
   --output-json artifacts/hippocampus/hierarchical_file_ann.json \
   --output-md artifacts/hippocampus/hierarchical_file_ann.md
 ```
@@ -194,7 +195,7 @@ python3 -m python.benchmarks.hierarchical_file_ann \
 Use `--promotion-bias` to increase or decrease the deterministic chance that a
 memory is promoted into higher-level basins. The report includes precision,
 context recall, path success, binary file reads, unique nodes read, cache hits,
-lazy edge expansions, latency, and promotion rate.
+lazy edge expansions, latency, promotion rate, and repeated-query determinism.
 
 Run the full local-first evaluation suite:
 
