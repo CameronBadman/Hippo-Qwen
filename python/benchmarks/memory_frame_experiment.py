@@ -64,11 +64,11 @@ class MemoryFrameDataset(Dataset):
         }
 
 
-def build_frames(cases: int, pool_size: int, frame_size: int, seed: int) -> list[dict[str, Any]]:
+def build_frames(cases: int, pool_size: int, frame_size: int, seed: int, use_role_features: bool) -> list[dict[str, Any]]:
     frames = []
     for offset in range(cases):
         row = build_large_pool_case(seed + offset, pool_size)
-        frames.append(build_frame(row, frame_size))
+        frames.append(build_frame(row, frame_size, use_role_features))
     return frames
 
 
@@ -79,14 +79,14 @@ def query_embedding(row: dict[str, Any]) -> list[float]:
     return embed_text(query)
 
 
-def frame_score(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[float]) -> float:
+def frame_score(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[float], use_role_features: bool) -> float:
     query = (row.get("retrieval_task") or {}).get("query") or row["anchor"]["text"]
     anchor = row["anchor"]
     qmask = activation_mask_for_text(query)
     cmask = activation_mask_for_text(candidate.get("text", ""))
     activation = (qmask & cmask).bit_count() / max(1, (qmask | cmask).bit_count())
     state = state_features(anchor, candidate)
-    role = str(candidate.get("synthetic_role") or "")
+    role = str(candidate.get("synthetic_role") or "") if use_role_features else ""
     conflict_penalty = 0.25 if any(term in role for term in ("decoy", "wrong", "stale", "background")) else 0.0
     return (
         0.36 * cosine(query_vec, candidate.get("embedding") or [])
@@ -101,12 +101,12 @@ def frame_score(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[
     )
 
 
-def build_frame(row: dict[str, Any], frame_size: int) -> dict[str, Any]:
+def build_frame(row: dict[str, Any], frame_size: int, use_role_features: bool) -> dict[str, Any]:
     qvec = query_embedding(row)
     anchor = dict(row["anchor"])
     relevant = set((row.get("retrieval_task") or {}).get("relevant_ids") or [])
     candidates = [dict(candidate) for candidate in row.get("candidates", [])]
-    candidates.sort(key=lambda item: (-frame_score(row, item, qvec), item["id"]))
+    candidates.sort(key=lambda item: (-frame_score(row, item, qvec, use_role_features), item["id"]))
     selected = candidates[:frame_size]
     embeddings = []
     scalars = []
@@ -117,7 +117,7 @@ def build_frame(row: dict[str, Any], frame_size: int) -> dict[str, Any]:
     for candidate in selected:
         embedding = candidate.get("embedding") or [0.0] * DEFAULT_DIMS
         embeddings.append(embedding)
-        scalars.append(frame_scalars(row, candidate, qvec, qmask))
+        scalars.append(frame_scalars(row, candidate, qvec, qmask, use_role_features))
         labels.append(1.0 if candidate["id"] in relevant else 0.0)
         mask.append(1.0)
     while len(embeddings) < frame_size:
@@ -135,13 +135,13 @@ def build_frame(row: dict[str, Any], frame_size: int) -> dict[str, Any]:
     }
 
 
-def frame_scalars(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[float], query_mask: int) -> list[float]:
+def frame_scalars(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[float], query_mask: int, use_role_features: bool) -> list[float]:
     query = (row.get("retrieval_task") or {}).get("query") or row["anchor"]["text"]
     state = state_features(row["anchor"], candidate)
     text = candidate.get("text", "")
     candidate_mask = activation_mask_for_text(text)
     candidate_len = max(1, len(tokens(text)))
-    role = str(candidate.get("synthetic_role") or "")
+    role = str(candidate.get("synthetic_role") or "") if use_role_features else ""
     values = [
         cosine(query_vec, candidate.get("embedding") or []),
         jaccard(query, text),
@@ -353,7 +353,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
     build_started = time.perf_counter()
-    frames = build_frames(args.cases, args.pool_size, args.frame_size, args.seed)
+    use_role_features = not args.hide_role_features
+    frames = build_frames(args.cases, args.pool_size, args.frame_size, args.seed, use_role_features)
     build_seconds = time.perf_counter() - build_started
     print(f"built_frames={len(frames)} build_seconds={build_seconds:.2f}", flush=True)
     dataset = MemoryFrameDataset(frames)
@@ -377,6 +378,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases": args.cases,
         "pool_size": args.pool_size,
         "frame_size": args.frame_size,
+        "role_features": use_role_features,
         "build_seconds": build_seconds,
         "config": asdict(config),
         "results": results,
@@ -391,6 +393,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- cases: `{result['cases']}`",
         f"- pool_size: `{result['pool_size']}`",
         f"- frame_size: `{result['frame_size']}`",
+        f"- role_features: `{result.get('role_features', True)}`",
         f"- build_seconds: `{result.get('build_seconds', 0.0):.2f}`",
         "",
         "| model | params | precision@k | recall@k | mrr | p50 ms/case | p95 ms/case |",
@@ -425,6 +428,7 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--seed", type=int, default=17000)
     parser.add_argument("--cpu", action="store_true")
+    parser.add_argument("--hide-role-features", action="store_true")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     args = parser.parse_args()
