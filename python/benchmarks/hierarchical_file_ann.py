@@ -204,6 +204,11 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
 
     memory_cards = {str(card["id"]): dict(card) for card in row.get("candidates", [])}
     for card in memory_cards.values():
+        embedding = [float(value) for value in card.get("embedding") or []]
+        routing_dims = int(args.semantic_dims) if int(args.semantic_dims) > 0 else len(embedding)
+        card["routing_embedding"] = [round(value, 8) for value in embedding[:routing_dims]]
+        if not args.store_full_embeddings:
+            card["embedding"] = []
         card["node_type"] = "memory"
         card["level"] = LEVEL_MEMORY
         card["children"] = []
@@ -289,6 +294,10 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
     all_nodes.extend(level1_nodes.values())
     all_nodes.extend(level2_nodes.values())
     all_nodes.extend(memory_cards.values())
+    if not args.store_full_embeddings:
+        for node in all_nodes:
+            if node.get("node_type") != "memory":
+                node["embedding"] = []
 
     offsets: dict[str, int] = {}
     levels: dict[str, list[str]] = {str(level): [] for level in range(LEVEL_MEMORY + 1)}
@@ -366,7 +375,7 @@ def score_node(row: dict[str, Any], query_text: str, query_embedding: list[float
     lexical = jaccard(query_text, f"{node.get('text', '')} {node.get('summary', '')}")
     same_cluster = 1.0 if str(anchor.get("cluster") or "").lower() == str(node.get("cluster") or "").lower() else 0.0
     if node.get("node_type") == "memory":
-        semantic = cosine_prefix(query_embedding, node.get("embedding") or [], semantic_dims)
+        semantic = cosine_prefix(query_embedding, node.get("routing_embedding") or node.get("embedding") or [], semantic_dims)
         activation = activation_overlap(query_mask, activation_mask_for_text(node.get("text") or ""))
         child_penalty = 0.0
         state = state_score(node)
@@ -927,6 +936,7 @@ def main() -> None:
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--cache-size", type=int, default=256)
     parser.add_argument("--semantic-dims", type=int, default=128)
+    parser.add_argument("--store-full-embeddings", action="store_true")
     parser.add_argument("--promotion-bias", type=float, default=0.0)
     parser.add_argument("--promotion-scale", type=float, default=1.0)
     parser.add_argument("--compact-limit", type=int, default=3)
