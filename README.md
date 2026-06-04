@@ -228,6 +228,31 @@ to run it with Hippo-encoder routing vectors. `--stable-max-basins 8` is the
 current quality-preserving pressure setting; lower basin or leaf caps are
 faster but can drop conflict-route recall under adversarial growth.
 
+Run the skeleton memory index experiment when testing the hot-skeleton/cold-
+payload path. It writes fixed-size binary routing records (`skeleton.hsk`) with
+quantized routing vectors, activation masks, state priors, deterministic segment
+IDs, and edge sketches. Query-time search scores the hot skeleton, expands
+edge sketches, and only fetches the final payload window:
+
+```bash
+python3 -m python.benchmarks.skeleton_memory_index \
+  --cases 10 \
+  --pool-size 5000 \
+  --growth-count 1000 \
+  --skeleton-segments 16 \
+  --skeleton-segment-limit 96 \
+  --skeleton-final-fetch 96 \
+  --determinism-repeats 3 \
+  --fail-on-regression \
+  --output-json artifacts/hippocampus/skeleton_memory_index.json \
+  --output-md artifacts/hippocampus/skeleton_memory_index.md
+```
+
+The skeleton report tracks precision, recall, growth retention, determinism,
+payload reads, raw skeleton candidates, and latency. This benchmark is the
+current place to test deterministic scale behavior without HNSW-style insertion
+instability.
+
 Run the full local-first evaluation suite:
 
 ```bash
