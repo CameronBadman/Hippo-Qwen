@@ -552,6 +552,10 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                 node = store.read(node_id)
                 basin_nodes_scored += 1
                 scored.append((node_id, score_node(row, query_text, query_embedding, query_mask, node, args.semantic_dims), node))
+
+            kept = keep_basin_candidates(scored, args)
+            promoted_sources = kept if args.stable_growth else scored
+            for _, _, node in promoted_sources:
                 promoted_ids = unique_limited(node.get("promoted_children") or [], args.promoted_per_basin)
                 for promoted_id in promoted_ids:
                     if args.stable_growth and args.stable_max_promoted_reads > 0 and stable_promoted_reads >= args.stable_max_promoted_reads:
@@ -567,7 +571,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                         prior_source = edge_source_scores.get(promoted_id)
                         if prior_source is None or score > prior_source[0]:
                             edge_source_scores[promoted_id] = (score, promoted.get("text", ""))
-            kept = keep_basin_candidates(scored, args)
+
             next_ids: list[str] = []
             for _, _, node in kept:
                 child_ids = list(node.get("children") or [])
