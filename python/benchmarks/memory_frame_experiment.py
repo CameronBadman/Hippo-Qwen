@@ -46,17 +46,14 @@ class FrameConfig:
 
 
 class MemoryFrameDataset(Dataset):
-    def __init__(self, rows: list[dict[str, Any]], frame_size: int, seed: int):
-        self.rows = rows
-        self.frame_size = frame_size
-        self.rng = random.Random(seed)
+    def __init__(self, frames: list[dict[str, Any]]):
+        self.frames = frames
 
     def __len__(self) -> int:
-        return len(self.rows)
+        return len(self.frames)
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
-        row = self.rows[index]
-        frame = build_frame(row, self.frame_size)
+        frame = self.frames[index]
         return {
             "query": torch.tensor(frame["query"], dtype=torch.float32),
             "anchor": torch.tensor(frame["anchor"], dtype=torch.float32),
@@ -67,8 +64,12 @@ class MemoryFrameDataset(Dataset):
         }
 
 
-def build_rows(cases: int, pool_size: int, seed: int) -> list[dict[str, Any]]:
-    return [build_large_pool_case(seed + offset, pool_size) for offset in range(cases)]
+def build_frames(cases: int, pool_size: int, frame_size: int, seed: int) -> list[dict[str, Any]]:
+    frames = []
+    for offset in range(cases):
+        row = build_large_pool_case(seed + offset, pool_size)
+        frames.append(build_frame(row, frame_size))
+    return frames
 
 
 def query_embedding(row: dict[str, Any]) -> list[float]:
@@ -351,8 +352,11 @@ def train_one(name: str, config: FrameConfig, train_loader: DataLoader, val_load
 def run(args: argparse.Namespace) -> dict[str, Any]:
     random.seed(args.seed)
     torch.manual_seed(args.seed)
-    rows = build_rows(args.cases, args.pool_size, args.seed)
-    dataset = MemoryFrameDataset(rows, args.frame_size, args.seed)
+    build_started = time.perf_counter()
+    frames = build_frames(args.cases, args.pool_size, args.frame_size, args.seed)
+    build_seconds = time.perf_counter() - build_started
+    print(f"built_frames={len(frames)} build_seconds={build_seconds:.2f}", flush=True)
+    dataset = MemoryFrameDataset(frames)
     val_count = max(1, int(len(dataset) * args.val_fraction))
     train_count = max(1, len(dataset) - val_count)
     train_set, val_set = random_split(dataset, [train_count, val_count], generator=torch.Generator().manual_seed(args.seed))
@@ -373,6 +377,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases": args.cases,
         "pool_size": args.pool_size,
         "frame_size": args.frame_size,
+        "build_seconds": build_seconds,
         "config": asdict(config),
         "results": results,
     }
@@ -386,6 +391,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- cases: `{result['cases']}`",
         f"- pool_size: `{result['pool_size']}`",
         f"- frame_size: `{result['frame_size']}`",
+        f"- build_seconds: `{result.get('build_seconds', 0.0):.2f}`",
         "",
         "| model | params | precision@k | recall@k | mrr | p50 ms/case | p95 ms/case |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
