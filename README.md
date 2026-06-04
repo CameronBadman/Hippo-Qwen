@@ -188,6 +188,7 @@ python3 -m python.benchmarks.hierarchical_file_ann \
   --stable-growth \
   --growth-noise-count 8 \
   --promotion-bias 0.0 \
+  --compact-limit 3 \
   --determinism-repeats 3 \
   --output-json artifacts/hippocampus/hierarchical_file_ann.json \
   --output-md artifacts/hippocampus/hierarchical_file_ann.md

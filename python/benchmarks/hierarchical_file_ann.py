@@ -40,6 +40,7 @@ from python.librarian.features import (
 
 
 Ranked = list[tuple[str, float, str]]
+SearchResult = tuple[Ranked, dict[str, float], set[str]]
 LEVEL_ROOT = 0
 LEVEL_PROJECT = 1
 LEVEL_TOPIC = 2
@@ -408,7 +409,7 @@ def ranked_signature(ranked: Ranked) -> list[tuple[str, float]]:
     return [(node_id, round(float(score), 12)) for node_id, score, _ in ranked]
 
 
-def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, meta: dict[str, Any], args: argparse.Namespace) -> tuple[Ranked, dict[str, float]]:
+def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, meta: dict[str, Any], args: argparse.Namespace) -> SearchResult:
     task = row.get("retrieval_task") or {}
     query_text = task.get("query") or row["anchor"]["text"]
     query_embedding = backend.embed_one(query_text)
@@ -421,6 +422,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         basin_nodes_scored = 0
         promoted_scored = 0
         edge_expansions = 0
+        protected_ids: set[str] = set()
         edge_source_scores: dict[str, tuple[float, str]] = {}
         visited_ids: set[str] = set()
         for level in [LEVEL_ROOT, LEVEL_PROJECT, LEVEL_TOPIC]:
@@ -475,6 +477,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         for depth in range(args.graph_depth):
             next_frontier: list[tuple[str, float, list[str]]] = []
             for current_id, current_score, path in frontier_edges:
+                protected_ids.add(current_id)
                 source = store.read(current_id)
                 for edge in source.get("edges") or []:
                     target_id = str(edge.get("target") or "")
@@ -493,6 +496,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                     prior = leaf_scores.get(target_id)
                     if prior is None or score > prior[0]:
                         edge_expansions += 1
+                        protected_ids.add(target_id)
                         leaf_scores[target_id] = (score, target.get("text", ""))
                         next_frontier.append((target_id, score, path + [target_id]))
             frontier_edges = next_frontier
@@ -518,8 +522,8 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         "final_candidate_count": float(len(ranked)),
     }
     if args.return_limit > 0:
-        return ranked[: args.return_limit], stats
-    return ranked, stats
+        ranked = ranked[: args.return_limit]
+    return ranked, stats, protected_ids
 
 
 def flatten(prefix: str, values: dict[str, float]) -> dict[str, float]:
@@ -566,6 +570,71 @@ def maybe_limit_ranked(ranked: Ranked, limit: int) -> Ranked:
     return ranked
 
 
+def compact_score(row: dict[str, Any], item: tuple[str, float, str], protected_ids: set[str]) -> float:
+    node_id, retrieval_score, text = item
+    task = row.get("retrieval_task") or {}
+    query = task.get("query") or row["anchor"]["text"]
+    query_mask = activation_mask_for_text(query)
+    text_mask = activation_mask_for_text(text)
+    lexical = jaccard(query, text)
+    activation = activation_overlap(query_mask, text_mask)
+    protected = 1.0 if node_id in protected_ids else 0.0
+    lower = text.lower()
+    conflict_penalty = 0.18 if any(term in lower for term in ("decoy", "wrong", "conflict", "superseded", "growth-noise")) else 0.0
+    path_bonus = 0.20 if any(term in lower for term in ("accepted resolution", "support note", "succeeded", "escalation")) else 0.0
+    return (
+        0.42 * retrieval_score
+        + 0.24 * lexical
+        + 0.18 * activation
+        + 0.28 * protected
+        + path_bonus
+        - conflict_penalty
+    )
+
+
+def compact_ranked(row: dict[str, Any], ranked: Ranked, protected_ids: set[str], args: argparse.Namespace) -> tuple[Ranked, dict[str, float]]:
+    started = time.perf_counter()
+    if args.compact_limit <= 0:
+        return ranked, {"latency_ms": 0.0, "output_count": float(len(ranked)), "protected_count": float(len(protected_ids))}
+    protected_ranked = [item for item in ranked if item[0] in protected_ids]
+    protected_ranked.sort(key=lambda item: (-item[1], item[0]))
+    if len(protected_ranked) >= args.compact_limit:
+        output = protected_ranked[: args.compact_limit]
+        return output, {
+            "latency_ms": (time.perf_counter() - started) * 1000.0,
+            "output_count": float(len(output)),
+            "protected_count": float(len(output)),
+            "input_count": float(len(ranked)),
+        }
+    scored = []
+    for item in ranked:
+        candidate_id, _, text = item
+        if candidate_id in protected_ids:
+            continue
+        scored.append((candidate_id, compact_score(row, item, protected_ids), text))
+    normal = scored
+    selected = []
+    seen = set()
+    for candidate_id, retrieval_score, text in protected_ranked:
+        selected.append((candidate_id, retrieval_score, text))
+        seen.add(candidate_id)
+    normal.sort(key=lambda item: (-item[1], item[0]))
+    for item in normal:
+        if item[0] in seen:
+            continue
+        seen.add(item[0])
+        selected.append(item)
+        if len(selected) >= args.compact_limit:
+            break
+    output = [(candidate_id, score, text) for candidate_id, score, text in selected]
+    return output, {
+        "latency_ms": (time.perf_counter() - started) * 1000.0,
+        "output_count": float(len(output)),
+        "protected_count": float(sum(1 for candidate_id, _, _ in output if candidate_id in protected_ids)),
+        "input_count": float(len(ranked)),
+    }
+
+
 def growth_stability_metrics(base: Ranked, grown: Ranked, row: dict[str, Any], top_n: int) -> dict[str, float]:
     relevant = set((row.get("retrieval_task") or {}).get("relevant_ids") or [])
     base_ids = [node_id for node_id, _, _ in base]
@@ -590,13 +659,14 @@ def growth_stability_metrics(base: Ranked, grown: Ranked, row: dict[str, Any], t
 def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir: Path, args: argparse.Namespace) -> dict[str, float]:
     row = ensure_backend_embeddings(row, backend)
     meta = write_lazy_index(row, backend, case_dir, args)
-    hierarchical, io_stats = hierarchical_search(row, backend, meta, args)
+    hierarchical, io_stats, protected_ids = hierarchical_search(row, backend, meta, args)
+    compacted, compact_stats = compact_ranked(row, hierarchical, protected_ids, args)
     determinism_mismatches = 0
     repeat_latency_ms = 0.0
     if args.determinism_repeats > 1:
         expected = ranked_signature(hierarchical)
         for _ in range(args.determinism_repeats - 1):
-            repeated, repeated_stats = hierarchical_search(row, backend, meta, args)
+            repeated, repeated_stats, _ = hierarchical_search(row, backend, meta, args)
             repeat_latency_ms += repeated_stats["latency_ms"]
             if ranked_signature(repeated) != expected:
                 determinism_mismatches += 1
@@ -620,11 +690,15 @@ def evaluate_case(row: dict[str, Any], backend: CachedEmbeddingBackend, case_dir
     flat.update(flatten("hierarchical_multihop", multihop_metrics(row, hierarchical, args.top_k, args.budget)))
     flat.update(flatten("hierarchical_context_exposure", context_decoy_metrics(row, hierarchical, args.budget)))
     flat.update(flatten("hierarchical_io", io_stats))
+    flat.update(flatten("compacted_retrieval", evaluate_ranked(row, compacted, args.top_k, args.budget)))
+    flat.update(flatten("compacted_multihop", multihop_metrics(row, compacted, args.top_k, args.budget)))
+    flat.update(flatten("compacted_context_exposure", context_decoy_metrics(row, compacted, args.budget)))
+    flat.update(flatten("compactor", compact_stats))
     if args.growth_noise_count > 0:
         grown_row = dict(row)
         grown_row["candidates"] = list(row.get("candidates") or []) + make_growth_noise(row, backend, args.seed, args.growth_noise_count)
         grown_meta = write_lazy_index(grown_row, backend, case_dir / "growth", args)
-        grown, grown_io = hierarchical_search(grown_row, backend, grown_meta, args)
+        grown, grown_io, _ = hierarchical_search(grown_row, backend, grown_meta, args)
         flat.update(flatten("growth_stability", growth_stability_metrics(hierarchical, grown, row, args.stability_top_n)))
         flat.update(flatten("growth_io", grown_io))
     flat.update(flatten("sparse_retrieval", evaluate_ranked(row, sparse, args.top_k, args.budget)))
@@ -651,6 +725,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "hierarchical_io_latency_ms",
         "hierarchical_io_file_reads",
         "hierarchical_io_final_candidate_count",
+        "compactor_latency_ms",
+        "compactor_output_count",
+        "compacted_retrieval_context_precision",
+        "compacted_retrieval_context_recall",
         "hierarchical_retrieval_context_precision",
         "hierarchical_retrieval_context_recall",
         "index_build_latency_ms",
@@ -673,6 +751,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_leaf_reads": args.max_leaf_reads,
         "promotion_bias": args.promotion_bias,
         "promotion_scale": args.promotion_scale,
+        "compact_limit": args.compact_limit,
         "determinism_repeats": args.determinism_repeats,
         "elapsed_seconds": round(time.time() - started, 2),
         "averages": averages,
@@ -714,17 +793,25 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- max_children_per_basin: `{result['max_children_per_basin']}`",
         f"- promotion_bias: `{result['promotion_bias']}`",
         f"- promotion_scale: `{result['promotion_scale']}`",
+        f"- compact_limit: `{result['compact_limit']}`",
         f"- determinism_repeats: `{result['determinism_repeats']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
         "| method | precision | recall | target ctx | path ctx | noise |",
         "| --- | ---: | ---: | ---: | ---: | ---: |",
         (
-            f"| hierarchical | {avg.get('hierarchical_retrieval_context_precision', 0.0):.4f} | "
+            f"| stable raw | {avg.get('hierarchical_retrieval_context_precision', 0.0):.4f} | "
             f"{avg.get('hierarchical_retrieval_context_recall', 0.0):.4f} | "
             f"{avg.get('hierarchical_multihop_target_context_recall', 0.0):.4f} | "
             f"{avg.get('hierarchical_multihop_path_context_success', 0.0):.4f} | "
             f"{avg.get('hierarchical_retrieval_noise', 0.0):.2f} |"
+        ),
+        (
+            f"| compacted | {avg.get('compacted_retrieval_context_precision', 0.0):.4f} | "
+            f"{avg.get('compacted_retrieval_context_recall', 0.0):.4f} | "
+            f"{avg.get('compacted_multihop_target_context_recall', 0.0):.4f} | "
+            f"{avg.get('compacted_multihop_path_context_success', 0.0):.4f} | "
+            f"{avg.get('compacted_retrieval_noise', 0.0):.2f} |"
         ),
         (
             f"| sparse topN | {avg.get('sparse_retrieval_context_precision', 0.0):.4f} | "
@@ -751,6 +838,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"| edge expansions | {avg.get('hierarchical_io_edge_expansions', 0.0):.2f} |",
         f"| final candidates | {avg.get('hierarchical_io_final_candidate_count', 0.0):.2f} |",
         f"| latency ms | {avg.get('hierarchical_io_latency_ms', 0.0):.2f} |",
+        f"| compactor latency ms | {avg.get('compactor_latency_ms', 0.0):.2f} |",
+        f"| compactor output count | {avg.get('compactor_output_count', 0.0):.2f} |",
+        f"| compactor protected count | {avg.get('compactor_protected_count', 0.0):.2f} |",
         f"| promoted links | {avg.get('promoted_count', 0.0):.2f} |",
         f"| promotion rate | {avg.get('promotion_rate', 0.0):.4f} |",
         f"| build latency ms | {avg.get('index_build_latency_ms', 0.0):.2f} |",
@@ -763,6 +853,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         "hierarchical_io_latency_ms",
         "hierarchical_io_file_reads",
         "hierarchical_io_final_candidate_count",
+        "compactor_latency_ms",
+        "compactor_output_count",
         "index_build_latency_ms",
     ]:
         q = result.get("quantiles", {}).get(key, {})
@@ -813,6 +905,7 @@ def main() -> None:
     parser.add_argument("--cache-size", type=int, default=256)
     parser.add_argument("--promotion-bias", type=float, default=0.0)
     parser.add_argument("--promotion-scale", type=float, default=1.0)
+    parser.add_argument("--compact-limit", type=int, default=3)
     parser.add_argument("--determinism-repeats", type=int, default=1)
     parser.add_argument("--stable-growth", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stable-basin-floor", type=float, default=0.16)
