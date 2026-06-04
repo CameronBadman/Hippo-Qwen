@@ -118,13 +118,17 @@ def ensure_backend_embeddings(row: dict[str, Any], backend: CachedEmbeddingBacke
         return row
     out = dict(row)
     anchor = dict(row["anchor"])
+    task = dict(row.get("retrieval_task") or {})
     candidates = [dict(candidate) for candidate in row.get("candidates", [])]
-    texts = [text_for_embedding(anchor)] + [text_for_embedding(candidate) for candidate in candidates]
+    query = str(task.get("query") or anchor.get("text") or "")
+    texts = [text_for_embedding(anchor), query] + [text_for_embedding(candidate) for candidate in candidates]
     vectors = backend.embed_many(texts)
     anchor["embedding"] = vectors[0]
-    for candidate, vector in zip(candidates, vectors[1:]):
+    task["query_embedding"] = vectors[1]
+    for candidate, vector in zip(candidates, vectors[2:]):
         candidate["embedding"] = vector
     out["anchor"] = anchor
+    out["retrieval_task"] = task
     out["candidates"] = candidates
     return out
 

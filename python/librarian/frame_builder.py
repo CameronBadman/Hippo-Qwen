@@ -35,6 +35,9 @@ def query_text(row: dict[str, Any]) -> str:
 def query_embedding(row: dict[str, Any]) -> list[float]:
     from python.librarian.features import embed_text
 
+    task_embedding = (row.get("retrieval_task") or {}).get("query_embedding")
+    if task_embedding:
+        return [float(value) for value in task_embedding]
     return embed_text(query_text(row))
 
 
