@@ -55,6 +55,9 @@ RELEVANT_ROLES = {
     "protected_old_relevant",
     "current_preference_relevant",
     "updated_same_project_relevant",
+    "associative_bridge_relevant",
+    "associative_target_relevant",
+    "associative_support_relevant",
 }
 
 
@@ -910,6 +913,248 @@ def iter_preference_shift_cases(seed: int, count: int, candidates: int) -> Itera
         }
 
 
+def iter_associative_multihop_cases(seed: int, count: int, candidates: int) -> Iterator[dict]:
+    rows = build_history(seed, max(count * 4, candidates + 160))
+    cards = [memory_card(row, idx) for idx, row in enumerate(rows)]
+    rng = random.Random(seed + 16000)
+    for idx in range(count):
+        base = rows[idx]
+        anchor = dict(cards[idx])
+        project = anchor["cluster"]
+        task = base["task"]
+        preference = base["preference"]
+        cue = rng.choice(["incident", "decision", "handoff", "debug note", "constraint"])
+        route_tag = f"route-{idx:04d}"
+        answer_tag = f"answer-{idx:04d}"
+        wrong_project = rng.choice([item for item in PROJECTS if item != project])
+        wrong_preference = PREFERENCE_CONFLICTS[preference]
+
+        anchor["text"] = (
+            f"{project}: current question references {cue} {route_tag}. "
+            f"Find the connected resolution before answering about {task}."
+        )
+        anchor["embedding"] = embed_text(anchor["text"])
+        anchor["importance"] = max(float(anchor.get("importance") or 0.5), 0.65)
+        anchor["age_days"] = 0
+
+        bridge = generated_card(
+            anchor,
+            (
+                f"{project}: {cue} {route_tag} came from {task}. "
+                f"The useful resolution is filed under {answer_tag}."
+            ),
+            "associative_bridge_relevant",
+            idx,
+            0,
+            age_days=3,
+            use_count=13,
+            evidence_count=5,
+            last_outcome="helpful",
+            importance=0.7,
+        )
+        target = generated_card(
+            anchor,
+            (
+                f"{answer_tag}: durable resolution says the user {preference}; "
+                f"apply this when making the final decision."
+            ),
+            "associative_target_relevant",
+            idx,
+            0,
+            age_days=7,
+            use_count=21,
+            evidence_count=8,
+            last_outcome="helpful",
+            importance=0.84,
+        )
+        support = generated_card(
+            anchor,
+            (
+                f"{answer_tag} support: previous successful answer followed the "
+                f"{preference} constraint and avoided unrelated implementation churn."
+            ),
+            "associative_support_relevant",
+            idx,
+            0,
+            age_days=14,
+            use_count=8,
+            evidence_count=5,
+            last_outcome="helpful",
+            importance=0.72,
+        )
+
+        chosen_roles: list[tuple[dict, str]] = [
+            (bridge, "associative_bridge_relevant"),
+            (target, "associative_target_relevant"),
+            (support, "associative_support_relevant"),
+        ]
+
+        decoy_count = max(3, candidates // 6)
+        for slot in range(decoy_count):
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        (
+                            f"{project}: {cue} {route_tag} mentioned {task}, "
+                            f"but this old branch was superseded and should not guide the answer."
+                        ),
+                        "stale_high_similarity_negative",
+                        idx,
+                        slot,
+                        age_days=420,
+                        use_count=0,
+                        evidence_count=0,
+                        last_outcome="ignored",
+                        importance=0.22,
+                    ),
+                    "stale_high_similarity_negative",
+                )
+            )
+
+        for slot in range(max(2, candidates // 8)):
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        (
+                            f"{wrong_project}: {cue} {route_tag} points to {answer_tag}, "
+                            f"but it belongs to a different project."
+                        ),
+                        "popular_wrong_project_negative",
+                        idx,
+                        slot,
+                        cluster=wrong_project,
+                        project=wrong_project,
+                        age_days=3,
+                        use_count=55,
+                        evidence_count=13,
+                        last_outcome="helpful",
+                        importance=0.78,
+                    ),
+                    "popular_wrong_project_negative",
+                )
+            )
+
+        for slot in range(max(2, candidates // 8)):
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        (
+                            f"{answer_tag}: tempting but wrong resolution says the user {wrong_preference}; "
+                            f"this conflicts with the accepted path."
+                        ),
+                        "contradicted_preference_negative",
+                        idx,
+                        slot,
+                        age_days=2,
+                        use_count=34,
+                        evidence_count=8,
+                        last_outcome="corrected",
+                        importance=0.76,
+                    ),
+                    "contradicted_preference_negative",
+                )
+            )
+
+        for slot in range(max(2, candidates // 10)):
+            chosen_roles.append(
+                (
+                    generated_card(
+                        anchor,
+                        f"{project}: {task}; {route_tag}; {rng.choice(NOISE)}. Lexically close but operational noise.",
+                        "lexical_decoy_negative",
+                        idx,
+                        slot,
+                        age_days=5,
+                        use_count=3,
+                        evidence_count=1,
+                        last_outcome="ignored",
+                        importance=0.34,
+                    ),
+                    "lexical_decoy_negative",
+                )
+            )
+
+        while len(chosen_roles) < candidates:
+            card_index = rng.randrange(len(cards))
+            card = dict(cards[card_index])
+            if card["id"] == anchor["id"]:
+                continue
+            card["synthetic_role"] = "background_negative"
+            chosen_roles.append((card, "background_negative"))
+
+        chosen_roles = chosen_roles[:candidates]
+        rng.shuffle(chosen_roles)
+        chosen = [item[0] for item in chosen_roles]
+        actions = [action_for_role(anchor, candidate, role) for candidate, role in chosen_roles]
+        relevant_ids = [candidate["id"] for candidate, role in chosen_roles if role in RELEVANT_ROLES]
+        bridge_ids = [candidate["id"] for candidate, role in chosen_roles if role == "associative_bridge_relevant"]
+        target_ids = [
+            candidate["id"]
+            for candidate, role in chosen_roles
+            if role in {"associative_target_relevant", "associative_support_relevant"}
+        ]
+        memory_edges = [
+            {
+                "source": bridge["id"],
+                "target": target["id"],
+                "type": "used_with",
+                "weight": 1.15,
+                "confidence": 0.92,
+                "activation_text": f"{project} {task} {preference} {route_tag} {answer_tag}",
+            },
+            {
+                "source": target["id"],
+                "target": support["id"],
+                "type": "same_context",
+                "weight": 0.86,
+                "confidence": 0.82,
+                "activation_text": f"{project} {preference} {answer_tag}",
+            },
+            {
+                "source": support["id"],
+                "target": target["id"],
+                "type": "same_context",
+                "weight": 0.72,
+                "confidence": 0.76,
+                "activation_text": f"{project} {preference} {answer_tag}",
+            },
+        ]
+        yield {
+            "anchor": anchor,
+            "candidates": chosen,
+            "labels": {
+                "attach": [action["attach"] for action in actions],
+                "rank": [action["rank"] for action in actions],
+                "edge_type": [action["edge_type_id"] for action in actions],
+                "weight": [action["weight"] for action in actions],
+                "confidence": [action["confidence"] for action in actions],
+                "decay_rate": [action["decay_rate"] for action in actions],
+                "importance_delta": [action["importance_delta"] for action in actions],
+            },
+            "retrieval_task": {
+                "query": (
+                    f"For {project}, answer the current {task} question by following "
+                    f"{cue} {route_tag} to the connected resolution."
+                ),
+                "relevant_ids": relevant_ids,
+                "bridge_ids": bridge_ids,
+                "target_ids": target_ids,
+                "budget": 90,
+            },
+            "memory_graph": {
+                "edges": memory_edges,
+                "max_depth": 3,
+            },
+            "teacher": "synthetic_associative_multihop_v1",
+            "schema_version": 7,
+            "scenario": "associative_multihop",
+            "edge_types": EDGE_TYPES,
+        }
+
+
 def longitudinal_text(project: str, task: str, preference: str, slot: int) -> str:
     variants = [
         f"{project}: {task}. Preference: {preference}.",
@@ -951,6 +1196,8 @@ def build_cases(seed: int, count: int, candidates: int, scenario: str = "standar
         iterator = iter_adversarial_cases(seed, count, candidates)
     elif scenario == "preference_shift":
         iterator = iter_preference_shift_cases(seed, count, candidates)
+    elif scenario == "associative_multihop":
+        iterator = iter_associative_multihop_cases(seed, count, candidates)
     else:
         iterator = iter_cases(seed, count, candidates)
     return list(iterator)
@@ -1006,7 +1253,11 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=200)
     parser.add_argument("--candidates", type=int, default=32)
     parser.add_argument("--seed", type=int, default=7)
-    parser.add_argument("--scenario", choices=["standard", "longitudinal", "adversarial", "preference_shift"], default="standard")
+    parser.add_argument(
+        "--scenario",
+        choices=["standard", "longitudinal", "adversarial", "preference_shift", "associative_multihop"],
+        default="standard",
+    )
     parser.add_argument("--format", choices=["cases", "memories"], default="cases")
     args = parser.parse_args()
     path = Path(args.output)
@@ -1019,6 +1270,8 @@ def main() -> None:
                 rows = iter_adversarial_cases(args.seed, args.count, args.candidates)
             elif args.scenario == "preference_shift":
                 rows = iter_preference_shift_cases(args.seed, args.count, args.candidates)
+            elif args.scenario == "associative_multihop":
+                rows = iter_associative_multihop_cases(args.seed, args.count, args.candidates)
             else:
                 rows = iter_cases(args.seed, args.count, args.candidates)
         else:
