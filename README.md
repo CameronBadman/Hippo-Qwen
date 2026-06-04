@@ -203,6 +203,28 @@ activation masks and absolute inclusion gates, so new unrelated nodes should add
 candidates rather than evict previously reachable relevant memories. Use
 `--growth-noise-count` to test that property directly.
 
+Run the hard deterministic memory regression when testing growth pressure and
+context saturation. It rebuilds each index twice, repeats searches against the
+same mmap store, and evaluates unrelated growth, semantic decoys, conflicts,
+repeated inserts, and combined pressure:
+
+```bash
+python3 -m python.benchmarks.hard_memory_regression \
+  --cases 10 \
+  --pool-size 5000 \
+  --growth-count 1000 \
+  --determinism-repeats 3 \
+  --fail-on-regression \
+  --output-json artifacts/hippocampus/hard_memory_regression.json \
+  --output-md artifacts/hippocampus/hard_memory_regression.md
+```
+
+The hard regression reports raw candidate volume, compacted context precision
+and recall, growth retention, top-N retention, repeated-query determinism, and
+p95 latency. Use the same `--embedding-backend hippo`,
+`--hippo-encoder-src`, and `--hippo-checkpoint` flags as the other benchmarks
+to run it with Hippo-encoder routing vectors.
+
 Run the full local-first evaluation suite:
 
 ```bash
