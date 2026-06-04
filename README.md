@@ -163,6 +163,7 @@ candidate retrieval from exploding as memory grows:
 python3 -m python.benchmarks.large_pool_retrieval \
   --cases 20 \
   --pool-size 5000 \
+  --calibration-strategies top16,top32,top64,pct99,z1.5,margin0.05 \
   --embedding-backend hippo \
   --hippo-encoder-src /path/to/Hippo-encoder/src \
   --hippo-checkpoint /path/to/extracted/hippoencoder-bge-small-all-nli-pair-500k-c025-epoch3 \
@@ -170,8 +171,9 @@ python3 -m python.benchmarks.large_pool_retrieval \
   --output-md artifacts/hippocampus/large_pool_hippo.md
 ```
 
-This benchmark reports both final context quality and pre-graph candidate-set
-size/precision at score thresholds and top-N cutoffs.
+This benchmark reports final context quality, pre-graph candidate-set
+size/precision at score thresholds and top-N cutoffs, and calibrated basin
+strategies with per-query graph-expansion latency.
 
 Run the full local-first evaluation suite:
 
