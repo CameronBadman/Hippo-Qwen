@@ -107,6 +107,8 @@ def hierarchy_args(args: argparse.Namespace) -> SimpleNamespace:
         stable_growth=args.hierarchy_stable_growth,
         stable_basin_floor=args.hierarchy_stable_basin_floor,
         stable_max_basins=args.hierarchy_stable_max_basins,
+        stable_max_leaf_reads=args.hierarchy_stable_max_leaf_reads,
+        stable_max_promoted_reads=args.hierarchy_stable_max_promoted_reads,
     )
 
 
@@ -128,6 +130,7 @@ def select_index_seed_ids(
         "index_file_reads": float(search_stats.get("file_reads") or 0.0),
         "index_unique_nodes_read": float(search_stats.get("unique_nodes_read") or 0.0),
         "index_final_candidate_count": float(search_stats.get("final_candidate_count") or 0.0),
+        "index_stable_promoted_reads": float(search_stats.get("stable_promoted_reads") or 0.0),
     }
 
 
@@ -168,6 +171,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "index_file_reads": [],
         "index_unique_nodes_read": [],
         "index_final_candidate_count": [],
+        "index_stable_promoted_reads": [],
         "live_frame_ms": [],
         "cached_frame_ms": [],
         "live_frame_recall": [],
@@ -331,6 +335,8 @@ def main() -> None:
     parser.add_argument("--hierarchy-stable-growth", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--hierarchy-stable-basin-floor", type=float, default=0.16)
     parser.add_argument("--hierarchy-stable-max-basins", type=int, default=12)
+    parser.add_argument("--hierarchy-stable-max-leaf-reads", type=int, default=0)
+    parser.add_argument("--hierarchy-stable-max-promoted-reads", type=int, default=0)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")

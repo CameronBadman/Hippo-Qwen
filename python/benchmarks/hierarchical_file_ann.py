@@ -476,6 +476,12 @@ def keep_basin_candidates(scored: list[tuple[str, float, dict[str, Any]]], args:
     return kept
 
 
+def stable_limited(ids: list[str], limit: int) -> list[str]:
+    if limit <= 0:
+        return ids
+    return ids[:limit]
+
+
 def ranked_signature(ranked: Ranked) -> list[tuple[str, float]]:
     return [(node_id, round(float(score), 12)) for node_id, score, _ in ranked]
 
@@ -497,6 +503,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         protected_ids: set[str] = set()
         edge_source_scores: dict[str, tuple[float, str]] = {}
         visited_ids: set[str] = set()
+        stable_promoted_reads = 0
         for level in [LEVEL_ROOT, LEVEL_PROJECT, LEVEL_TOPIC]:
             scored: list[tuple[str, float, dict[str, Any]]] = []
             for node_id in frontier:
@@ -508,7 +515,10 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                 scored.append((node_id, score_node(row, query_text, query_embedding, query_mask, node, args.semantic_dims), node))
                 promoted_ids = unique_limited(node.get("promoted_children") or [], args.promoted_per_basin)
                 for promoted_id in promoted_ids:
+                    if args.stable_growth and args.stable_max_promoted_reads > 0 and stable_promoted_reads >= args.stable_max_promoted_reads:
+                        break
                     promoted = store.read(promoted_id)
+                    stable_promoted_reads += 1
                     promoted_scored += 1
                     score = score_node(row, query_text, query_embedding, query_mask, promoted, args.semantic_dims) + 0.03 * (LEVEL_TOPIC - level + 1)
                     prior = leaf_scores.get(promoted_id)
@@ -527,7 +537,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
                 next_ids.extend(child_ids)
             frontier = unique_ids(next_ids, 0 if args.stable_growth else args.max_frontier)
 
-        leaf_frontier = frontier if args.stable_growth else frontier[: args.max_leaf_reads]
+        leaf_frontier = stable_limited(frontier, args.stable_max_leaf_reads) if args.stable_growth else frontier[: args.max_leaf_reads]
         for node_id in leaf_frontier:
             node = store.read(node_id)
             score = score_node(row, query_text, query_embedding, query_mask, node, args.semantic_dims)
@@ -592,6 +602,7 @@ def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, me
         "promoted_scored": float(promoted_scored),
         "edge_expansions": float(edge_expansions),
         "final_candidate_count": float(len(ranked)),
+        "stable_promoted_reads": float(stable_promoted_reads),
     }
     if args.return_limit > 0:
         ranked = ranked[: args.return_limit]
@@ -984,6 +995,8 @@ def main() -> None:
     parser.add_argument("--stable-growth", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--stable-basin-floor", type=float, default=0.16)
     parser.add_argument("--stable-max-basins", type=int, default=0)
+    parser.add_argument("--stable-max-leaf-reads", type=int, default=0)
+    parser.add_argument("--stable-max-promoted-reads", type=int, default=0)
     parser.add_argument("--growth-noise-count", type=int, default=1)
     parser.add_argument("--stability-top-n", type=int, default=64)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
