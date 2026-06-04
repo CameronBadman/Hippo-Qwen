@@ -239,9 +239,10 @@ python3 -m python.benchmarks.skeleton_memory_index \
   --cases 10 \
   --pool-size 5000 \
   --growth-count 1000 \
+  --skeleton-dims 32 \
   --skeleton-segments 16 \
-  --skeleton-segment-limit 96 \
-  --skeleton-final-fetch 96 \
+  --skeleton-segment-limit 64 \
+  --skeleton-final-fetch 64 \
   --determinism-repeats 3 \
   --fail-on-regression \
   --output-json artifacts/hippocampus/skeleton_memory_index.json \
