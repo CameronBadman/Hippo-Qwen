@@ -65,11 +65,21 @@ class MemoryFrameDataset(Dataset):
         }
 
 
-def build_frames(cases: int, pool_size: int, frame_size: int, seed: int, use_role_features: bool) -> list[dict[str, Any]]:
+def build_frames(
+    cases: int,
+    pool_size: int,
+    frame_size: int,
+    seed: int,
+    use_role_features: bool,
+    frame_builder: str,
+    graph_seed_count: int,
+    graph_depth: int,
+    graph_boost: float,
+) -> list[dict[str, Any]]:
     frames = []
     for offset in range(cases):
         row = build_large_pool_case(seed + offset, pool_size)
-        frames.append(build_frame(row, frame_size, use_role_features))
+        frames.append(build_frame(row, frame_size, use_role_features, frame_builder, graph_seed_count, graph_depth, graph_boost))
     return frames
 
 
@@ -102,12 +112,24 @@ def frame_score(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[
     )
 
 
-def build_frame(row: dict[str, Any], frame_size: int, use_role_features: bool) -> dict[str, Any]:
+def build_frame(
+    row: dict[str, Any],
+    frame_size: int,
+    use_role_features: bool,
+    frame_builder: str,
+    graph_seed_count: int,
+    graph_depth: int,
+    graph_boost: float,
+) -> dict[str, Any]:
     qvec = query_embedding(row)
     anchor = dict(row["anchor"])
     relevant = set((row.get("retrieval_task") or {}).get("relevant_ids") or [])
     candidates = [dict(candidate) for candidate in row.get("candidates", [])]
-    candidates.sort(key=lambda item: (-frame_score(row, item, qvec, use_role_features), item["id"]))
+    base_scores = {candidate["id"]: frame_score(row, candidate, qvec, use_role_features) for candidate in candidates}
+    scores = base_scores
+    if frame_builder == "graph":
+        scores = graph_expanded_scores(row, candidates, base_scores, graph_seed_count, graph_depth, graph_boost)
+    candidates.sort(key=lambda item: (-scores.get(item["id"], -99.0), item["id"]))
     selected = candidates[:frame_size]
     embeddings = []
     scalars = []
@@ -135,6 +157,51 @@ def build_frame(row: dict[str, Any], frame_size: int, use_role_features: bool) -
         "mask": mask,
         "gold_total": float(len(relevant)),
     }
+
+
+def graph_expanded_scores(
+    row: dict[str, Any],
+    candidates: list[dict[str, Any]],
+    base_scores: dict[str, float],
+    graph_seed_count: int,
+    graph_depth: int,
+    graph_boost: float,
+) -> dict[str, float]:
+    scores = dict(base_scores)
+    by_id = {candidate["id"]: candidate for candidate in candidates}
+    query = (row.get("retrieval_task") or {}).get("query") or row["anchor"]["text"]
+    query_mask = activation_mask_for_text(query)
+    adjacency: dict[str, list[tuple[str, float, float, str]]] = {}
+    for edge in (row.get("memory_graph") or {}).get("edges") or []:
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        if source not in by_id or target not in by_id:
+            continue
+        weight = float(edge.get("weight") or 0.0)
+        confidence = float(edge.get("confidence") or 0.0)
+        activation_text = str(edge.get("activation_text") or "")
+        adjacency.setdefault(source, []).append((target, weight, confidence, activation_text))
+        adjacency.setdefault(target, []).append((source, weight * 0.72, confidence * 0.72, activation_text))
+
+    seeds = sorted(base_scores.items(), key=lambda item: (-item[1], item[0]))[: max(1, graph_seed_count)]
+    frontier = [(candidate_id, score, 0) for candidate_id, score in seeds]
+    best_depth = {candidate_id: 0 for candidate_id, _, _ in frontier}
+    while frontier:
+        source_id, source_score, depth = frontier.pop(0)
+        if depth >= graph_depth:
+            continue
+        for target_id, edge_weight, confidence, activation_text in adjacency.get(source_id, []):
+            edge_mask = activation_mask_for_text(activation_text)
+            activation = (query_mask & edge_mask).bit_count() / max(1, (query_mask | edge_mask).bit_count())
+            hop = graph_boost * (0.48 * edge_weight + 0.34 * confidence + 0.18 * activation) / (depth + 1)
+            candidate_score = base_scores.get(target_id, -99.0) + 0.35 * source_score + hop
+            if candidate_score > scores.get(target_id, -99.0):
+                scores[target_id] = candidate_score
+            next_depth = depth + 1
+            if next_depth < best_depth.get(target_id, 999):
+                best_depth[target_id] = next_depth
+                frontier.append((target_id, scores[target_id], next_depth))
+    return scores
 
 
 def frame_scalars(row: dict[str, Any], candidate: dict[str, Any], query_vec: list[float], query_mask: int, use_role_features: bool) -> list[float]:
@@ -371,7 +438,17 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     torch.manual_seed(args.seed)
     build_started = time.perf_counter()
     use_role_features = not args.hide_role_features
-    frames = build_frames(args.cases, args.pool_size, args.frame_size, args.seed, use_role_features)
+    frames = build_frames(
+        args.cases,
+        args.pool_size,
+        args.frame_size,
+        args.seed,
+        use_role_features,
+        args.frame_builder,
+        args.graph_seed_count,
+        args.graph_depth,
+        args.graph_boost,
+    )
     build_seconds = time.perf_counter() - build_started
     print(f"built_frames={len(frames)} build_seconds={build_seconds:.2f}", flush=True)
     dataset = MemoryFrameDataset(frames)
@@ -395,6 +472,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cases": args.cases,
         "pool_size": args.pool_size,
         "frame_size": args.frame_size,
+        "frame_builder": args.frame_builder,
+        "graph_seed_count": args.graph_seed_count,
+        "graph_depth": args.graph_depth,
+        "graph_boost": args.graph_boost,
         "role_features": use_role_features,
         "build_seconds": build_seconds,
         "config": asdict(config),
@@ -410,6 +491,10 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- cases: `{result['cases']}`",
         f"- pool_size: `{result['pool_size']}`",
         f"- frame_size: `{result['frame_size']}`",
+        f"- frame_builder: `{result.get('frame_builder', 'heuristic')}`",
+        f"- graph_seed_count: `{result.get('graph_seed_count', 0)}`",
+        f"- graph_depth: `{result.get('graph_depth', 0)}`",
+        f"- graph_boost: `{result.get('graph_boost', 0.0):.2f}`",
         f"- role_features: `{result.get('role_features', True)}`",
         f"- build_seconds: `{result.get('build_seconds', 0.0):.2f}`",
         "",
@@ -433,6 +518,10 @@ def main() -> None:
     parser.add_argument("--cases", type=int, default=6000)
     parser.add_argument("--pool-size", type=int, default=5000)
     parser.add_argument("--frame-size", type=int, default=64)
+    parser.add_argument("--frame-builder", choices=["graph", "heuristic"], default="graph")
+    parser.add_argument("--graph-seed-count", type=int, default=16)
+    parser.add_argument("--graph-depth", type=int, default=3)
+    parser.add_argument("--graph-boost", type=float, default=0.85)
     parser.add_argument("--top-k", type=int, default=3)
     parser.add_argument("--models", default="structured,prefix,cross_attention,lowrank_router")
     parser.add_argument("--epochs", type=int, default=6)
