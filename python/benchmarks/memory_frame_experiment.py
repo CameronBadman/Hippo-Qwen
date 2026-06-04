@@ -61,6 +61,7 @@ class MemoryFrameDataset(Dataset):
             "scalars": torch.tensor(frame["scalars"], dtype=torch.float32),
             "labels": torch.tensor(frame["labels"], dtype=torch.float32),
             "mask": torch.tensor(frame["mask"], dtype=torch.bool),
+            "gold_total": torch.tensor(frame["gold_total"], dtype=torch.float32),
         }
 
 
@@ -132,6 +133,7 @@ def build_frame(row: dict[str, Any], frame_size: int, use_role_features: bool) -
         "scalars": scalars,
         "labels": labels,
         "mask": mask,
+        "gold_total": float(len(relevant)),
     }
 
 
@@ -282,29 +284,44 @@ def evaluate(model: nn.Module, loader: DataLoader, device: torch.device, top_k: 
             if device.type == "cuda":
                 torch.cuda.synchronize()
             latencies.append((time.perf_counter() - started) * 1000.0 / max(1, logits.shape[0]))
-            rows.append(score_metrics(logits.detach().cpu(), batch["labels"].detach().cpu(), batch["mask"].detach().cpu(), top_k))
+            rows.append(
+                score_metrics(
+                    logits.detach().cpu(),
+                    batch["labels"].detach().cpu(),
+                    batch["mask"].detach().cpu(),
+                    batch["gold_total"].detach().cpu(),
+                    top_k,
+                )
+            )
     return average(rows) | quantile_metrics(latencies, "latency_ms")
 
 
-def score_metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, top_k: int) -> dict[str, float]:
+def score_metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, gold_total: torch.Tensor, top_k: int) -> dict[str, float]:
+    available_recall = []
+    frame_recall = []
     recall = []
     precision = []
     mrr = []
-    for item_logits, item_labels, item_mask in zip(logits, labels, mask):
+    for item_logits, item_labels, item_mask, item_gold_total in zip(logits, labels, mask, gold_total):
         valid_logits = item_logits[item_mask.bool()]
         valid_labels = item_labels[item_mask.bool()]
         positives = torch.nonzero(valid_labels >= 0.5, as_tuple=False).flatten()
+        total_gold = max(1.0, float(item_gold_total.item()))
+        frame_recall.append(float(positives.numel()) / total_gold)
         if positives.numel() == 0:
             continue
         order = torch.argsort(valid_logits, descending=True)
         top = order[:top_k]
         hits = torch.isin(top, positives).sum().item()
-        recall.append(hits / max(1, positives.numel()))
+        available_recall.append(hits / max(1, positives.numel()))
+        recall.append(hits / total_gold)
         precision.append(hits / max(1, top.numel()))
         first = torch.nonzero(torch.isin(order, positives), as_tuple=False).flatten()
         mrr.append(1.0 / (int(first[0].item()) + 1) if first.numel() else 0.0)
     return {
         "recall_at_k": sum(recall) / max(1, len(recall)),
+        "available_recall_at_k": sum(available_recall) / max(1, len(available_recall)),
+        "frame_recall": sum(frame_recall) / max(1, len(frame_recall)),
         "precision_at_k": sum(precision) / max(1, len(precision)),
         "mrr": sum(mrr) / max(1, len(mrr)),
     }
@@ -396,14 +413,15 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- role_features: `{result.get('role_features', True)}`",
         f"- build_seconds: `{result.get('build_seconds', 0.0):.2f}`",
         "",
-        "| model | params | precision@k | recall@k | mrr | p50 ms/case | p95 ms/case |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| model | params | precision@k | recall@k | frame recall | available recall@k | mrr | p50 ms/case | p95 ms/case |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for item in result["results"]:
         final = item["final"]
         lines.append(
             f"| {item['name']} | {item['parameters']} | "
             f"{final.get('precision_at_k', 0.0):.4f} | {final.get('recall_at_k', 0.0):.4f} | "
+            f"{final.get('frame_recall', 0.0):.4f} | {final.get('available_recall_at_k', 0.0):.4f} | "
             f"{final.get('mrr', 0.0):.4f} | {final.get('latency_ms_p50', 0.0):.4f} | {final.get('latency_ms_p95', 0.0):.4f} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
