@@ -333,7 +333,7 @@ def main() -> None:
     parser.add_argument("--hierarchy-promotion-bias", type=float, default=0.0)
     parser.add_argument("--hierarchy-promotion-scale", type=float, default=1.0)
     parser.add_argument("--hierarchy-stable-growth", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--hierarchy-stable-basin-floor", type=float, default=0.16)
+    parser.add_argument("--hierarchy-stable-basin-floor", type=float, default=0.32)
     parser.add_argument("--hierarchy-stable-max-basins", type=int, default=12)
     parser.add_argument("--hierarchy-stable-max-leaf-reads", type=int, default=0)
     parser.add_argument("--hierarchy-stable-max-promoted-reads", type=int, default=0)

@@ -1032,7 +1032,7 @@ def main() -> None:
     parser.add_argument("--compact-limit", type=int, default=3)
     parser.add_argument("--determinism-repeats", type=int, default=1)
     parser.add_argument("--stable-growth", action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument("--stable-basin-floor", type=float, default=0.16)
+    parser.add_argument("--stable-basin-floor", type=float, default=0.32)
     parser.add_argument("--stable-max-basins", type=int, default=0)
     parser.add_argument("--stable-max-leaf-reads", type=int, default=0)
     parser.add_argument("--stable-max-promoted-reads", type=int, default=0)
