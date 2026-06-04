@@ -112,6 +112,37 @@ python3 -m python.benchmarks.benchmark_librarian \
   --output-md artifacts/librarian/benchmark.md
 ```
 
+## Hippocampus Retrieval Scorecard
+
+The hippocampus path is currently benchmark-first. It tests sparse memory basins
+and associative graph recall without changing the Go runtime search behavior.
+HNSW remains a future acceleration layer for candidate discovery; it is not the
+memory algorithm.
+
+Generate multi-hop associative cases:
+
+```bash
+python3 -m python.synthetic.generate \
+  --scenario associative_multihop \
+  --output data/synthetic/associative_multihop.jsonl \
+  --count 5000 \
+  --candidates 32
+```
+
+Run the scorecard:
+
+```bash
+python3 -m python.benchmarks.hippocampus_retrieval \
+  --dataset data/synthetic/associative_multihop.jsonl \
+  --limit 1000 \
+  --output-json artifacts/hippocampus/scorecard.json \
+  --output-md artifacts/hippocampus/scorecard.md
+```
+
+The report compares vector-only retrieval, sparse basin routing, and
+associative recall. In addition to normal context metrics, it reports bridge
+recall, target recall, path success, stale exposure, and wrong-context exposure.
+
 Run the full local-first evaluation suite:
 
 ```bash
