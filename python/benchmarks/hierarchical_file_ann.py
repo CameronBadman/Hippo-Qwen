@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import mmap
 import struct
 import sys
 import time
@@ -47,6 +48,7 @@ LEVEL_TOPIC = 2
 LEVEL_MEMORY = 3
 NODE_STORE_MAGIC = b"HGFANN1\x00"
 NODE_HEADER = struct.Struct("<II")
+ROUTING_FLOAT = struct.Struct("<f")
 
 
 def stable_unit(value: str) -> float:
@@ -200,20 +202,29 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
     row = ensure_backend_embeddings(row, backend)
     output_dir.mkdir(parents=True, exist_ok=True)
     nodes_path = output_dir / "nodes.hgb"
+    routing_path = output_dir / "routing.f32"
     meta_path = output_dir / "index.json"
+    routing_handle = routing_path.open("wb")
 
     memory_cards = {str(card["id"]): dict(card) for card in row.get("candidates", [])}
-    for card in memory_cards.values():
-        embedding = [float(value) for value in card.get("embedding") or []]
-        routing_dims = int(args.semantic_dims) if int(args.semantic_dims) > 0 else len(embedding)
-        card["routing_embedding"] = [round(value, 8) for value in embedding[:routing_dims]]
-        if not args.store_full_embeddings:
-            card["embedding"] = []
-        card["node_type"] = "memory"
-        card["level"] = LEVEL_MEMORY
-        card["children"] = []
-        card["promoted_children"] = []
-        card["edges"] = []
+    try:
+        for card in memory_cards.values():
+            embedding = [float(value) for value in card.get("embedding") or []]
+            routing_dims = int(args.semantic_dims) if int(args.semantic_dims) > 0 else len(embedding)
+            routing = embedding[:routing_dims]
+            card["routing_embedding_offset"] = routing_handle.tell()
+            card["routing_embedding_dims"] = len(routing)
+            for value in routing:
+                routing_handle.write(ROUTING_FLOAT.pack(float(value)))
+            if not args.store_full_embeddings:
+                card["embedding"] = []
+            card["node_type"] = "memory"
+            card["level"] = LEVEL_MEMORY
+            card["children"] = []
+            card["promoted_children"] = []
+            card["edges"] = []
+    finally:
+        routing_handle.close()
 
     for edge in (row.get("memory_graph") or {}).get("edges") or []:
         source = str(edge.get("source") or "")
@@ -312,6 +323,7 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
     meta = {
         "version": 1,
         "nodes_path": str(nodes_path),
+        "routing_path": str(routing_path),
         "levels": levels,
         "top_ids": levels[str(LEVEL_ROOT)],
         "offsets": offsets,
@@ -324,6 +336,7 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
     meta_path.write_text(json.dumps(meta, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     meta["build_latency_ms"] = (time.perf_counter() - started) * 1000.0
     meta["node_store_bytes"] = nodes_path.stat().st_size
+    meta["routing_store_bytes"] = routing_path.stat().st_size
     meta["index_bytes"] = meta_path.stat().st_size
     return meta
 
@@ -332,18 +345,45 @@ class LazyNodeStore:
     def __init__(self, meta: dict[str, Any], cache_size: int):
         self.meta = meta
         self.path = Path(meta["nodes_path"])
+        self.routing_path = Path(meta["routing_path"]) if meta.get("routing_path") else None
         self.cache_size = max(0, cache_size)
         self.cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.handle = self.path.open("rb")
-        magic = self.handle.read(len(NODE_STORE_MAGIC))
+        self.data = mmap.mmap(self.handle.fileno(), 0, access=mmap.ACCESS_READ)
+        magic = self.data[: len(NODE_STORE_MAGIC)]
         if magic != NODE_STORE_MAGIC:
             raise ValueError(f"unsupported node store format: {self.path}")
+        self.routing_handle = self.routing_path.open("rb") if self.routing_path and self.routing_path.exists() else None
+        self.routing_data = (
+            mmap.mmap(self.routing_handle.fileno(), 0, access=mmap.ACCESS_READ)
+            if self.routing_handle and self.routing_path and self.routing_path.stat().st_size > 0
+            else None
+        )
         self.reads = 0
         self.cache_hits = 0
         self.unique_reads: set[str] = set()
 
     def close(self) -> None:
+        if self.routing_data is not None:
+            self.routing_data.close()
+        if self.routing_handle is not None:
+            self.routing_handle.close()
+        self.data.close()
         self.handle.close()
+
+    def _attach_routing_embedding(self, node: dict[str, Any]) -> dict[str, Any]:
+        if self.routing_data is None or node.get("routing_embedding") is not None:
+            return node
+        dims = int(node.get("routing_embedding_dims") or 0)
+        offset = int(node.get("routing_embedding_offset") or 0)
+        if dims <= 0:
+            return node
+        size = dims * ROUTING_FLOAT.size
+        frame = self.routing_data[offset : offset + size]
+        if len(frame) != size:
+            raise ValueError(f"short routing vector for {node.get('id')}")
+        node["routing_embedding"] = list(struct.unpack(f"<{dims}f", frame))
+        return node
 
     def read(self, node_id: str) -> dict[str, Any]:
         if node_id in self.cache:
@@ -352,17 +392,17 @@ class LazyNodeStore:
             self.cache[node_id] = node
             return node
         offset = int(self.meta["offsets"][node_id])
-        self.handle.seek(offset)
-        header = self.handle.read(NODE_HEADER.size)
+        header = self.data[offset : offset + NODE_HEADER.size]
         if len(header) != NODE_HEADER.size:
             raise ValueError(f"short node header for {node_id}")
         payload_size, raw_size = NODE_HEADER.unpack(header)
-        frame = self.handle.read(payload_size)
+        frame_start = offset + NODE_HEADER.size
+        frame = self.data[frame_start : frame_start + payload_size]
         if len(frame) != payload_size:
             raise ValueError(f"short node payload for {node_id}")
         self.reads += 1
         self.unique_reads.add(node_id)
-        node = decode_node_record(frame, raw_size)
+        node = self._attach_routing_embedding(decode_node_record(frame, raw_size))
         if self.cache_size > 0:
             self.cache[node_id] = node
             while len(self.cache) > self.cache_size:
