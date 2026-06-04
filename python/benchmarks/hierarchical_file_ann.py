@@ -135,7 +135,36 @@ def activation_union(cards: list[dict[str, Any]]) -> int:
     return mask
 
 
-def make_basin_node(node_id: str, level: int, kind: str, key: str, children: list[str], child_cards: list[dict[str, Any]]) -> dict[str, Any]:
+def centroid_routing_embedding(child_cards: list[dict[str, Any]], routing_dims: int) -> list[float]:
+    dims = routing_dims
+    if dims <= 0:
+        dims = max((len(card.get("routing_embedding") or card.get("embedding") or []) for card in child_cards), default=0)
+    if dims <= 0:
+        return []
+    total = [0.0] * dims
+    count = 0
+    for card in child_cards:
+        embedding = card.get("routing_embedding") or card.get("embedding") or []
+        if not embedding:
+            continue
+        local_dims = min(dims, len(embedding))
+        for index in range(local_dims):
+            total[index] += float(embedding[index])
+        count += 1
+    if count <= 0:
+        return []
+    return [value / count for value in total]
+
+
+def make_basin_node(
+    node_id: str,
+    level: int,
+    kind: str,
+    key: str,
+    children: list[str],
+    child_cards: list[dict[str, Any]],
+    routing_dims: int,
+) -> dict[str, Any]:
     text = basin_text(kind, key)
     return {
         "id": node_id,
@@ -146,6 +175,7 @@ def make_basin_node(node_id: str, level: int, kind: str, key: str, children: lis
         "text": text,
         "summary": "",
         "embedding": embed_text(text),
+        "routing_embedding": centroid_routing_embedding(child_cards, routing_dims),
         "routing_mask": activation_union(child_cards),
         "importance": 0.5,
         "cluster": key.split(":")[0],
@@ -204,27 +234,19 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
     nodes_path = output_dir / "nodes.hgb"
     routing_path = output_dir / "routing.f32"
     meta_path = output_dir / "index.json"
-    routing_handle = routing_path.open("wb")
 
     memory_cards = {str(card["id"]): dict(card) for card in row.get("candidates", [])}
-    try:
-        for card in memory_cards.values():
-            embedding = [float(value) for value in card.get("embedding") or []]
-            routing_dims = int(args.semantic_dims) if int(args.semantic_dims) > 0 else len(embedding)
-            routing = embedding[:routing_dims]
-            card["routing_embedding_offset"] = routing_handle.tell()
-            card["routing_embedding_dims"] = len(routing)
-            for value in routing:
-                routing_handle.write(ROUTING_FLOAT.pack(float(value)))
-            if not args.store_full_embeddings:
-                card["embedding"] = []
-            card["node_type"] = "memory"
-            card["level"] = LEVEL_MEMORY
-            card["children"] = []
-            card["promoted_children"] = []
-            card["edges"] = []
-    finally:
-        routing_handle.close()
+    for node_id in sorted(memory_cards):
+        card = memory_cards[node_id]
+        embedding = [float(value) for value in card.get("embedding") or []]
+        routing_dims = int(args.semantic_dims) if int(args.semantic_dims) > 0 else len(embedding)
+        card["embedding"] = embedding
+        card["routing_embedding"] = embedding[:routing_dims]
+        card["node_type"] = "memory"
+        card["level"] = LEVEL_MEMORY
+        card["children"] = []
+        card["promoted_children"] = []
+        card["edges"] = []
 
     for edge in (row.get("memory_graph") or {}).get("edges") or []:
         source = str(edge.get("source") or "")
@@ -244,7 +266,9 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
         route_groups.setdefault((project, topic, route), []).append(node_id)
 
     level2_nodes: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for key, ids in route_groups.items():
+    routing_dims = int(args.semantic_dims)
+    for key in sorted(route_groups):
+        ids = route_groups[key]
         ids = sort_ids_by_priority(ids, memory_cards, args.promotion_bias, args.promotion_scale)
         project, topic, route = key
         level2_nodes[key] = make_basin_node(
@@ -254,10 +278,12 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
             f"{project}:{topic}:{route}",
             ids,
             [memory_cards[node_id] for node_id in ids],
+            routing_dims,
         )
 
     level1_nodes: dict[tuple[str, str], dict[str, Any]] = {}
-    for key, ids in topic_groups.items():
+    for key in sorted(topic_groups):
+        ids = topic_groups[key]
         project, topic = key
         child_keys = sorted(route_key(memory_cards[node_id]) for node_id in ids)
         child_ids = [f"basin:l2:{project}:{topic}:{route}" for route in OrderedDict.fromkeys(child_keys)]
@@ -269,10 +295,12 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
             f"{project}:{topic}",
             child_ids,
             child_cards,
+            routing_dims,
         )
 
     level0_nodes: dict[str, dict[str, Any]] = {}
-    for project, ids in project_groups.items():
+    for project in sorted(project_groups):
+        ids = project_groups[project]
         topics = sorted(topic_key(memory_cards[node_id]) for node_id in ids)
         child_ids = [f"basin:l1:{project}:{topic}" for topic in OrderedDict.fromkeys(topics)]
         child_cards = [level1_nodes[(project, topic)] for topic in OrderedDict.fromkeys(topics)]
@@ -283,10 +311,12 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
             project,
             child_ids,
             child_cards,
+            routing_dims,
         )
 
     promoted_count = 0
-    for node_id, card in memory_cards.items():
+    for node_id in sorted(memory_cards):
+        card = memory_cards[node_id]
         project = project_key(card)
         topic = topic_key(card)
         route = route_key(card)
@@ -301,14 +331,23 @@ def write_lazy_index(row: dict[str, Any], backend: CachedEmbeddingBackend, outpu
                 promoted_count += 1
 
     all_nodes: list[dict[str, Any]] = []
-    all_nodes.extend(level0_nodes.values())
-    all_nodes.extend(level1_nodes.values())
-    all_nodes.extend(level2_nodes.values())
-    all_nodes.extend(memory_cards.values())
+    all_nodes.extend(level0_nodes[key] for key in sorted(level0_nodes))
+    all_nodes.extend(level1_nodes[key] for key in sorted(level1_nodes))
+    all_nodes.extend(level2_nodes[key] for key in sorted(level2_nodes))
+    all_nodes.extend(memory_cards[key] for key in sorted(memory_cards))
+
+    with routing_path.open("wb") as routing_handle:
+        for node in all_nodes:
+            routing = [float(value) for value in node.get("routing_embedding") or []]
+            node["routing_embedding_offset"] = routing_handle.tell()
+            node["routing_embedding_dims"] = len(routing)
+            for value in routing:
+                routing_handle.write(ROUTING_FLOAT.pack(value))
+            node.pop("routing_embedding", None)
+
     if not args.store_full_embeddings:
         for node in all_nodes:
-            if node.get("node_type") != "memory":
-                node["embedding"] = []
+            node["embedding"] = []
 
     offsets: dict[str, int] = {}
     levels: dict[str, list[str]] = {str(level): [] for level in range(LEVEL_MEMORY + 1)}
@@ -421,7 +460,7 @@ def score_node(row: dict[str, Any], query_text: str, query_embedding: list[float
         state = state_score(node)
         promotion = 0.06 * float(node.get("importance") or 0.5)
     else:
-        semantic = 0.0
+        semantic = cosine_prefix(query_embedding, node.get("routing_embedding") or node.get("embedding") or [], semantic_dims)
         activation = activation_coverage(query_mask, int(node.get("routing_mask") or 0))
         child_penalty = 0.0
         state = 0.0
