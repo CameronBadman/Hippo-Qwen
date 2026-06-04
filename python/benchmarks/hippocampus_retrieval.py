@@ -9,7 +9,7 @@ from typing import Any
 if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
-from python.benchmarks.benchmark_librarian import average_metrics, evaluate_ranked, load_rows, vector_scores
+from python.benchmarks.benchmark_librarian import average_metrics, evaluate_ranked, load_rows
 from python.librarian.features import (
     activation_mask_for_text,
     cluster_score,
@@ -24,6 +24,109 @@ from python.librarian.features import (
 
 
 Ranked = list[tuple[str, float, str]]
+
+
+class EmbeddingBackend:
+    name = "hash"
+
+    def embed_one(self, text: str) -> list[float]:
+        return embed_text(text)
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        return [self.embed_one(text) for text in texts]
+
+
+class CachedEmbeddingBackend:
+    def __init__(self, backend: EmbeddingBackend):
+        self.backend = backend
+        self.name = backend.name
+        self.cache: dict[str, list[float]] = {}
+
+    def embed_one(self, text: str) -> list[float]:
+        if text not in self.cache:
+            self.cache[text] = self.backend.embed_one(text)
+        return self.cache[text]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        missing = []
+        seen = set()
+        for text in texts:
+            if text not in self.cache and text not in seen:
+                missing.append(text)
+                seen.add(text)
+        if missing:
+            for text, vector in zip(missing, self.backend.embed_many(missing)):
+                self.cache[text] = vector
+        return [self.cache[text] for text in texts]
+
+
+class HippoEncoderBackend(EmbeddingBackend):
+    name = "hippo"
+
+    def __init__(self, checkpoint: str, source_dir: str, device: str, max_length: int, batch_size: int):
+        if source_dir:
+            sys.path.insert(0, str(Path(source_dir).resolve()))
+        try:
+            import torch
+
+            from hippo_encoder.student import TinyEncoderStudent
+        except ImportError as exc:
+            raise RuntimeError("Hippo-encoder backend requires torch, transformers, and hippo_encoder on PYTHONPATH") from exc
+
+        self.torch = torch
+        self.device = torch.device(device if device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.max_length = max_length
+        self.batch_size = batch_size
+        self.model = TinyEncoderStudent.load_checkpoint(checkpoint, device=self.device)
+        self.model.eval()
+
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed_many([text])[0]
+
+    def embed_many(self, texts: list[str]) -> list[list[float]]:
+        outputs = []
+        with self.torch.no_grad():
+            for start in range(0, len(texts), self.batch_size):
+                batch = texts[start : start + self.batch_size]
+                encoded = self.model(batch, device=self.device, max_length=self.max_length)["projected_embeds"]
+                outputs.extend(encoded.detach().cpu().tolist())
+        return outputs
+
+
+def build_embedding_backend(args: argparse.Namespace) -> CachedEmbeddingBackend:
+    if args.embedding_backend == "hash":
+        return CachedEmbeddingBackend(EmbeddingBackend())
+    if not args.hippo_checkpoint:
+        raise ValueError("--hippo-checkpoint is required when --embedding-backend hippo")
+    return CachedEmbeddingBackend(
+        HippoEncoderBackend(
+            checkpoint=args.hippo_checkpoint,
+            source_dir=args.hippo_encoder_src,
+            device=args.device,
+            max_length=args.hippo_max_length,
+            batch_size=args.hippo_batch_size,
+        )
+    )
+
+
+def text_for_embedding(card: dict[str, Any]) -> str:
+    return f"{card.get('text', '')} {card.get('summary', '')}".strip()
+
+
+def ensure_backend_embeddings(row: dict[str, Any], backend: CachedEmbeddingBackend) -> dict[str, Any]:
+    if backend.name == "hash":
+        return row
+    out = dict(row)
+    anchor = dict(row["anchor"])
+    candidates = [dict(candidate) for candidate in row.get("candidates", [])]
+    texts = [text_for_embedding(anchor)] + [text_for_embedding(candidate) for candidate in candidates]
+    vectors = backend.embed_many(texts)
+    anchor["embedding"] = vectors[0]
+    for candidate, vector in zip(candidates, vectors[1:]):
+        candidate["embedding"] = vector
+    out["anchor"] = anchor
+    out["candidates"] = candidates
+    return out
 
 
 def activation_overlap(left: int, right: int) -> float:
@@ -49,10 +152,22 @@ def state_score(card: dict[str, Any]) -> float:
     )
 
 
-def sparse_basin_scores(row: dict[str, Any]) -> Ranked:
+def vector_scores_with_backend(row: dict[str, Any], backend: CachedEmbeddingBackend) -> Ranked:
     task = row.get("retrieval_task") or {}
     query = task.get("query") or row["anchor"]["text"]
-    query_embedding = embed_text(query)
+    query_embedding = backend.embed_one(query)
+    scored = []
+    for candidate in row.get("candidates", []):
+        item = dict(candidate)
+        ensure_embedding(item)
+        scored.append((item["id"], cosine(query_embedding, item["embedding"]), item.get("text", "")))
+    return sorted(scored, key=lambda item: (-item[1], item[0]))
+
+
+def sparse_basin_scores(row: dict[str, Any], backend: CachedEmbeddingBackend) -> Ranked:
+    task = row.get("retrieval_task") or {}
+    query = task.get("query") or row["anchor"]["text"]
+    query_embedding = backend.embed_one(query)
     query_mask = activation_mask_for_text(query)
     anchor = dict(row["anchor"])
     ensure_embedding(anchor)
@@ -99,10 +214,10 @@ def edge_type_boost(edge_type: str) -> float:
     return 1.0
 
 
-def associative_recall_scores(row: dict[str, Any], seed_count: int = 8) -> Ranked:
+def associative_recall_scores(row: dict[str, Any], backend: CachedEmbeddingBackend, seed_count: int = 8) -> Ranked:
     candidates = {candidate["id"]: dict(candidate) for candidate in row.get("candidates", [])}
-    sparse = sparse_basin_scores(row)
-    dense = vector_scores(row)
+    sparse = sparse_basin_scores(row, backend)
+    dense = vector_scores_with_backend(row, backend)
     base_scores: dict[str, float] = {}
     texts: dict[str, str] = {}
     for rank, (candidate_id, score, text) in enumerate(sparse):
@@ -202,14 +317,16 @@ def multihop_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, default_bu
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
     rows = load_rows(Path(args.dataset), args.limit)
+    backend = build_embedding_backend(args)
     scorers = {
-        "vector_only": lambda row: vector_scores(row),
-        "sparse_basin": lambda row: sparse_basin_scores(row),
-        "associative_recall": lambda row: associative_recall_scores(row, args.seed_count),
+        "vector_only": lambda row: vector_scores_with_backend(row, backend),
+        "sparse_basin": lambda row: sparse_basin_scores(row, backend),
+        "associative_recall": lambda row: associative_recall_scores(row, backend, args.seed_count),
     }
     retrieval: dict[str, list[dict[str, float]]] = {name: [] for name in scorers}
     multihop: dict[str, list[dict[str, float]]] = {name: [] for name in scorers}
     for row in rows:
+        row = ensure_backend_embeddings(row, backend)
         for name, scorer in scorers.items():
             ranked = scorer(row)
             retrieval[name].append(evaluate_ranked(row, ranked, args.top_k, args.budget))
@@ -220,6 +337,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "top_k": args.top_k,
         "budget": args.budget,
         "seed_count": args.seed_count,
+        "embedding_backend": backend.name,
+        "hippo_checkpoint": args.hippo_checkpoint if backend.name == "hippo" else "",
         "metrics": {name: average_metrics(items) for name, items in retrieval.items()},
         "multihop_metrics": {name: average_metrics(items) for name, items in multihop.items()},
     }
@@ -234,6 +353,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- top_k: `{result['top_k']}`",
         f"- budget: `{result['budget']}`",
         f"- seed_count: `{result['seed_count']}`",
+        f"- embedding_backend: `{result['embedding_backend']}`",
         "",
         "## Retrieval",
         "",
@@ -293,6 +413,12 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=90)
     parser.add_argument("--seed-count", type=int, default=8)
+    parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
+    parser.add_argument("--hippo-checkpoint", default="")
+    parser.add_argument("--hippo-encoder-src", default="")
+    parser.add_argument("--hippo-max-length", type=int, default=128)
+    parser.add_argument("--hippo-batch-size", type=int, default=128)
+    parser.add_argument("--device", default="")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     args = parser.parse_args()

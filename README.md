@@ -139,6 +139,19 @@ python3 -m python.benchmarks.hippocampus_retrieval \
   --output-md artifacts/hippocampus/scorecard.md
 ```
 
+Run the same scorecard with a Hippo-encoder checkpoint:
+
+```bash
+python3 -m python.benchmarks.hippocampus_retrieval \
+  --dataset data/synthetic/associative_multihop.jsonl \
+  --limit 1000 \
+  --embedding-backend hippo \
+  --hippo-encoder-src /path/to/Hippo-encoder/src \
+  --hippo-checkpoint /path/to/extracted/hippoencoder-bge-small-all-nli-pair-500k-c025-epoch3 \
+  --output-json artifacts/hippocampus/scorecard_hippo_encoder.json \
+  --output-md artifacts/hippocampus/scorecard_hippo_encoder.md
+```
+
 The report compares vector-only retrieval, sparse basin routing, and
 associative recall. In addition to normal context metrics, it reports bridge
 recall, target recall, path success, stale exposure, and wrong-context exposure.
