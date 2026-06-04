@@ -412,7 +412,8 @@ def ranked_signature(ranked: Ranked) -> list[tuple[str, float]]:
 def hierarchical_search(row: dict[str, Any], backend: CachedEmbeddingBackend, meta: dict[str, Any], args: argparse.Namespace) -> SearchResult:
     task = row.get("retrieval_task") or {}
     query_text = task.get("query") or row["anchor"]["text"]
-    query_embedding = backend.embed_one(query_text)
+    query_embedding = task.get("query_embedding") or backend.embed_one(query_text)
+    query_embedding = [float(value) for value in query_embedding]
     query_mask = activation_mask_for_text(query_text)
     started = time.perf_counter()
     store = LazyNodeStore(meta, args.cache_size)
