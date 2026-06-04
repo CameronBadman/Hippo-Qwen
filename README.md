@@ -156,6 +156,23 @@ The report compares vector-only retrieval, sparse basin routing, and
 associative recall. In addition to normal context metrics, it reports bridge
 recall, target recall, path success, stale exposure, and wrong-context exposure.
 
+Run the large-pool scaling benchmark when testing whether an encoder keeps
+candidate retrieval from exploding as memory grows:
+
+```bash
+python3 -m python.benchmarks.large_pool_retrieval \
+  --cases 20 \
+  --pool-size 5000 \
+  --embedding-backend hippo \
+  --hippo-encoder-src /path/to/Hippo-encoder/src \
+  --hippo-checkpoint /path/to/extracted/hippoencoder-bge-small-all-nli-pair-500k-c025-epoch3 \
+  --output-json artifacts/hippocampus/large_pool_hippo.json \
+  --output-md artifacts/hippocampus/large_pool_hippo.md
+```
+
+This benchmark reports both final context quality and pre-graph candidate-set
+size/precision at score thresholds and top-N cutoffs.
+
 Run the full local-first evaluation suite:
 
 ```bash
