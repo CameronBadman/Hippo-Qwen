@@ -28,13 +28,14 @@ from python.benchmarks.memorycraft_retrieval import (
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import build_faiss, build_hnswlib, exact_vector_search, faiss_search, hnswlib_search
+from python.benchmarks.vector_db_compare import hybrid_faiss_token_search
 from python.benchmarks.vector_db_compare import metric_cell
 from python.field_memory.token_field import build_token_field_index, search_token_field
 
 
 def parse_systems(value: str) -> list[str]:
     systems = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field"}
+    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field", "hybrid_faiss_hnsw_token"}
     unknown = sorted(set(systems) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
@@ -84,6 +85,8 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "fallback_ms": float(stats.get("fallback_ms") or 0.0),
         "candidate_cap_ms": float(stats.get("candidate_cap_ms") or 0.0),
         "candidate_score_ms": float(stats.get("candidate_score_ms") or 0.0),
+        "vector_candidate_latency_ms": float(stats.get("vector_candidate_latency_ms") or 0.0),
+        "vector_candidate_count": float(stats.get("vector_candidate_count") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
     out.update(candidate_pool_metrics(row, ranked, candidate_ids))
@@ -206,6 +209,23 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
                 "build_latency_ms": float(index.build_latency_ms),
                 "memory_count": len(index.nodes),
                 "total_index_bytes": int(index.index_bytes),
+            }
+        )
+    if "hybrid_faiss_hnsw_token" in args.systems:
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, "hnsw")
+        index = build_token_field_index(embedded_base, args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        rows, mismatches = repeated(qa_rows, lambda row: hybrid_faiss_token_search(row, backend, faiss_built, index, args), args)
+        systems.append(
+            {
+                "name": "hybrid_faiss_hnsw_token",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": len(index.nodes),
+                "total_index_bytes": int(index.index_bytes) + int(faiss_built["index_bytes"]),
             }
         )
 
@@ -406,6 +426,7 @@ def main() -> None:
     parser.add_argument("--device", default="")
     parser.add_argument("--token-encoder-checkpoint", default="")
     parser.add_argument("--token-encoder-device", default="")
+    parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     parser.add_argument("--print-records", action="store_true")

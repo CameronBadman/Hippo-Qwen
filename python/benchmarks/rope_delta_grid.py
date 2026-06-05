@@ -643,6 +643,8 @@ def evaluate_one(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], a
         "fallback_ms": float(stats.get("fallback_ms") or 0.0),
         "candidate_cap_ms": float(stats.get("candidate_cap_ms") or 0.0),
         "candidate_score_ms": float(stats.get("candidate_score_ms") or 0.0),
+        "vector_candidate_latency_ms": float(stats.get("vector_candidate_latency_ms") or 0.0),
+        "vector_candidate_count": float(stats.get("vector_candidate_count") or 0.0),
         "determinism_mismatches": float(stats.get("determinism_mismatches") or 0.0),
         "deterministic": 1.0 if float(stats.get("determinism_mismatches") or 0.0) == 0.0 else 0.0,
     }

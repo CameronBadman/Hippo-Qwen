@@ -29,6 +29,7 @@ class FieldNode:
 @dataclass
 class TokenFieldIndex:
     nodes: list[FieldNode]
+    id_to_index: dict[str, int]
     inverted: dict[tuple[int, int], list[int]]
     action_inverted: dict[int, list[int]]
     layered_inverted: dict[tuple[int, int, int], list[int]]
@@ -204,6 +205,7 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
     )
     return TokenFieldIndex(
         nodes=nodes,
+        id_to_index={node.node_id: node.index for node in nodes},
         inverted={key: sorted(values) for key, values in inverted.items()},
         action_inverted={key: sorted(values) for key, values in action_inverted_sets.items()},
         layered_inverted={key: sorted(values) for key, values in layered_inverted.items()},
@@ -310,7 +312,12 @@ def action_fallback_candidates(index: TokenFieldIndex, tokens: tuple[FieldToken,
     return candidates
 
 
-def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex, args: Any) -> tuple[list[tuple[str, float, str]], dict[str, float], set[str]]:
+def query_field_context(
+    row: dict[str, Any],
+    backend: Any,
+    index: TokenFieldIndex,
+    args: Any,
+) -> tuple[str, tuple[float, ...], tuple[FieldToken, ...], dict[str, float]]:
     started = time.perf_counter()
     marks: dict[str, float] = {}
     task = row.get("retrieval_task") or {}
@@ -324,6 +331,66 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
     else:
         tokens = query_tokens(query, query_embedding, index.projection_plan, args)
     marks["query_token_ms"] = (time.perf_counter() - token_started) * 1000.0
+    return query, query_embedding, tokens, marks
+
+
+def score_token_field_candidates(
+    query: str,
+    query_embedding: tuple[float, ...],
+    tokens: tuple[FieldToken, ...],
+    index: TokenFieldIndex,
+    candidates: dict[int, float],
+    args: Any,
+) -> list[tuple[str, float, str]]:
+    bucket_radius = max(0, int(args.bucket_radius))
+    query_mask = activation_mask_for_text(query)
+    scored = []
+    for node_index, source_score in candidates.items():
+        node = index.nodes[node_index]
+        field = overlap_score(tokens, node, bucket_radius)
+        semantic = cosine(query_embedding, node.embedding)
+        activation = (query_mask & node.mask).bit_count() / max(1, query_mask.bit_count())
+        score = 0.50 * field + 0.30 * semantic + 0.14 * activation + 0.06 * float(source_score)
+        scored.append((node.node_id, float(score), node.text))
+    scored.sort(key=lambda item: (-item[1], item[0]))
+    return scored
+
+
+def search_token_field_candidates(
+    row: dict[str, Any],
+    backend: Any,
+    index: TokenFieldIndex,
+    args: Any,
+    candidate_scores: dict[int, float],
+) -> tuple[list[tuple[str, float, str]], dict[str, float], set[str]]:
+    started = time.perf_counter()
+    query, query_embedding, tokens, marks = query_field_context(row, backend, index, args)
+    max_candidates = max(1, int(getattr(args, "max_candidates", 192)))
+    limited = deterministic_take(candidate_scores, max_candidates)
+    score_started = time.perf_counter()
+    scored = score_token_field_candidates(query, query_embedding, tokens, index, limited, args)
+    marks["candidate_score_ms"] = (time.perf_counter() - score_started) * 1000.0
+    fetch = scored[: max(1, int(args.final_fetch))]
+    stats = {
+        "latency_ms": (time.perf_counter() - started) * 1000.0,
+        "unique_nodes_read": float(len(limited)),
+        "payload_reads": float(len(fetch)),
+        "node_records_read": float(len(limited)),
+        "edge_reads": 0.0,
+        "edge_expansions": 0.0,
+        "routing_layer_reads": 0.0,
+        "routing_candidate_count": 0.0,
+        "raw_final_candidate_count": float(len(candidate_scores)),
+        "final_candidate_count": float(len(fetch)),
+        "calibrator_latency_ms": 0.0,
+    }
+    stats.update(marks)
+    return fetch, stats, {index.nodes[node_index].node_id for node_index in limited}
+
+
+def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex, args: Any) -> tuple[list[tuple[str, float, str]], dict[str, float], set[str]]:
+    started = time.perf_counter()
+    query, query_embedding, tokens, marks = query_field_context(row, backend, index, args)
     bucket_radius = max(0, int(args.bucket_radius))
     route_started = time.perf_counter()
     routing_frontier, route_stats = route_layers(index, tokens, bucket_radius, args)
@@ -364,16 +431,7 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
     candidates = deterministic_take(candidates, max_candidates)
     marks["candidate_cap_ms"] = (time.perf_counter() - cap_started) * 1000.0
     score_started = time.perf_counter()
-    scored = []
-    query_mask = activation_mask_for_text(query)
-    for node_index, collision in candidates.items():
-        node = index.nodes[node_index]
-        field = overlap_score(tokens, node, bucket_radius)
-        semantic = cosine(query_embedding, node.embedding)
-        activation = (query_mask & node.mask).bit_count() / max(1, query_mask.bit_count())
-        score = 0.58 * field + 0.28 * semantic + 0.14 * activation + 0.02 * collision
-        scored.append((node.node_id, float(score), node.text))
-    scored.sort(key=lambda item: (-item[1], item[0]))
+    scored = score_token_field_candidates(query, query_embedding, tokens, index, candidates, args)
     marks["candidate_score_ms"] = (time.perf_counter() - score_started) * 1000.0
     fetch = scored[: max(1, int(args.final_fetch))]
     stats = {

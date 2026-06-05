@@ -17,13 +17,13 @@ from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ens
 from python.benchmarks.large_pool_retrieval import build_large_pool_case
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, evaluate_one, query_embedding_for, search_rope_delta_grid
 from python.benchmarks.skeleton_memory_index import compact_output, parse_scenarios
-from python.field_memory.token_field import build_token_field_index, search_token_field
+from python.field_memory.token_field import TokenFieldIndex, build_token_field_index, search_token_field, search_token_field_candidates
 from python.librarian.features import cosine
 
 
 def parse_systems(value: str) -> list[str]:
     systems = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field"}
+    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field", "hybrid_faiss_hnsw_token"}
     unknown = sorted(set(systems) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
@@ -100,11 +100,12 @@ def build_faiss(row: dict[str, Any], args: argparse.Namespace, kind: str) -> dic
     }
 
 
-def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args: argparse.Namespace) -> tuple[Ranked, dict[str, float], set[str]]:
+def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args: argparse.Namespace, fetch_count: int | None = None) -> tuple[Ranked, dict[str, float], set[str]]:
     started = time.perf_counter()
     query = normalized_float32(query_embedding_for(row, backend)).reshape(1, -1)
-    fetch_count = max(1, min(int(args.final_fetch), int(built["memory_count"])))
-    scores, indices = built["index"].search(query.astype("float32", copy=False), fetch_count)
+    limit = int(args.final_fetch) if fetch_count is None else int(fetch_count)
+    limit = max(1, min(limit, int(built["memory_count"])))
+    scores, indices = built["index"].search(query.astype("float32", copy=False), limit)
     ranked = []
     for score, index in zip(scores[0].tolist(), indices[0].tolist()):
         if index < 0:
@@ -120,11 +121,47 @@ def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args:
         "cells_touched": 0.0,
         "active_query_layers": 0.0,
         "skipped_layers": 0.0,
-        "raw_final_candidate_count": float(fetch_count),
+        "raw_final_candidate_count": float(limit),
         "final_candidate_count": float(len(ranked)),
         "vector_index_scan_count": float(built["memory_count"]) if built.get("kind") == "flat" else -1.0,
     }
     return ranked, stats, set()
+
+
+def faiss_candidate_scores(
+    row: dict[str, Any],
+    backend: Any,
+    built: dict[str, Any],
+    token_index: TokenFieldIndex,
+    args: argparse.Namespace,
+) -> tuple[dict[int, float], dict[str, float]]:
+    ranked, stats, _ = faiss_search(row, backend, built, args, int(args.hybrid_candidate_fetch))
+    candidates: dict[int, float] = {}
+    for node_id, score, _ in ranked:
+        node_index = token_index.id_to_index.get(str(node_id))
+        if node_index is None:
+            continue
+        candidates[node_index] = max(candidates.get(node_index, -99.0), float(score))
+    return candidates, stats
+
+
+def hybrid_faiss_token_search(
+    row: dict[str, Any],
+    backend: Any,
+    faiss_built: dict[str, Any],
+    token_index: TokenFieldIndex,
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float], set[str]]:
+    started = time.perf_counter()
+    candidate_scores, faiss_stats = faiss_candidate_scores(row, backend, faiss_built, token_index, args)
+    ranked, token_stats, candidate_ids = search_token_field_candidates(row, backend, token_index, args, candidate_scores)
+    stats = dict(token_stats)
+    stats["latency_ms"] = (time.perf_counter() - started) * 1000.0
+    stats["vector_candidate_latency_ms"] = float(faiss_stats.get("latency_ms") or 0.0)
+    stats["vector_candidate_count"] = float(len(candidate_scores))
+    stats["vector_index_scan_count"] = float(faiss_stats.get("vector_index_scan_count", -1.0))
+    stats["raw_final_candidate_count"] = float(len(candidate_scores))
+    return ranked, stats, candidate_ids
 
 
 def build_hnswlib(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
@@ -323,6 +360,28 @@ def run_dataset(
             }
         )
         systems.append(token_result)
+    if "hybrid_faiss_hnsw_token" in args.systems:
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(row, args, "hnsw")
+        token_index = build_token_field_index(row, args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        hybrid_result = run_repeated(
+            "hybrid_faiss_hnsw_token",
+            row,
+            lambda item: hybrid_faiss_token_search(item, backend, faiss_built, token_index, args),
+            args,
+        )
+        hybrid_result.update(
+            {
+                "build_latency_ms": build_ms,
+                "memory_count": len(token_index.nodes),
+                "node_record_count": len(token_index.nodes),
+                "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
+                "edge_count": 0,
+                "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
+            }
+        )
+        systems.append(hybrid_result)
     return {"name": name, "systems": systems}
 
 
@@ -452,6 +511,7 @@ def main() -> None:
     parser.add_argument("--include-min-overlap", type=float, default=0.01)
     parser.add_argument("--token-encoder-checkpoint", default="")
     parser.add_argument("--token-encoder-device", default="")
+    parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
