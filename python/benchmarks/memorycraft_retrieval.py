@@ -13,6 +13,7 @@ if __package__ is None or __package__ == "":
 from python.benchmarks.hard_memory_regression import aggregate
 from python.benchmarks.hierarchical_file_ann import Ranked, ranked_signature
 from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ensure_backend_embeddings
+from python.benchmarks.agent_memory_graph import build_agent_memory_graph, search_agent_memory_graph
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, query_embedding_for, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import (
     build_faiss,
@@ -30,7 +31,15 @@ DEFAULT_HF_FILE = "selected/sample.jsonl"
 
 def parse_systems(value: str) -> list[str]:
     systems = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "hippo_calibrated"}
+    valid = {
+        "exact_vector",
+        "faiss_flat",
+        "faiss_hnsw",
+        "hnswlib",
+        "hippo_rope_grid",
+        "hippo_calibrated",
+        "agent_memory_graph",
+    }
     unknown = sorted(set(systems) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
@@ -532,6 +541,24 @@ def run_record(
                     "total_index_bytes": index_size(meta),
                 }
             )
+    if "agent_memory_graph" in args.systems:
+        index = build_agent_memory_graph(embedded_base, backend, work_dir / f"record_{record_number:05d}" / "agent_memory_graph", args)
+        rows, mismatches = run_queries(qa_rows, lambda row: search_agent_memory_graph(row, backend, index, args), args)
+        systems.append(
+            {
+                "name": "agent_memory_graph",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": float(index.build_latency_ms),
+                "memory_count": len(index.nodes),
+                "node_record_count": len(index.nodes),
+                "cell_count": int(args.memory_graph_layers),
+                "edge_count": sum(len(edges) for edges in index.truth_edges)
+                + sum(len(edges) for layer in index.routing_edges for edges in layer),
+                "total_index_bytes": int(index.index_bytes),
+            }
+        )
 
     return {
         "uid": str(record.get("uid") or ""),
@@ -717,6 +744,21 @@ def main() -> None:
     parser.add_argument("--final-fetch", type=int, default=96)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-max-candidates", type=int, default=128)
+    parser.add_argument("--memory-graph-layers", type=int, default=8)
+    parser.add_argument("--memory-graph-route-degree", type=int, default=24)
+    parser.add_argument("--memory-graph-promotion-threshold", type=int, default=72)
+    parser.add_argument("--memory-graph-bias-promotion", action="store_true")
+    parser.add_argument("--memory-graph-bridge-degree", type=int, default=6)
+    parser.add_argument("--memory-graph-importance-threshold", type=float, default=0.68)
+    parser.add_argument("--memory-graph-reciprocal-routes", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--memory-graph-ef", type=int, default=80)
+    parser.add_argument("--memory-graph-beam", type=int, default=12)
+    parser.add_argument("--memory-graph-truth-seeds", type=int, default=16)
+    parser.add_argument("--memory-graph-truth-depth", type=int, default=2)
+    parser.add_argument("--memory-graph-truth-fanout", type=int, default=6)
+    parser.add_argument("--memory-graph-min-results", type=int, default=4)
+    parser.add_argument("--memory-graph-cutoff-margin", type=float, default=0.28)
+    parser.add_argument("--memory-graph-min-score", type=float, default=-0.05)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
