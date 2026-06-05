@@ -15,6 +15,12 @@ storage/retrieval architecture is designed from scratch.
 - `python/benchmarks`: benchmark harnesses and prior experiment references
 - `requirements-train.txt`: Python training dependencies
 
+## License
+
+This project is released under the MIT License. Use, copying, modification,
+distribution, sublicensing, and commercial use are allowed, provided the
+copyright and permission notice for Cameron Badman is retained.
+
 ## Current Experiment
 
 `python/benchmarks/rope_delta_grid.py` tests a deterministic rope delta grid:
@@ -87,6 +93,20 @@ Sparse 1024-dimensional hash embedding check:
   `1.0`, p95 query latency about `81 ms`, and `65,536` node-record reads
 - deterministic repeated search output with zero mismatches
 - combined-growth binary index footprint about `138 MB`
+
+75k exact-vector comparison:
+
+- `python/benchmarks/vector_db_compare.py`
+- compares exact cosine scan against the bounded rope grid on the same
+  synthetic agent-memory workload
+- `--pool-size 75000 --growth-count 7500 --growth-scenarios combined`
+- `--dim-count 1024 --max-cell-scan 4096 --repeat-searches 3`
+- exact vector baseline: baseline p95 about `2769 ms`, combined-growth p95
+  about `2970 ms`, and context recall/precision `0.0` in this workload
+- bounded rope grid: baseline p95 about `40 ms`, combined-growth p95 about
+  `59 ms`, context recall `1.0`, context precision `1.0`, and deterministic
+  repeated output
+- combined-growth rope index footprint about `95 MB`
 
 Conclusion: sparse deterministic layer selection is the better high-dimensional
 direction than a dense grid or ball-tree style index. It keeps growth-stable
