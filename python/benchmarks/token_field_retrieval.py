@@ -27,13 +27,13 @@ from python.benchmarks.memorycraft_retrieval import (
     unit_mode,
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, search_rope_delta_grid
-from python.benchmarks.vector_db_compare import exact_vector_search
+from python.benchmarks.vector_db_compare import build_faiss, build_hnswlib, exact_vector_search, faiss_search, hnswlib_search
 from python.field_memory.token_field import build_token_field_index, search_token_field
 
 
 def parse_systems(value: str) -> list[str]:
     systems = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"exact_vector", "hippo_rope_grid", "token_field"}
+    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field"}
     unknown = sorted(set(systems) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
@@ -148,6 +148,40 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
                 "build_latency_ms": float(meta.get("build_latency_ms") or 0.0),
                 "memory_count": int(meta["memory_count"]),
                 "total_index_bytes": index_size(meta),
+            }
+        )
+    for system_name, kind in (("faiss_flat", "flat"), ("faiss_hnsw", "hnsw")):
+        if system_name not in args.systems:
+            continue
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, kind)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        rows, mismatches = repeated(qa_rows, lambda row: faiss_search(row, backend, faiss_built, args), args)
+        systems.append(
+            {
+                "name": system_name,
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": int(faiss_built["memory_count"]),
+                "total_index_bytes": int(faiss_built["index_bytes"]),
+            }
+        )
+    if "hnswlib" in args.systems:
+        build_started = time.perf_counter()
+        hnswlib_built = build_hnswlib(embedded_base, args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        rows, mismatches = repeated(qa_rows, lambda row: hnswlib_search(row, backend, hnswlib_built, args), args)
+        systems.append(
+            {
+                "name": "hnswlib",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": int(hnswlib_built["memory_count"]),
+                "total_index_bytes": int(hnswlib_built["index_bytes"]),
             }
         )
     if "token_field" in args.systems:
@@ -345,6 +379,12 @@ def main() -> None:
     parser.add_argument("--max-node-layers", type=int, default=24)
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
+    parser.add_argument("--faiss-hnsw-m", type=int, default=32)
+    parser.add_argument("--faiss-ef-construction", type=int, default=200)
+    parser.add_argument("--faiss-ef-search", type=int, default=128)
+    parser.add_argument("--hnswlib-m", type=int, default=32)
+    parser.add_argument("--hnswlib-ef-construction", type=int, default=200)
+    parser.add_argument("--hnswlib-ef-search", type=int, default=128)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
