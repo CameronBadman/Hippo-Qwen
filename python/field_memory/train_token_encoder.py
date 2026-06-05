@@ -152,6 +152,34 @@ def metrics(scores: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, cand
     }
 
 
+def hard_token_scores(model: TokenFieldEncoder, query: torch.Tensor, candidates: torch.Tensor, bucket_radius: int) -> torch.Tensor:
+    batch, count, _ = candidates.shape
+    query = fit_tensor_embeddings(query, model.config.embedding_dim)
+    candidates = fit_tensor_embeddings(candidates, model.config.embedding_dim)
+    query_tokens = model.export_tokens(query, "query", token_count=model.config.query_token_count)
+    node_tokens = model.export_tokens(
+        candidates.reshape(batch * count, model.config.embedding_dim),
+        "node",
+        token_count=model.config.node_token_count,
+    )
+    node_tokens_by_row = [node_tokens[index * count : (index + 1) * count] for index in range(batch)]
+    scores = torch.zeros((batch, count), dtype=torch.float32, device=query.device)
+    radius = max(0, int(bucket_radius))
+    for row_index, (row_query_tokens, row_node_tokens) in enumerate(zip(query_tokens, node_tokens_by_row)):
+        query_by_action: dict[int, list[tuple[int, float]]] = {}
+        for token in row_query_tokens:
+            query_by_action.setdefault(token.action_id, []).append((token.bucket, token.weight))
+        for candidate_index, candidate_tokens in enumerate(row_node_tokens):
+            score = 0.0
+            for token in candidate_tokens:
+                for query_bucket, query_weight in query_by_action.get(token.action_id, []):
+                    delta = abs(int(query_bucket) - int(token.bucket))
+                    if delta <= radius:
+                        score += (float(query_weight) * float(token.weight)) / float(1 + delta)
+            scores[row_index, candidate_index] = score
+    return scores
+
+
 def average(items: list[dict[str, float]], key: str) -> float:
     return sum(item.get(key, 0.0) for item in items) / max(1, len(items))
 
@@ -182,6 +210,8 @@ def train(args: argparse.Namespace) -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     best_recall = -1.0
+    best_hard_recall = -1.0
+    best_hard_recall_at_k = -1.0
     best_state = None
     for epoch in range(args.epochs):
         model.train()
@@ -203,21 +233,32 @@ def train(args: argparse.Namespace) -> None:
 
         model.eval()
         val_metrics = []
+        hard_val_metrics = []
         with torch.no_grad():
             for batch in val_loader:
                 batch = {key: value.to(device) for key, value in batch.items()}
                 scores = pair_scores(model, batch["query"], batch["candidates"], args.bucket_radius, args.temperature)
                 scores = scores.masked_fill(~batch["mask"], -1e9)
                 val_metrics.append(metrics(scores, batch["labels"], batch["mask"], args.candidate_cap, args.top_k))
+                hard_scores = hard_token_scores(model, batch["query"], batch["candidates"], args.bucket_radius)
+                hard_scores = hard_scores.masked_fill(~batch["mask"], -1e9)
+                hard_val_metrics.append(metrics(hard_scores, batch["labels"], batch["mask"], args.candidate_cap, args.top_k))
         candidate_recall = average(val_metrics, "candidate_recall")
-        if candidate_recall > best_recall:
+        hard_candidate_recall = average(hard_val_metrics, "candidate_recall")
+        hard_recall_at_k = average(hard_val_metrics, "recall_at_k")
+        if (hard_candidate_recall, hard_recall_at_k, candidate_recall) > (best_hard_recall, best_hard_recall_at_k, best_recall):
             best_recall = candidate_recall
+            best_hard_recall = hard_candidate_recall
+            best_hard_recall_at_k = hard_recall_at_k
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         print(
             f"epoch={epoch + 1} train_loss={sum(train_losses) / max(1, len(train_losses)):.4f} "
             f"val_candidate_recall={candidate_recall:.4f} "
             f"val_recall@{args.top_k}={average(val_metrics, 'recall_at_k'):.4f} "
-            f"val_precision@{args.top_k}={average(val_metrics, 'precision_at_k'):.4f}",
+            f"val_precision@{args.top_k}={average(val_metrics, 'precision_at_k'):.4f} "
+            f"hard_candidate_recall={hard_candidate_recall:.4f} "
+            f"hard_recall@{args.top_k}={hard_recall_at_k:.4f} "
+            f"hard_precision@{args.top_k}={average(hard_val_metrics, 'precision_at_k'):.4f}",
             flush=True,
         )
     if best_state is not None:
@@ -227,6 +268,8 @@ def train(args: argparse.Namespace) -> None:
         args.output,
         dataset=args.dataset,
         best_candidate_recall=best_recall,
+        best_hard_candidate_recall=best_hard_recall,
+        best_hard_recall_at_k=best_hard_recall_at_k,
         candidate_cap=args.candidate_cap,
         bucket_radius=args.bucket_radius,
     )
