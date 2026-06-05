@@ -121,12 +121,28 @@ def metrics(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, top_
         first = torch.nonzero(ordered_positive, as_tuple=False).flatten()
         mrr.append(1.0 / (int(first[0].item()) + 1) if first.numel() else 0.0)
     if not recall:
-        return {"recall_at_k": 0.0, "precision_at_k": 0.0, "mrr": 0.0}
+        return {"recall_at_k": 0.0, "precision_at_k": 0.0, "f1_at_k": 0.0, "mrr": 0.0}
+    avg_recall = sum(recall) / len(recall)
+    avg_precision = sum(precision) / len(precision)
+    f1 = 2.0 * avg_recall * avg_precision / max(1e-6, avg_recall + avg_precision)
     return {
-        "recall_at_k": sum(recall) / len(recall),
-        "precision_at_k": sum(precision) / len(precision),
+        "recall_at_k": avg_recall,
+        "precision_at_k": avg_precision,
+        "f1_at_k": f1,
         "mrr": sum(mrr) / len(mrr),
     }
+
+
+def selection_score(metric: dict[str, float], name: str) -> float:
+    if name == "mrr":
+        return metric["mrr"]
+    if name == "precision":
+        return metric["precision_at_k"]
+    if name == "recall":
+        return metric["recall_at_k"]
+    if name == "f1":
+        return metric["f1_at_k"]
+    return 0.50 * metric["f1_at_k"] + 0.30 * metric["mrr"] + 0.20 * metric["recall_at_k"]
 
 
 def positive_weight(dataset: HippoCalibrationDataset, max_weight: float) -> float:
@@ -165,7 +181,8 @@ def train(args: argparse.Namespace) -> None:
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     pos_weight = torch.tensor(positive_weight(dataset, args.max_pos_weight), dtype=torch.float32, device=device)
 
-    best_mrr = -1.0
+    best_score = -1.0
+    best_metrics: dict[str, float] = {"recall_at_k": 0.0, "precision_at_k": 0.0, "f1_at_k": 0.0, "mrr": 0.0}
     best_state = None
     for epoch in range(args.epochs):
         model.train()
@@ -175,13 +192,18 @@ def train(args: argparse.Namespace) -> None:
             outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
             logits = outputs["relevance_logits"]
             valid = batch["mask"].bool()
+            effective_weights = batch["weights"] * torch.where(
+                batch["labels"] >= 0.5,
+                torch.ones_like(batch["labels"]),
+                torch.full_like(batch["labels"], float(args.negative_weight)),
+            )
             bce = F.binary_cross_entropy_with_logits(
                 logits[valid],
                 batch["labels"][valid],
                 pos_weight=pos_weight,
-                weight=batch["weights"][valid],
+                weight=effective_weights[valid],
             )
-            rank = ranking_loss(logits, batch["labels"], batch["mask"], batch["weights"])
+            rank = ranking_loss(logits, batch["labels"], batch["mask"], effective_weights)
             loss = bce + args.rank_loss_weight * rank
             optimizer.zero_grad()
             loss.backward()
@@ -198,25 +220,35 @@ def train(args: argparse.Namespace) -> None:
                 outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
                 logits = outputs["relevance_logits"]
                 valid = batch["mask"].bool()
+                effective_weights = batch["weights"] * torch.where(
+                    batch["labels"] >= 0.5,
+                    torch.ones_like(batch["labels"]),
+                    torch.full_like(batch["labels"], float(args.negative_weight)),
+                )
                 bce = F.binary_cross_entropy_with_logits(
                     logits[valid],
                     batch["labels"][valid],
                     pos_weight=pos_weight,
-                    weight=batch["weights"][valid],
+                    weight=effective_weights[valid],
                 )
-                rank = ranking_loss(logits, batch["labels"], batch["mask"], batch["weights"])
+                rank = ranking_loss(logits, batch["labels"], batch["mask"], effective_weights)
                 val_losses.append(float((bce + args.rank_loss_weight * rank).detach().cpu().item()))
                 val_metrics.append(metrics(logits, batch["labels"], batch["mask"], args.top_k))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         precision = sum(item["precision_at_k"] for item in val_metrics) / max(1, len(val_metrics))
+        f1 = sum(item["f1_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         mrr = sum(item["mrr"] for item in val_metrics) / max(1, len(val_metrics))
-        if mrr > best_mrr:
-            best_mrr = mrr
+        current_metrics = {"recall_at_k": recall, "precision_at_k": precision, "f1_at_k": f1, "mrr": mrr}
+        current_score = selection_score(current_metrics, args.selection_metric)
+        if current_score > best_score:
+            best_score = current_score
+            best_metrics = current_metrics
             best_state = {key: value.detach().cpu().clone() for key, value in model.state_dict().items()}
         print(
             f"epoch={epoch + 1} train_loss={train_loss / max(1, len(train_loader)):.4f} "
             f"val_loss={sum(val_losses) / max(1, len(val_losses)):.4f} "
-            f"val_recall@{args.top_k}={recall:.3f} val_precision@{args.top_k}={precision:.3f} val_mrr={mrr:.3f}",
+            f"val_recall@{args.top_k}={recall:.3f} val_precision@{args.top_k}={precision:.3f} "
+            f"val_f1@{args.top_k}={f1:.3f} val_mrr={mrr:.3f}",
             flush=True,
         )
     if best_state is not None:
@@ -225,7 +257,9 @@ def train(args: argparse.Namespace) -> None:
         model,
         args.output,
         dataset=args.dataset,
-        best_val_mrr=best_mrr,
+        best_val_score=best_score,
+        best_val_metrics=best_metrics,
+        selection_metric=args.selection_metric,
         max_candidates=args.max_candidates,
         feature_dim=args.feature_dim,
     )
@@ -250,6 +284,8 @@ def main() -> None:
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--rank-loss-weight", type=float, default=0.6)
     parser.add_argument("--max-pos-weight", type=float, default=16.0)
+    parser.add_argument("--negative-weight", type=float, default=1.0)
+    parser.add_argument("--selection-metric", choices=["mrr", "precision", "recall", "f1", "balanced"], default="mrr")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--seed", type=int, default=9101)
