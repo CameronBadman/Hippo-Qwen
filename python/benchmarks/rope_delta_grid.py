@@ -634,6 +634,7 @@ def evaluate_one(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], a
         "skipped_layers": float(stats.get("skipped_layers") or 0.0),
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or 0.0),
+        "vector_index_scan_count": float(stats.get("vector_index_scan_count") or 0.0),
         "determinism_mismatches": float(stats.get("determinism_mismatches") or 0.0),
         "deterministic": 1.0 if float(stats.get("determinism_mismatches") or 0.0) == 0.0 else 0.0,
     }
