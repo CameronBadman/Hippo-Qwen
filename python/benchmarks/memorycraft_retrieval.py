@@ -400,8 +400,12 @@ def calibrated_search(
     started = time.perf_counter()
     raw_ranked, stats, protected = search_rope_delta_grid(row, backend, meta, args)
     ranked = rerank_with_calibrator(calibrator, calibrator_payload(row, raw_ranked, id_to_candidate, backend, args))
+    total_latency_ms = (time.perf_counter() - started) * 1000.0
+    search_latency_ms = float(stats.get("latency_ms") or 0.0)
     out = dict(stats)
-    out["calibrator_latency_ms"] = (time.perf_counter() - started) * 1000.0 - float(stats.get("latency_ms") or 0.0)
+    out["search_latency_ms"] = search_latency_ms
+    out["latency_ms"] = total_latency_ms
+    out["calibrator_latency_ms"] = max(0.0, total_latency_ms - search_latency_ms)
     return ranked, out, protected
 
 
