@@ -70,12 +70,51 @@ remaining under the 200 ms target at 10k nodes. This is promising, but not a fai
 general vector DB benchmark yet because the synthetic labels are not pure nearest
 neighbors.
 
+## 75k Synthetic Scale Check
+
+Run shape:
+
+- Embeddings: deterministic hash backend, 768 dimensions.
+- Pool size: 75,000.
+- Growth: 0.
+- Exact vector scan omitted.
+
+| system/config | p95 ms | recall | precision | candidate reads p95 | deterministic |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| faiss_flat | 9.23 | 0.0000 | 0.0000 | 96 returned | 1.0000 |
+| faiss_hnsw | 0.87 | 0.0000 | 0.0000 | 96 returned | 1.0000 |
+| hnswlib | 0.59 | 0.0000 | 0.0000 | 96 returned | 1.0000 |
+| token_field, routing 8 | 1118.92 | 0.3333 | 0.3333 | 512 scored | 1.0000 |
+| token_field, routing 1, q40/n40/r2 | 453.70 | 0.3333 | 0.3333 | 512 scored | 1.0000 |
+| token_field, routing 1, q24/n32/r1 | 273.14 | 0.3333 | 0.3333 | 377 scored | 1.0000 |
+| token_field, routing 1, q16/n24/r1 | 198.02 | 0.0000 | 0.0000 | 0 scored | 1.0000 |
+
+Result: the current Python token-field path is not fast enough at 75k while
+preserving recall. Profiling shows routing dominates the original path:
+
+| stage | p95 ms at 75k, routing 8 |
+| --- | ---: |
+| routing | 757.47 |
+| layer-zero collision | 194.59 |
+| candidate filter | 117.24 |
+| candidate scoring | 43.52 |
+| query embedding + tokenization | 1.53 |
+
+Disabling high-layer routing cuts p95 by more than half, which means the current
+routing layer implementation is doing too much posting-list work. The next
+engineering target is not model training; it is replacing Python dict/list
+collision routing with a compact array or native implementation, or redesigning
+routing so higher layers reduce work instead of multiplying it.
+
 ## Current Verdict
 
 Hippo/token-field is not beating FAISS as a general vector database yet. The path
 worth pursuing is narrower and more interesting: beat vector-only retrieval on
 agent-memory workloads where the answer depends on learned shapes, stable graph
-growth, bridge memories, and bounded candidate reads.
+growth, bridge memories, and bounded candidate reads. At 75k nodes, the current
+implementation is promising on recall for graph-shaped synthetic labels, but it
+misses the 200 ms latency target unless the token settings are tightened enough
+to collapse recall.
 
 The next fair target is a benchmark with:
 
