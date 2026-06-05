@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -17,6 +18,15 @@ from python.benchmarks.large_pool_retrieval import build_large_pool_case
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, evaluate_one, query_embedding_for, search_rope_delta_grid
 from python.benchmarks.skeleton_memory_index import compact_output, parse_scenarios
 from python.librarian.features import cosine
+
+
+def parse_systems(value: str) -> list[str]:
+    systems = [item.strip() for item in value.split(",") if item.strip()]
+    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid"}
+    unknown = sorted(set(systems) - valid)
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
+    return systems
 
 
 def exact_vector_search(row: dict[str, Any], backend: Any, args: argparse.Namespace) -> tuple[Ranked, dict[str, float], set[str]]:
@@ -44,6 +54,124 @@ def exact_vector_search(row: dict[str, Any], backend: Any, args: argparse.Namesp
         "final_candidate_count": float(len(fetch)),
     }
     return fetch, stats, set()
+
+
+def normalized_float32(values: list[float]) -> Any:
+    import numpy as np
+
+    vector = np.asarray(values, dtype="float32")
+    norm = float(np.linalg.norm(vector))
+    if norm > 0.0 and math.isfinite(norm):
+        vector = vector / norm
+    return vector
+
+
+def build_faiss(row: dict[str, Any], args: argparse.Namespace, kind: str) -> dict[str, Any]:
+    try:
+        import faiss
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("faiss systems require faiss-cpu or faiss-gpu to be installed") from exc
+
+    candidates = list(row.get("candidates", []))
+    if not candidates:
+        raise ValueError("cannot build faiss index with no candidates")
+    vectors = [normalized_float32([float(value) for value in candidate.get("embedding") or []]) for candidate in candidates]
+    dim = int(vectors[0].shape[0])
+    matrix = np.vstack(vectors).astype("float32", copy=False)
+    if kind == "flat":
+        index = faiss.IndexFlatIP(dim)
+    elif kind == "hnsw":
+        index = faiss.IndexHNSWFlat(dim, int(args.faiss_hnsw_m), faiss.METRIC_INNER_PRODUCT)
+        index.hnsw.efConstruction = int(args.faiss_ef_construction)
+        index.hnsw.efSearch = int(args.faiss_ef_search)
+    else:
+        raise ValueError(f"unknown faiss index kind: {kind}")
+    index.add(matrix)
+    return {
+        "index": index,
+        "ids": [str(candidate.get("id") or "") for candidate in candidates],
+        "texts": [str(candidate.get("text") or "") for candidate in candidates],
+        "memory_count": len(candidates),
+        "index_bytes": int(matrix.nbytes),
+    }
+
+
+def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args: argparse.Namespace) -> tuple[Ranked, dict[str, float], set[str]]:
+    started = time.perf_counter()
+    query = normalized_float32(query_embedding_for(row, backend)).reshape(1, -1)
+    fetch_count = max(1, min(int(args.final_fetch), int(built["memory_count"])))
+    scores, indices = built["index"].search(query.astype("float32", copy=False), fetch_count)
+    ranked = []
+    for score, index in zip(scores[0].tolist(), indices[0].tolist()):
+        if index < 0:
+            continue
+        ranked.append((built["ids"][index], float(score), built["texts"][index]))
+    stats = {
+        "latency_ms": (time.perf_counter() - started) * 1000.0,
+        "unique_nodes_read": float(built["memory_count"]),
+        "payload_reads": float(len(ranked)),
+        "node_records_read": float(built["memory_count"]),
+        "edge_reads": 0.0,
+        "edge_expansions": 0.0,
+        "cells_touched": 0.0,
+        "active_query_layers": 0.0,
+        "skipped_layers": 0.0,
+        "raw_final_candidate_count": float(fetch_count),
+        "final_candidate_count": float(len(ranked)),
+    }
+    return ranked, stats, set()
+
+
+def build_hnswlib(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
+    try:
+        import hnswlib
+        import numpy as np
+    except ImportError as exc:
+        raise RuntimeError("hnswlib system requires hnswlib to be installed") from exc
+
+    candidates = list(row.get("candidates", []))
+    if not candidates:
+        raise ValueError("cannot build hnswlib index with no candidates")
+    vectors = [normalized_float32([float(value) for value in candidate.get("embedding") or []]) for candidate in candidates]
+    dim = int(vectors[0].shape[0])
+    matrix = np.vstack(vectors).astype("float32", copy=False)
+    labels = np.arange(len(candidates), dtype=np.int64)
+    index = hnswlib.Index(space="cosine", dim=dim)
+    index.init_index(max_elements=len(candidates), ef_construction=int(args.hnswlib_ef_construction), M=int(args.hnswlib_m))
+    index.add_items(matrix, labels)
+    index.set_ef(int(args.hnswlib_ef_search))
+    return {
+        "index": index,
+        "ids": [str(candidate.get("id") or "") for candidate in candidates],
+        "texts": [str(candidate.get("text") or "") for candidate in candidates],
+        "memory_count": len(candidates),
+        "index_bytes": int(matrix.nbytes),
+    }
+
+
+def hnswlib_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args: argparse.Namespace) -> tuple[Ranked, dict[str, float], set[str]]:
+    started = time.perf_counter()
+    query = normalized_float32(query_embedding_for(row, backend)).reshape(1, -1)
+    fetch_count = max(1, min(int(args.final_fetch), int(built["memory_count"])))
+    labels, distances = built["index"].knn_query(query, k=fetch_count)
+    ranked = []
+    for index, distance in zip(labels[0].tolist(), distances[0].tolist()):
+        ranked.append((built["ids"][index], 1.0 - float(distance), built["texts"][index]))
+    stats = {
+        "latency_ms": (time.perf_counter() - started) * 1000.0,
+        "unique_nodes_read": float(built["memory_count"]),
+        "payload_reads": float(len(ranked)),
+        "node_records_read": float(built["memory_count"]),
+        "edge_reads": 0.0,
+        "edge_expansions": 0.0,
+        "cells_touched": 0.0,
+        "active_query_layers": 0.0,
+        "skipped_layers": 0.0,
+        "raw_final_candidate_count": float(fetch_count),
+        "final_candidate_count": float(len(ranked)),
+    }
+    return ranked, stats, set()
 
 
 def run_repeated(
@@ -78,42 +206,91 @@ def run_dataset(
     work_dir: Path,
     args: argparse.Namespace,
 ) -> dict[str, Any]:
-    exact = run_repeated(
-        "exact_vector",
-        row,
-        lambda item: exact_vector_search(item, backend, args),
-        args,
-    )
-    build_started = time.perf_counter()
-    meta = build_rope_delta_grid(row, backend, work_dir / name / "hippo_rope", args)
-    build_ms = (time.perf_counter() - build_started) * 1000.0
-    hippo = run_repeated(
-        "hippo_rope_grid",
-        row,
-        lambda item: search_rope_delta_grid(item, backend, meta, args),
-        args,
-    )
-    hippo.update(
-        {
-            "build_latency_ms": build_ms,
-            "memory_count": meta["memory_count"],
-            "node_record_count": meta["node_record_count"],
-            "cell_count": meta["cell_count"],
-            "edge_count": meta["edge_count"],
-            "total_index_bytes": meta["grid_bytes"] + meta["payload_bytes"] + meta["records_bytes"] + meta["edges_bytes"],
-        }
-    )
-    exact.update(
-        {
-            "build_latency_ms": 0.0,
-            "memory_count": len(row.get("candidates", [])),
-            "node_record_count": len(row.get("candidates", [])),
-            "cell_count": 0,
-            "edge_count": 0,
-            "total_index_bytes": 0,
-        }
-    )
-    return {"name": name, "systems": [exact, hippo]}
+    systems = []
+    if "exact_vector" in args.systems:
+        exact = run_repeated(
+            "exact_vector",
+            row,
+            lambda item: exact_vector_search(item, backend, args),
+            args,
+        )
+        exact.update(
+            {
+                "build_latency_ms": 0.0,
+                "memory_count": len(row.get("candidates", [])),
+                "node_record_count": len(row.get("candidates", [])),
+                "cell_count": 0,
+                "edge_count": 0,
+                "total_index_bytes": 0,
+            }
+        )
+        systems.append(exact)
+    for system_name, kind in (("faiss_flat", "flat"), ("faiss_hnsw", "hnsw")):
+        if system_name not in args.systems:
+            continue
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(row, args, kind)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        faiss_result = run_repeated(
+            system_name,
+            row,
+            lambda item: faiss_search(item, backend, faiss_built, args),
+            args,
+        )
+        faiss_result.update(
+            {
+                "build_latency_ms": build_ms,
+                "memory_count": faiss_built["memory_count"],
+                "node_record_count": faiss_built["memory_count"],
+                "cell_count": 0,
+                "edge_count": 0,
+                "total_index_bytes": faiss_built["index_bytes"],
+            }
+        )
+        systems.append(faiss_result)
+    if "hnswlib" in args.systems:
+        build_started = time.perf_counter()
+        hnswlib_built = build_hnswlib(row, args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        hnswlib_result = run_repeated(
+            "hnswlib",
+            row,
+            lambda item: hnswlib_search(item, backend, hnswlib_built, args),
+            args,
+        )
+        hnswlib_result.update(
+            {
+                "build_latency_ms": build_ms,
+                "memory_count": hnswlib_built["memory_count"],
+                "node_record_count": hnswlib_built["memory_count"],
+                "cell_count": 0,
+                "edge_count": 0,
+                "total_index_bytes": hnswlib_built["index_bytes"],
+            }
+        )
+        systems.append(hnswlib_result)
+    if "hippo_rope_grid" in args.systems:
+        build_started = time.perf_counter()
+        meta = build_rope_delta_grid(row, backend, work_dir / name / "hippo_rope", args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        hippo = run_repeated(
+            "hippo_rope_grid",
+            row,
+            lambda item: search_rope_delta_grid(item, backend, meta, args),
+            args,
+        )
+        hippo.update(
+            {
+                "build_latency_ms": build_ms,
+                "memory_count": meta["memory_count"],
+                "node_record_count": meta["node_record_count"],
+                "cell_count": meta["cell_count"],
+                "edge_count": meta["edge_count"],
+                "total_index_bytes": meta["grid_bytes"] + meta["payload_bytes"] + meta["records_bytes"] + meta["edges_bytes"],
+            }
+        )
+        systems.append(hippo)
+    return {"name": name, "systems": systems}
 
 
 def write_markdown(result: dict[str, Any], path: Path) -> None:
@@ -125,6 +302,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- growth_count: `{result['growth_count']}`",
         f"- growth_scenarios: `{','.join(result['growth_scenarios'])}`",
         f"- repeat_searches: `{result['repeat_searches']}`",
+        f"- systems: `{','.join(result['systems'])}`",
         f"- dim_count: `{result['dim_count']}`",
         f"- max_cell_scan: `{result['max_cell_scan']}`",
         "",
@@ -170,6 +348,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "growth_count": args.growth_count,
         "growth_scenarios": args.growth_scenarios,
         "repeat_searches": args.repeat_searches,
+        "systems": args.systems,
         "seed": args.seed,
         "dim_count": args.dim_count,
         "layers": args.layers,
@@ -195,6 +374,7 @@ def main() -> None:
     parser.add_argument("--growth-count", type=int, default=7500)
     parser.add_argument("--growth-scenarios", type=parse_scenarios, default=["combined"])
     parser.add_argument("--repeat-searches", type=int, default=3)
+    parser.add_argument("--systems", type=parse_systems, default=["exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid"])
     parser.add_argument("--seed", type=int, default=62000)
     parser.add_argument("--work-dir", default="artifacts/vector_db_compare")
     parser.add_argument("--top-k", type=int, default=8)
@@ -206,6 +386,12 @@ def main() -> None:
     parser.add_argument("--cell-width", type=float, default=0.03125)
     parser.add_argument("--radius", type=int, default=0)
     parser.add_argument("--max-cell-scan", type=int, default=4096)
+    parser.add_argument("--faiss-hnsw-m", type=int, default=32)
+    parser.add_argument("--faiss-ef-construction", type=int, default=200)
+    parser.add_argument("--faiss-ef-search", type=int, default=128)
+    parser.add_argument("--hnswlib-m", type=int, default=32)
+    parser.add_argument("--hnswlib-ef-construction", type=int, default=200)
+    parser.add_argument("--hnswlib-ef-search", type=int, default=128)
     parser.add_argument("--min-layer-delta", type=float, default=0.0075)
     parser.add_argument("--min-query-layers", type=int, default=8)
     parser.add_argument("--max-query-layers", type=int, default=24)

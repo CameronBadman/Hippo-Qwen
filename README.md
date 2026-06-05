@@ -94,16 +94,23 @@ Sparse 1024-dimensional hash embedding check:
 - deterministic repeated search output with zero mismatches
 - combined-growth binary index footprint about `138 MB`
 
-75k exact-vector comparison:
+75k vector-search comparison:
 
 - `python/benchmarks/vector_db_compare.py`
-- compares exact cosine scan against the bounded rope grid on the same
-  synthetic agent-memory workload
+- compares Python exact cosine scan, FAISS flat inner-product search, FAISS
+  HNSW, hnswlib HNSW, and the bounded rope grid on the same synthetic
+  agent-memory workload
 - `--pool-size 75000 --growth-count 7500 --growth-scenarios combined`
 - `--dim-count 1024 --max-cell-scan 4096 --repeat-searches 3`
-- exact vector baseline: baseline p95 about `2769 ms`, combined-growth p95
-  about `2970 ms`, and context recall/precision `0.0` in this workload
-- bounded rope grid: baseline p95 about `40 ms`, combined-growth p95 about
+- Python exact scan: baseline p95 about `2979 ms`, combined-growth p95 about
+  `3275 ms`, and context recall/precision `0.0` in this workload
+- FAISS flat: baseline p95 about `23 ms`, combined-growth p95 about `19 ms`,
+  and context recall/precision `0.0` in this workload
+- FAISS HNSW: baseline p95 about `0.52 ms`, combined-growth p95 about
+  `0.31 ms`, and context recall/precision `0.0` in this workload
+- hnswlib: baseline p95 about `0.27 ms`, combined-growth p95 about `0.34 ms`,
+  and context recall/precision `0.0` in this workload
+- bounded rope grid: baseline p95 about `42 ms`, combined-growth p95 about
   `59 ms`, context recall `1.0`, context precision `1.0`, and deterministic
   repeated output
 - combined-growth rope index footprint about `95 MB`
