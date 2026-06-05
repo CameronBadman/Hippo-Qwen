@@ -10,7 +10,7 @@ from typing import Any
 from python.benchmarks.hierarchical_file_ann import Ranked, project_key
 from python.benchmarks.hippocampus_retrieval import activation_overlap, edge_activation, edge_type_boost, ensure_backend_embeddings, state_score
 from python.benchmarks.rope_delta_grid import query_embedding_for, read_vector
-from python.librarian.features import activation_mask_for_text, cosine, fnv1a64, jaccard
+from python.librarian.features import activation_mask_for_text, cosine, fnv1a64
 
 
 @dataclass(frozen=True)
@@ -71,37 +71,98 @@ def normalized(values: list[float]) -> tuple[float, ...]:
 
 def route_score(left: MemoryGraphNode, right: MemoryGraphNode) -> float:
     semantic = cosine(list(left.embedding), list(right.embedding))
-    lexical = jaccard(left.text, right.text)
     activation = activation_overlap(left.mask, right.mask)
     same_project = 1.0 if left.project_hash == right.project_hash else 0.0
-    return 0.72 * semantic + 0.12 * lexical + 0.08 * activation + 0.05 * same_project + 0.03 * right.importance + right.state
+    return 0.78 * semantic + 0.08 * activation + 0.06 * same_project + 0.04 * right.importance + right.state
+
+
+def projection_value(node: MemoryGraphNode, layer: int, projection: int, dim_count: int) -> float:
+    if dim_count <= 0:
+        return 0.0
+    value = 0.0
+    # A deterministic sparse random projection. Sixteen dimensions is enough
+    # for routing candidates without turning build time into an all-pairs scan.
+    for offset in range(min(16, dim_count)):
+        hashed = fnv1a64(f"route:{layer}:{projection}:{offset}")
+        dim = hashed % dim_count
+        sign = -1.0 if ((hashed >> 17) & 1) else 1.0
+        value += sign * node.embedding[dim]
+    return value
 
 
 def query_node_score(query: str, query_embedding: list[float], query_mask: int, query_project_hash: int, node: MemoryGraphNode) -> float:
-    semantic = cosine(query_embedding, list(node.embedding))
-    lexical = jaccard(query, node.text)
+    semantic = cosine(query_embedding, node.embedding)
     activation = activation_overlap(query_mask, node.mask)
     same_project = 1.0 if query_project_hash == node.project_hash else 0.0
-    return 0.58 * semantic + 0.16 * lexical + 0.12 * activation + 0.06 * same_project + 0.04 * node.importance + node.state
+    return 0.66 * semantic + 0.18 * activation + 0.06 * same_project + 0.04 * node.importance + node.state
+
+
+def objective_seed_nodes(
+    index: AgentMemoryGraphIndex,
+    query: str,
+    query_embedding: list[float],
+    query_mask: int,
+    query_project_hash: int,
+    args: argparse.Namespace,
+) -> list[int]:
+    count = max(0, int(getattr(args, "memory_graph_objective_seeds", 0)))
+    if count <= 0:
+        return []
+    scored = []
+    for node in index.nodes:
+        activation = activation_overlap(query_mask, node.mask)
+        if activation <= 0.0:
+            continue
+        same_project = 1.0 if node.project_hash == query_project_hash else 0.0
+        score = 0.62 * activation + 0.08 * same_project + 0.05 * node.importance + node.state
+        scored.append((score, node.index))
+    if len(scored) < count:
+        for node in index.nodes:
+            if any(node.index == existing for _, existing in scored):
+                continue
+            score = query_node_score(query, query_embedding, query_mask, query_project_hash, node)
+            scored.append((score, node.index))
+    scored.sort(key=lambda item: (-item[0], index.nodes[item[1]].node_id))
+    return [node_index for _, node_index in scored[:count]]
 
 
 def build_routing_edges(nodes: list[MemoryGraphNode], args: argparse.Namespace) -> list[list[list[int]]]:
     layer_count = max(1, int(args.memory_graph_layers))
     max_degree = max(1, int(args.memory_graph_route_degree))
+    projection_count = max(1, int(getattr(args, "memory_graph_projection_count", 3)))
+    projection_window = max(max_degree, int(getattr(args, "memory_graph_projection_window", max_degree * 2)))
+    dim_count = len(nodes[0].embedding) if nodes else 0
     routing: list[list[list[int]]] = [[[] for _ in nodes] for _ in range(layer_count)]
     for layer in range(layer_count):
         layer_nodes = [node.index for node in nodes if node.max_level >= layer]
         if len(layer_nodes) <= 1:
             continue
+        candidate_scores: dict[int, dict[int, float]] = {node_index: {} for node_index in layer_nodes}
+        for projection in range(projection_count):
+            ordered = sorted(
+                layer_nodes,
+                key=lambda node_index: (projection_value(nodes[node_index], layer, projection, dim_count), nodes[node_index].node_id),
+            )
+            positions = {node_index: position for position, node_index in enumerate(ordered)}
+            for source in layer_nodes:
+                position = positions[source]
+                start = max(0, position - projection_window)
+                end = min(len(ordered), position + projection_window + 1)
+                for target_position in range(start, end):
+                    if target_position == position:
+                        continue
+                    target = ordered[target_position]
+                    distance = abs(position - target_position)
+                    candidate_scores[source][target] = candidate_scores[source].get(target, 0.0) + 1.0 / float(1 + distance)
         for source in layer_nodes:
-            scored = []
             source_node = nodes[source]
-            for target in layer_nodes:
-                if target == source:
-                    continue
+            scored = []
+            for target, proximity in candidate_scores[source].items():
                 target_node = nodes[target]
                 jitter = (fnv1a64(f"{source_node.node_id}->{target_node.node_id}:{layer}") & 0xFFFF) / 1_000_000_000.0
-                scored.append((route_score(source_node, target_node) + jitter, target))
+                same_project = 1.0 if source_node.project_hash == target_node.project_hash else 0.0
+                score = proximity + 0.06 * same_project + 0.04 * target_node.importance + target_node.state + jitter
+                scored.append((score, target))
             scored.sort(key=lambda item: (-item[0], nodes[item[1]].node_id))
             routing[layer][source] = [target for _, target in scored[:max_degree]]
     if bool(getattr(args, "memory_graph_reciprocal_routes", True)):
@@ -114,7 +175,7 @@ def build_routing_edges(nodes: list[MemoryGraphNode], args: argparse.Namespace) 
                         if len(routing[layer][target]) > max_degree * 2:
                             routing[layer][target] = sorted(
                                 routing[layer][target],
-                                key=lambda item: (-route_score(nodes[target], nodes[item]), nodes[item].node_id),
+                                key=lambda item: (-(nodes[item].importance + nodes[item].state), nodes[item].node_id),
                             )[: max_degree * 2]
     return routing
 
@@ -219,6 +280,7 @@ def search_layer(
     query_embedding: list[float],
     query_mask: int,
     query_project_hash: int,
+    score_cache: dict[int, float],
     args: argparse.Namespace,
 ) -> tuple[list[tuple[int, float]], int]:
     ef = max(1, int(args.memory_graph_ef))
@@ -229,7 +291,9 @@ def search_layer(
     for seed in seeds:
         if seed < 0 or seed >= len(index.nodes):
             continue
-        score = query_node_score(query, query_embedding, query_mask, query_project_hash, index.nodes[seed])
+        if seed not in score_cache:
+            score_cache[seed] = query_node_score(query, query_embedding, query_mask, query_project_hash, index.nodes[seed])
+        score = score_cache[seed]
         scored[seed] = max(scored.get(seed, -99.0), score)
         frontier.append((score, seed))
     expansions = 0
@@ -243,7 +307,9 @@ def search_layer(
         for target in index.routing_edges[layer][current]:
             if target in visited:
                 continue
-            target_score = query_node_score(query, query_embedding, query_mask, query_project_hash, index.nodes[target])
+            if target not in score_cache:
+                score_cache[target] = query_node_score(query, query_embedding, query_mask, query_project_hash, index.nodes[target])
+            target_score = score_cache[target]
             if target_score > scored.get(target, -99.0):
                 scored[target] = target_score
                 frontier.append((target_score, target))
@@ -313,14 +379,28 @@ def search_agent_memory_graph(row: dict[str, Any], backend: Any, index: AgentMem
     query_mask = activation_mask_for_text(query)
     query_project_hash = fnv1a64(project_key(row["anchor"]))
     started = time.perf_counter()
+    score_cache: dict[int, float] = {}
     total_node_reads = 0
     layer_count = len(index.routing_edges)
-    seeds = [index.entrypoints[-1]]
+    objective_seeds = objective_seed_nodes(index, query, query_embedding_list, query_mask, query_project_hash, args)
+    seeds = [index.entrypoints[-1]] + objective_seeds[: max(0, int(args.memory_graph_beam))]
     candidates: list[tuple[int, float]] = []
     for layer in range(layer_count - 1, -1, -1):
         entry = index.entrypoints[layer]
         layer_seeds = sorted(set(seeds + [entry]))
-        candidates, reads = search_layer(index, layer, layer_seeds, query, query_embedding_list, query_mask, query_project_hash, args)
+        if layer == 0:
+            layer_seeds = sorted(set(layer_seeds + objective_seeds))
+        candidates, reads = search_layer(
+            index,
+            layer,
+            layer_seeds,
+            query,
+            query_embedding_list,
+            query_mask,
+            query_project_hash,
+            score_cache,
+            args,
+        )
         total_node_reads += reads
         seeds = [node_index for node_index, _ in candidates[: max(1, int(args.memory_graph_beam))]]
     best, edge_reads, edge_expansions = apply_truth_expansion(index, candidates, query_mask, args)
