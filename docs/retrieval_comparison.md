@@ -25,6 +25,7 @@ Run shape:
 | token_field | 25.13 | 0.7900 | 0.0669 | 0.6314 | 0.1625 | 0.6914 | 66.9 scored | 1.0000 |
 | hybrid_faiss_hnsw_token, 512 candidates | 43.15 | 1.0000 | 0.0641 | 0.8117 | 0.2000 | 0.8281 | 201.1 scored | 1.0000 |
 | hybrid_faiss_hnsw_token, 128 candidates | 15.93 | 0.9500 | 0.0678 | 0.8117 | 0.2000 | 0.8281 | 74.4 scored | 1.0000 |
+| hybrid_union_token, 512 candidates | 55.08 | 1.0000 | 0.0639 | 0.8217 | 0.2062 | 0.8281 | 493 p95 scored | 1.0000 |
 
 Result: FAISS wins raw latency. The hybrid path is the stronger Hippo direction:
 FAISS/HNSW handles fast candidate generation, and token-field adds a deterministic
@@ -33,6 +34,30 @@ memory-shape bias during reranking. With 128 candidates it stays well under the
 slower than plain FAISS and slightly behind on recall@8/precision@8. With 512
 candidates, candidate recall reaches 1.0 and MRR improves over FAISS on this
 sample, but Python candidate scoring dominates latency.
+
+## Union-Calibrated Holdout Slice
+
+Run shape:
+
+- Train records: first 60 MemoryCraft records, union candidate source, 85 usable
+  QA rows.
+- Holdout records: records 60-99, 37 usable QA rows.
+- Candidate source: FAISS/HNSW plus token-field union.
+- Calibrator: 512 candidates, 768-dimensional Hippo embeddings, 3-layer
+  transformer.
+
+| system | p95 ms | recall@8 | precision@8 | context recall | context precision | mrr |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| faiss_hnsw | 0.32 | 0.9510 | 0.2883 | 0.9367 | 0.3426 | 0.9865 |
+| hybrid_union_token | 14.10 | 0.9468 | 0.2815 | 0.9308 | 0.3254 | 0.9865 |
+| hippo_calibrated_union, recall-biased | 31.74 | 0.9468 | 0.2815 | 0.9552 | 0.2989 | 1.0000 |
+| hippo_calibrated_union, precision-biased | 31.69 | 0.9489 | 0.2849 | 0.9510 | 0.2743 | 1.0000 |
+| hippo_calibrated_union, F1/negative-weight | 30.06 | 0.9448 | 0.2782 | 0.9571 | 0.2432 | 1.0000 |
+
+Result: the union candidate source and calibrator improve MRR and can improve
+context recall, but this small training set does not beat FAISS on top-8
+precision. The next quality target is more training rows and a precision-aware
+context inclusion policy, not more candidate widening.
 
 ## LongMemEval Small Slice
 
