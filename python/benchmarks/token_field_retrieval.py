@@ -28,6 +28,7 @@ from python.benchmarks.memorycraft_retrieval import (
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import build_faiss, build_hnswlib, exact_vector_search, faiss_search, hnswlib_search
+from python.benchmarks.vector_db_compare import metric_cell
 from python.field_memory.token_field import build_token_field_index, search_token_field
 
 
@@ -67,6 +68,7 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "unique_nodes_read": float(stats.get("unique_nodes_read") or 0.0),
         "payload_reads": float(stats.get("payload_reads") or 0.0),
         "node_records_read": float(stats.get("node_records_read") or 0.0),
+        "vector_index_scan_count": float(stats.get("vector_index_scan_count") or 0.0),
         "edge_reads": float(stats.get("edge_reads") or 0.0),
         "edge_expansions": float(stats.get("edge_expansions") or 0.0),
         "routing_layer_reads": float(stats.get("routing_layer_reads") or 0.0),
@@ -265,8 +267,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- node_token_count: `{result['node_token_count']}`",
         f"- routing_layers: `{result['routing_layers']}`",
         "",
-        "| system | records | avg memories | index MB | build ms | p95 ms | cand recall | cand precision | recall@k | precision@k | context recall | routed | read | mrr | deterministic |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | records | avg memories | index MB | build ms | p95 ms | cand recall | cand precision | recall@k | precision@k | context recall | routed | payload p95 | known vector scan p95 | candidates/read p95 | mrr | deterministic |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, rollup in result["rollup"].items():
         metrics = rollup["metrics"]
@@ -281,7 +283,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('routing_candidate_count', {}).get('avg', 0.0):.1f} | "
-            f"{metrics.get('unique_nodes_read', {}).get('avg', 0.0):.1f} | "
+            f"{metric_cell(metrics, 'payload_reads')} | "
+            f"{metric_cell(metrics, 'vector_index_scan_count')} | "
+            f"{metric_cell(metrics, 'node_records_read')} | "
             f"{metrics.get('mrr', {}).get('avg', 0.0):.4f} | {deterministic:.4f} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)

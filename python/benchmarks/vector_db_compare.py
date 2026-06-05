@@ -53,6 +53,7 @@ def exact_vector_search(row: dict[str, Any], backend: Any, args: argparse.Namesp
         "skipped_layers": 0.0,
         "raw_final_candidate_count": float(scanned),
         "final_candidate_count": float(len(fetch)),
+        "vector_index_scan_count": float(scanned),
     }
     return fetch, stats, set()
 
@@ -95,6 +96,7 @@ def build_faiss(row: dict[str, Any], args: argparse.Namespace, kind: str) -> dic
         "texts": [str(candidate.get("text") or "") for candidate in candidates],
         "memory_count": len(candidates),
         "index_bytes": int(matrix.nbytes),
+        "kind": kind,
     }
 
 
@@ -110,9 +112,9 @@ def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args:
         ranked.append((built["ids"][index], float(score), built["texts"][index]))
     stats = {
         "latency_ms": (time.perf_counter() - started) * 1000.0,
-        "unique_nodes_read": float(built["memory_count"]),
+        "unique_nodes_read": float(len(ranked)),
         "payload_reads": float(len(ranked)),
-        "node_records_read": float(built["memory_count"]),
+        "node_records_read": float(len(ranked)),
         "edge_reads": 0.0,
         "edge_expansions": 0.0,
         "cells_touched": 0.0,
@@ -120,6 +122,7 @@ def faiss_search(row: dict[str, Any], backend: Any, built: dict[str, Any], args:
         "skipped_layers": 0.0,
         "raw_final_candidate_count": float(fetch_count),
         "final_candidate_count": float(len(ranked)),
+        "vector_index_scan_count": float(built["memory_count"]) if built.get("kind") == "flat" else -1.0,
     }
     return ranked, stats, set()
 
@@ -161,9 +164,9 @@ def hnswlib_search(row: dict[str, Any], backend: Any, built: dict[str, Any], arg
         ranked.append((built["ids"][index], 1.0 - float(distance), built["texts"][index]))
     stats = {
         "latency_ms": (time.perf_counter() - started) * 1000.0,
-        "unique_nodes_read": float(built["memory_count"]),
+        "unique_nodes_read": float(len(ranked)),
         "payload_reads": float(len(ranked)),
-        "node_records_read": float(built["memory_count"]),
+        "node_records_read": float(len(ranked)),
         "edge_reads": 0.0,
         "edge_expansions": 0.0,
         "cells_touched": 0.0,
@@ -171,8 +174,16 @@ def hnswlib_search(row: dict[str, Any], backend: Any, built: dict[str, Any], arg
         "skipped_layers": 0.0,
         "raw_final_candidate_count": float(fetch_count),
         "final_candidate_count": float(len(ranked)),
+        "vector_index_scan_count": -1.0,
     }
     return ranked, stats, set()
+
+
+def metric_cell(metrics: dict[str, Any], name: str, stat: str = "p95") -> str:
+    value = float(metrics.get(name, {}).get(stat, 0.0))
+    if value < 0.0:
+        return "n/a"
+    return f"{value:.2f}"
 
 
 def run_repeated(
@@ -328,8 +339,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- dim_count: `{result['dim_count']}`",
         f"- max_cell_scan: `{result['max_cell_scan']}`",
         "",
-        "| dataset | system | memories | index MB | build ms | p50 ms | p95 ms | recall | precision | raw candidates p95 | node reads p95 | deterministic |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| dataset | system | memories | index MB | build ms | p50 ms | p95 ms | recall | precision | payload p95 | known vector scan p95 | candidates/read p95 | deterministic |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for dataset in result["datasets"]:
         for system in dataset["systems"]:
@@ -345,8 +356,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
                 f"{metrics.get('latency_ms', {}).get('p95', 0.0):.2f} | "
                 f"{metrics.get('retrieval_context_recall', {}).get('avg', 0.0):.4f} | "
                 f"{metrics.get('retrieval_context_precision', {}).get('avg', 0.0):.4f} | "
-                f"{metrics.get('raw_final_candidate_count', {}).get('p95', 0.0):.2f} | "
-                f"{metrics.get('node_records_read', {}).get('p95', 0.0):.2f} | "
+                f"{metric_cell(metrics, 'payload_reads')} | "
+                f"{metric_cell(metrics, 'vector_index_scan_count')} | "
+                f"{metric_cell(metrics, 'node_records_read')} | "
                 f"{deterministic:.4f} |"
             )
     path.parent.mkdir(parents=True, exist_ok=True)
