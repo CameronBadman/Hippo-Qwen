@@ -30,6 +30,7 @@ class FieldNode:
 class TokenFieldIndex:
     nodes: list[FieldNode]
     inverted: dict[tuple[int, int], list[int]]
+    action_inverted: dict[int, list[int]]
     layered_inverted: dict[tuple[int, int, int], list[int]]
     projection_plan: tuple[tuple[tuple[int, float], ...], ...]
     token_emitter: Any | None
@@ -154,6 +155,7 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
     promotion_bias = float(getattr(args, "promotion_bias", 0.0))
     nodes = []
     inverted: dict[tuple[int, int], list[int]] = {}
+    action_inverted_sets: dict[int, set[int]] = {}
     layered_inverted: dict[tuple[int, int, int], list[int]] = {}
     sorted_candidates = sorted(row.get("candidates") or [], key=lambda item: str(item.get("id") or ""))
     embeddings = [
@@ -190,17 +192,20 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
         nodes.append(node)
         for token in tokens:
             inverted.setdefault((token.action_id, token.bucket), []).append(index)
+            action_inverted_sets.setdefault(token.action_id, set()).add(index)
             for layer in range(level + 1):
                 layered_inverted.setdefault((layer, token.action_id, token.bucket), []).append(index)
     index_bytes = (
         len(nodes) * (64 + 4 * dim_count)
         + sum(len(values) for values in inverted.values()) * 8
+        + sum(len(values) for values in action_inverted_sets.values()) * 4
         + sum(len(values) for values in layered_inverted.values()) * 8
         + sum(len(node.text.encode("utf-8")) + len(node.node_id.encode("utf-8")) for node in nodes)
     )
     return TokenFieldIndex(
         nodes=nodes,
         inverted={key: sorted(values) for key, values in inverted.items()},
+        action_inverted={key: sorted(values) for key, values in action_inverted_sets.items()},
         layered_inverted={key: sorted(values) for key, values in layered_inverted.items()},
         projection_plan=projection_plan,
         token_emitter=token_emitter,
@@ -298,11 +303,10 @@ def route_layers(
 
 
 def action_fallback_candidates(index: TokenFieldIndex, tokens: tuple[FieldToken, ...]) -> dict[int, float]:
-    query_action_ids = {token.action_id for token in tokens}
     candidates: dict[int, float] = {}
-    for node in index.nodes:
-        if any(token.action_id in query_action_ids for token in node.tokens):
-            candidates.setdefault(node.index, 0.0)
+    for token in tokens:
+        for node_index in index.action_inverted.get(token.action_id, []):
+            candidates[node_index] = candidates.get(node_index, 0.0) + 0.05 * token.weight
     return candidates
 
 
