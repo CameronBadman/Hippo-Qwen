@@ -7,7 +7,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from python.librarian.features import DEFAULT_DIMS, clamp, jaccard, tokens
+from python.librarian.features import DEFAULT_DIMS, clamp, jaccard, state_features, tokens
 
 
 @dataclass
@@ -66,6 +66,10 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
     candidate_len = max(1, len(tokens(text)))
     query_len = max(1, len(tokens(query)))
     metadata = candidate.get("metadata") or {}
+    state = state_features({}, candidate)
+    outcome = state["last_outcome_value"]
+    lower_text = text.lower()
+    conflict_terms = ("decoy", "wrong", "conflict", "contradict", "superseded", "obsolete", "ignored")
     values = [
         clamp(float(score), -2.0, 2.0) / 2.0,
         1.0 / float(max(1, rank)),
@@ -83,6 +87,14 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
         1.0 if metadata.get("speaker") else 0.0,
         1.0 if metadata.get("timestamp") else 0.0,
         1.0 if candidate.get("cluster") else 0.0,
+        state["candidate_age_norm"],
+        state["stale_unused_flag"],
+        state["recency_score"],
+        max(0.0, -outcome),
+        max(0.0, outcome),
+        1.0 if any(term in lower_text for term in conflict_terms) else 0.0,
+        clamp(jaccard(query, str(candidate.get("summary") or "")), 0.0, 1.0),
+        clamp(float(candidate.get("base_score_gap") or 0.0), -2.0, 2.0) / 2.0,
     ]
     if feature_dim <= len(values):
         return values[:feature_dim]

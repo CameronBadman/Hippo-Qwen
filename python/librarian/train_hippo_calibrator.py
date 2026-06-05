@@ -43,6 +43,7 @@ class HippoCalibrationDataset(Dataset):
         candidates = torch.zeros((self.max_candidates, self.embedding_dim), dtype=torch.float32)
         features = torch.zeros((self.max_candidates, self.feature_dim), dtype=torch.float32)
         labels = torch.zeros((self.max_candidates,), dtype=torch.float32)
+        weights = torch.ones((self.max_candidates,), dtype=torch.float32)
         mask = torch.zeros((self.max_candidates,), dtype=torch.bool)
         for idx, candidate in enumerate((row.get("candidates") or [])[: self.max_candidates]):
             candidates[idx] = torch.tensor(fit_embedding(candidate.get("embedding") or [], self.embedding_dim), dtype=torch.float32)
@@ -58,8 +59,16 @@ class HippoCalibrationDataset(Dataset):
                 dtype=torch.float32,
             )
             labels[idx] = 1.0 if str(candidate.get("id") or "") in relevant else 0.0
+            weights[idx] = max(0.05, float(candidate.get("label_weight") or 1.0))
             mask[idx] = True
-        return {"query": query_embedding, "candidates": candidates, "features": features, "labels": labels, "mask": mask}
+        return {
+            "query": query_embedding,
+            "candidates": candidates,
+            "features": features,
+            "labels": labels,
+            "weights": weights,
+            "mask": mask,
+        }
 
 
 def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
@@ -68,21 +77,26 @@ def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         "candidates": torch.stack([item["candidates"] for item in batch]),
         "features": torch.stack([item["features"] for item in batch]),
         "labels": torch.stack([item["labels"] for item in batch]),
+        "weights": torch.stack([item["weights"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
     }
 
 
-def ranking_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+def ranking_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, weights: torch.Tensor | None = None) -> torch.Tensor:
     losses = []
-    for item_logits, item_labels, item_mask in zip(logits, labels, mask):
+    if weights is None:
+        weights = torch.ones_like(labels)
+    for item_logits, item_labels, item_mask, item_weights in zip(logits, labels, mask, weights):
         valid_logits = item_logits[item_mask]
         valid_labels = item_labels[item_mask]
+        valid_weights = item_weights[item_mask]
         positive = valid_labels >= 0.5
         negative = valid_labels <= 0.0
         if not positive.any() or not negative.any():
             continue
         diffs = valid_logits[positive].unsqueeze(1) - valid_logits[negative].unsqueeze(0)
-        losses.append(F.softplus(-diffs).mean())
+        pair_weights = valid_weights[positive].unsqueeze(1) * valid_weights[negative].unsqueeze(0)
+        losses.append((F.softplus(-diffs) * pair_weights).sum() / pair_weights.sum().clamp_min(1.0))
     if not losses:
         return logits.sum() * 0
     return torch.stack(losses).mean()
@@ -161,8 +175,13 @@ def train(args: argparse.Namespace) -> None:
             outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
             logits = outputs["relevance_logits"]
             valid = batch["mask"].bool()
-            bce = F.binary_cross_entropy_with_logits(logits[valid], batch["labels"][valid], pos_weight=pos_weight)
-            rank = ranking_loss(logits, batch["labels"], batch["mask"])
+            bce = F.binary_cross_entropy_with_logits(
+                logits[valid],
+                batch["labels"][valid],
+                pos_weight=pos_weight,
+                weight=batch["weights"][valid],
+            )
+            rank = ranking_loss(logits, batch["labels"], batch["mask"], batch["weights"])
             loss = bce + args.rank_loss_weight * rank
             optimizer.zero_grad()
             loss.backward()
@@ -179,8 +198,13 @@ def train(args: argparse.Namespace) -> None:
                 outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
                 logits = outputs["relevance_logits"]
                 valid = batch["mask"].bool()
-                bce = F.binary_cross_entropy_with_logits(logits[valid], batch["labels"][valid], pos_weight=pos_weight)
-                rank = ranking_loss(logits, batch["labels"], batch["mask"])
+                bce = F.binary_cross_entropy_with_logits(
+                    logits[valid],
+                    batch["labels"][valid],
+                    pos_weight=pos_weight,
+                    weight=batch["weights"][valid],
+                )
+                rank = ranking_loss(logits, batch["labels"], batch["mask"], batch["weights"])
                 val_losses.append(float((bce + args.rank_loss_weight * rank).detach().cpu().item()))
                 val_metrics.append(metrics(logits, batch["labels"], batch["mask"], args.top_k))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))

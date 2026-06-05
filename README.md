@@ -175,6 +175,8 @@ python -m python.benchmarks.build_hippo_calibration_data \
   --max-candidates 128 \
   --final-fetch 128 \
   --inject-missing-relevant \
+  --synthetic-hard-negatives 24 \
+  --synthetic-hard-negative-weight 3.0 \
   --output artifacts/hippo_calibrator/memorycraft_train.jsonl
 
 python -m python.librarian.train_hippo_calibrator \
@@ -183,7 +185,8 @@ python -m python.librarian.train_hippo_calibrator \
   --epochs 8 \
   --batch-size 64 \
   --max-candidates 128 \
-  --embedding-dim 1024
+  --embedding-dim 1024 \
+  --feature-dim 24
 
 python -m python.benchmarks.memorycraft_retrieval \
   --hf-file selected/sample.jsonl \
