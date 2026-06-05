@@ -45,6 +45,19 @@ Result summary: deterministic rebuild/search, context recall `1.0`, context
 precision `1.0`, baseline p95 query latency about `32 ms`, and worst growth
 p95 query latency about `70 ms` on the local hash-embedding benchmark.
 
+512-dimensional hash embedding check:
+
+- `--dim-count 512 --layers 96 --radius 0 --min-layer-delta 0.01`
+- 10k pool, 2k growth, one case across all hard growth scenarios
+- context recall `1.0` and context precision `1.0`
+- baseline p95 query latency about `69 ms`
+- worst growth p95 query latency about `204 ms` in `combined`
+- worst growth node-record reads about `197k`
+
+Conclusion: 512 dimensions can keep accuracy, but the current one-node-per-layer
+arena layout needs a stronger layer sampler or posting cap before it is a good
+default at high growth.
+
 ## Reset Boundary
 
 No production memory database runtime is currently present. The next runtime

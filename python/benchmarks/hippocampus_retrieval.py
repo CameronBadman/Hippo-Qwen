@@ -29,8 +29,11 @@ Ranked = list[tuple[str, float, str]]
 class EmbeddingBackend:
     name = "hash"
 
+    def __init__(self, dims: int = 64):
+        self.dims = max(1, int(dims))
+
     def embed_one(self, text: str) -> list[float]:
-        return embed_text(text)
+        return embed_text(text, self.dims)
 
     def embed_many(self, texts: list[str]) -> list[list[float]]:
         return [self.embed_one(text) for text in texts]
@@ -40,6 +43,7 @@ class CachedEmbeddingBackend:
     def __init__(self, backend: EmbeddingBackend):
         self.backend = backend
         self.name = backend.name
+        self.dims = getattr(backend, "dims", 0)
         self.cache: dict[str, list[float]] = {}
 
     def embed_one(self, text: str) -> list[float]:
@@ -95,7 +99,8 @@ class HippoEncoderBackend(EmbeddingBackend):
 
 def build_embedding_backend(args: argparse.Namespace) -> CachedEmbeddingBackend:
     if args.embedding_backend == "hash":
-        return CachedEmbeddingBackend(EmbeddingBackend())
+        dims = int(getattr(args, "hash_dims", 0) or getattr(args, "dim_count", 0) or 64)
+        return CachedEmbeddingBackend(EmbeddingBackend(dims))
     if not args.hippo_checkpoint:
         raise ValueError("--hippo-checkpoint is required when --embedding-backend hippo")
     return CachedEmbeddingBackend(
@@ -114,7 +119,7 @@ def text_for_embedding(card: dict[str, Any]) -> str:
 
 
 def ensure_backend_embeddings(row: dict[str, Any], backend: CachedEmbeddingBackend) -> dict[str, Any]:
-    if backend.name == "hash":
+    if backend.name == "hash" and int(getattr(backend, "dims", 64) or 64) == 64:
         return row
     out = dict(row)
     anchor = dict(row["anchor"])
