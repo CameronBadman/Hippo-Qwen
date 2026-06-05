@@ -323,10 +323,14 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
     bucket_radius = max(0, int(args.bucket_radius))
     routing_frontier, route_stats = route_layers(index, tokens, bucket_radius, args)
     layer_zero = layer_collisions(index, tokens, 0, bucket_radius)
+    pre_filter_limit = int(getattr(args, "pre_filter_candidates", 0) or 0)
+    layer_zero_items = sorted(layer_zero.items(), key=lambda item: (-item[1], item[0]))
+    if pre_filter_limit > 0:
+        layer_zero_items = layer_zero_items[: max(1, pre_filter_limit)]
     min_collision = max(0.0, float(getattr(args, "include_min_collision", 0.0)))
     min_overlap = max(0.0, float(getattr(args, "include_min_overlap", 0.0)))
     candidates = {}
-    for node_index, collision in layer_zero.items():
+    for node_index, collision in layer_zero_items:
         routed_bonus = routing_frontier.get(node_index, 0.0)
         node = index.nodes[node_index]
         if collision < min_collision:
@@ -366,6 +370,7 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         "routing_layer_reads": route_stats["routing_layer_reads"],
         "routing_candidate_count": route_stats["routing_candidate_count"],
         "raw_final_candidate_count": float(raw_candidate_count),
+        "pre_filter_candidate_count": float(len(layer_zero)),
         "final_candidate_count": float(len(fetch)),
         "calibrator_latency_ms": 0.0,
     }

@@ -443,6 +443,7 @@ def main() -> None:
     parser.add_argument("--bucket-radius", type=int, default=2)
     parser.add_argument("--min-candidates", type=int, default=16)
     parser.add_argument("--max-candidates", type=int, default=512)
+    parser.add_argument("--pre-filter-candidates", type=int, default=2048)
     parser.add_argument("--routing-layers", type=int, default=8)
     parser.add_argument("--promotion-probability", type=float, default=0.45)
     parser.add_argument("--promotion-bias", type=float, default=0.12)
