@@ -226,6 +226,11 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
                 "build_latency_ms": build_ms,
                 "memory_count": len(index.nodes),
                 "total_index_bytes": int(index.index_bytes) + int(faiss_built["index_bytes"]),
+                "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+                "hybrid_source_weight": float(args.hybrid_source_weight),
+                "hybrid_semantic_weight": float(args.hybrid_semantic_weight),
+                "hybrid_field_weight": float(args.hybrid_field_weight),
+                "hybrid_activation_weight": float(args.hybrid_activation_weight),
             }
         )
 
@@ -427,6 +432,10 @@ def main() -> None:
     parser.add_argument("--token-encoder-checkpoint", default="")
     parser.add_argument("--token-encoder-device", default="")
     parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-source-weight", type=float, default=0.75)
+    parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
+    parser.add_argument("--hybrid-field-weight", type=float, default=0.08)
+    parser.add_argument("--hybrid-activation-weight", type=float, default=0.02)
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     parser.add_argument("--print-records", action="store_true")

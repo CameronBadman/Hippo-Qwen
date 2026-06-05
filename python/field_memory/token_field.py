@@ -341,6 +341,11 @@ def score_token_field_candidates(
     index: TokenFieldIndex,
     candidates: dict[int, float],
     args: Any,
+    *,
+    field_weight: float = 0.50,
+    semantic_weight: float = 0.30,
+    activation_weight: float = 0.14,
+    source_weight: float = 0.06,
 ) -> list[tuple[str, float, str]]:
     bucket_radius = max(0, int(args.bucket_radius))
     query_mask = activation_mask_for_text(query)
@@ -350,7 +355,12 @@ def score_token_field_candidates(
         field = overlap_score(tokens, node, bucket_radius)
         semantic = cosine(query_embedding, node.embedding)
         activation = (query_mask & node.mask).bit_count() / max(1, query_mask.bit_count())
-        score = 0.50 * field + 0.30 * semantic + 0.14 * activation + 0.06 * float(source_score)
+        score = (
+            float(field_weight) * field
+            + float(semantic_weight) * semantic
+            + float(activation_weight) * activation
+            + float(source_weight) * float(source_score)
+        )
         scored.append((node.node_id, float(score), node.text))
     scored.sort(key=lambda item: (-item[1], item[0]))
     return scored
@@ -368,7 +378,18 @@ def search_token_field_candidates(
     max_candidates = max(1, int(getattr(args, "max_candidates", 192)))
     limited = deterministic_take(candidate_scores, max_candidates)
     score_started = time.perf_counter()
-    scored = score_token_field_candidates(query, query_embedding, tokens, index, limited, args)
+    scored = score_token_field_candidates(
+        query,
+        query_embedding,
+        tokens,
+        index,
+        limited,
+        args,
+        field_weight=float(getattr(args, "hybrid_field_weight", 0.08)),
+        semantic_weight=float(getattr(args, "hybrid_semantic_weight", 0.15)),
+        activation_weight=float(getattr(args, "hybrid_activation_weight", 0.02)),
+        source_weight=float(getattr(args, "hybrid_source_weight", 0.75)),
+    )
     marks["candidate_score_ms"] = (time.perf_counter() - score_started) * 1000.0
     fetch = scored[: max(1, int(args.final_fetch))]
     stats = {

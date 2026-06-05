@@ -379,6 +379,11 @@ def run_dataset(
                 "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
                 "edge_count": 0,
                 "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
+                "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+                "hybrid_source_weight": float(args.hybrid_source_weight),
+                "hybrid_semantic_weight": float(args.hybrid_semantic_weight),
+                "hybrid_field_weight": float(args.hybrid_field_weight),
+                "hybrid_activation_weight": float(args.hybrid_activation_weight),
             }
         )
         systems.append(hybrid_result)
@@ -512,6 +517,10 @@ def main() -> None:
     parser.add_argument("--token-encoder-checkpoint", default="")
     parser.add_argument("--token-encoder-device", default="")
     parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-source-weight", type=float, default=0.75)
+    parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
+    parser.add_argument("--hybrid-field-weight", type=float, default=0.08)
+    parser.add_argument("--hybrid-activation-weight", type=float, default=0.02)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
