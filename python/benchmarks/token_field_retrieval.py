@@ -40,7 +40,28 @@ def parse_systems(value: str) -> list[str]:
     return systems
 
 
-def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], args: argparse.Namespace) -> dict[str, float]:
+def candidate_pool_metrics(row: dict[str, Any], ranked: Ranked, candidate_ids: set[str]) -> dict[str, float]:
+    relevant = {str(item) for item in (row.get("retrieval_task") or {}).get("relevant_ids") or []}
+    candidates = {str(item) for item in candidate_ids}
+    if not candidates:
+        candidates = {str(item[0]) for item in ranked}
+    if not relevant:
+        return {
+            "candidate_recall": 0.0,
+            "candidate_precision": 0.0,
+            "candidate_count": float(len(candidates)),
+            "candidate_hits": 0.0,
+        }
+    hits = len(relevant & candidates)
+    return {
+        "candidate_recall": hits / len(relevant),
+        "candidate_precision": hits / max(1, len(candidates)),
+        "candidate_count": float(len(candidates)),
+        "candidate_hits": float(hits),
+    }
+
+
+def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], candidate_ids: set[str], args: argparse.Namespace) -> dict[str, float]:
     out = {
         "latency_ms": float(stats.get("latency_ms") or 0.0),
         "unique_nodes_read": float(stats.get("unique_nodes_read") or 0.0),
@@ -55,6 +76,7 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "calibrator_latency_ms": float(stats.get("calibrator_latency_ms") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
+    out.update(candidate_pool_metrics(row, ranked, candidate_ids))
     return out
 
 
@@ -69,9 +91,9 @@ def repeated(
         signatures = []
         metrics = []
         for _ in range(max(1, int(args.repeat_searches))):
-            ranked, stats, _ = search(row)
+            ranked, stats, candidate_ids = search(row)
             signatures.append(ranked_signature(ranked))
-            metrics.append(evaluate_search(row, ranked, stats, args))
+            metrics.append(evaluate_search(row, ranked, stats, candidate_ids, args))
         if any(signature != signatures[0] for signature in signatures[1:]):
             mismatches += 1
         rows.append(metrics[-1])
@@ -209,8 +231,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- node_token_count: `{result['node_token_count']}`",
         f"- routing_layers: `{result['routing_layers']}`",
         "",
-        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | routed | read | mrr | deterministic |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | records | avg memories | index MB | build ms | p95 ms | cand recall | cand precision | recall@k | precision@k | context recall | routed | read | mrr | deterministic |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, rollup in result["rollup"].items():
         metrics = rollup["metrics"]
@@ -219,10 +241,11 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"| {name} | {rollup['record_count']} | {rollup['memory_count_avg']:.1f} | "
             f"{rollup['index_mb_avg']:.2f} | {rollup['build_latency_ms_avg']:.2f} | "
             f"{metrics.get('latency_ms', {}).get('p95', 0.0):.2f} | "
+            f"{metrics.get('candidate_recall', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('candidate_precision', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('recall_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('routing_candidate_count', {}).get('avg', 0.0):.1f} | "
             f"{metrics.get('unique_nodes_read', {}).get('avg', 0.0):.1f} | "
             f"{metrics.get('mrr', {}).get('avg', 0.0):.4f} | {deterministic:.4f} |"

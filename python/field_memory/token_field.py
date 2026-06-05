@@ -339,4 +339,4 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         "final_candidate_count": float(len(fetch)),
         "calibrator_latency_ms": 0.0,
     }
-    return fetch, stats, set()
+    return fetch, stats, {index.nodes[node_index].node_id for node_index in candidates}

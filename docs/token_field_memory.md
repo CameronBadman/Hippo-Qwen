@@ -68,6 +68,11 @@ encoder direction:
 4. Compare against exact vector, HNSW/FAISS-style baselines, and the prior Hippo
    rope-grid experiments.
 
+During this stage, candidate-pool recall is more important than final top-k
+precision. The index should first avoid dropping relevant memories. Precision can
+then be improved by training the encoder, adding better include gates, and using
+a stronger reranker.
+
 The benchmark entrypoint is:
 
 ```bash
