@@ -13,20 +13,28 @@ if __package__ is None or __package__ == "":
 from python.benchmarks.hard_memory_regression import aggregate
 from python.benchmarks.hierarchical_file_ann import Ranked, ranked_signature
 from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ensure_backend_embeddings
-from python.benchmarks.rope_delta_grid import build_rope_delta_grid, search_rope_delta_grid
+from python.benchmarks.rope_delta_grid import build_rope_delta_grid, query_embedding_for, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import (
     build_faiss,
     build_hnswlib,
     exact_vector_search,
     faiss_search,
     hnswlib_search,
-    parse_systems,
 )
 from python.librarian.features import activation_mask_for_text, fnv1a64, tokens
 
 
 DEFAULT_HF_REPO = "daven3/MemoryCraft"
 DEFAULT_HF_FILE = "selected/sample.jsonl"
+
+
+def parse_systems(value: str) -> list[str]:
+    systems = [item.strip() for item in value.split(",") if item.strip()]
+    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "hippo_calibrated"}
+    unknown = sorted(set(systems) - valid)
+    if unknown:
+        raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
+    return systems
 
 
 def load_dataset_path(args: argparse.Namespace) -> Path:
@@ -318,6 +326,7 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "edge_expansions": float(stats.get("edge_expansions") or 0.0),
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or len(ranked)),
+        "calibrator_latency_ms": float(stats.get("calibrator_latency_ms") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
     return out
@@ -350,7 +359,60 @@ def index_size(meta: dict[str, Any]) -> int:
     return int(meta.get("grid_bytes", 0)) + int(meta.get("payload_bytes", 0)) + int(meta.get("records_bytes", 0)) + int(meta.get("edges_bytes", 0))
 
 
-def run_record(record: dict[str, Any], record_number: int, backend: Any, work_dir: Path, args: argparse.Namespace) -> dict[str, Any] | None:
+def calibrator_payload(
+    row: dict[str, Any],
+    ranked: Ranked,
+    id_to_candidate: dict[str, dict[str, Any]],
+    backend: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    candidates = []
+    for rank, (candidate_id, score, _) in enumerate(ranked[: int(args.calibrator_max_candidates)], start=1):
+        candidate = dict(id_to_candidate.get(candidate_id) or {})
+        if not candidate:
+            continue
+        candidate["base_rank"] = rank
+        candidate["base_score"] = float(score)
+        candidates.append(candidate)
+    task = row.get("retrieval_task") or {}
+    return {
+        "query": str(task.get("query") or ""),
+        "answer": str(task.get("answer") or ""),
+        "qa_id": str(task.get("qa_id") or ""),
+        "question_type": str(task.get("question_type") or ""),
+        "query_embedding": query_embedding_for(row, backend),
+        "budget": int(task.get("budget") or args.budget),
+        "relevant_ids": list(task.get("relevant_ids") or []),
+        "candidates": candidates,
+    }
+
+
+def calibrated_search(
+    row: dict[str, Any],
+    backend: Any,
+    meta: dict[str, Any],
+    calibrator: Any,
+    id_to_candidate: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float], set[str]]:
+    from python.librarian.hippo_calibrator import rerank_with_calibrator
+
+    started = time.perf_counter()
+    raw_ranked, stats, protected = search_rope_delta_grid(row, backend, meta, args)
+    ranked = rerank_with_calibrator(calibrator, calibrator_payload(row, raw_ranked, id_to_candidate, backend, args))
+    out = dict(stats)
+    out["calibrator_latency_ms"] = (time.perf_counter() - started) * 1000.0 - float(stats.get("latency_ms") or 0.0)
+    return ranked, out, protected
+
+
+def run_record(
+    record: dict[str, Any],
+    record_number: int,
+    backend: Any,
+    work_dir: Path,
+    args: argparse.Namespace,
+    calibrator: Any = None,
+) -> dict[str, Any] | None:
     mode = unit_mode(record, args.unit)
     base = record_index_row(record, mode)
     if len(base.get("candidates") or []) < 1:
@@ -374,6 +436,7 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
     for row in qa_rows:
         row["anchor"] = embedded_base["anchor"]
         row["candidates"] = embedded_base["candidates"]
+    id_to_candidate = {str(candidate.get("id") or ""): dict(candidate) for candidate in embedded_base.get("candidates", [])}
 
     systems = []
     if "exact_vector" in args.systems:
@@ -423,25 +486,48 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
                 "total_index_bytes": int(built.get("index_bytes") or 0),
             }
         )
-    if "hippo_rope_grid" in args.systems:
+    if "hippo_rope_grid" in args.systems or "hippo_calibrated" in args.systems:
         started = time.perf_counter()
         meta = build_rope_delta_grid(embedded_base, backend, work_dir / f"record_{record_number:05d}" / "hippo_rope", args)
         build_ms = (time.perf_counter() - started) * 1000.0
-        rows, mismatches = run_queries(qa_rows, lambda row: search_rope_delta_grid(row, backend, meta, args), args)
-        systems.append(
-            {
-                "name": "hippo_rope_grid",
-                "metrics": aggregate(rows),
-                "_metric_rows": rows,
-                "determinism_mismatches": mismatches,
-                "build_latency_ms": build_ms,
-                "memory_count": int(meta["memory_count"]),
-                "node_record_count": int(meta["node_record_count"]),
-                "cell_count": int(meta["cell_count"]),
-                "edge_count": int(meta["edge_count"]),
-                "total_index_bytes": index_size(meta),
-            }
-        )
+        if "hippo_rope_grid" in args.systems:
+            rows, mismatches = run_queries(qa_rows, lambda row: search_rope_delta_grid(row, backend, meta, args), args)
+            systems.append(
+                {
+                    "name": "hippo_rope_grid",
+                    "metrics": aggregate(rows),
+                    "_metric_rows": rows,
+                    "determinism_mismatches": mismatches,
+                    "build_latency_ms": build_ms,
+                    "memory_count": int(meta["memory_count"]),
+                    "node_record_count": int(meta["node_record_count"]),
+                    "cell_count": int(meta["cell_count"]),
+                    "edge_count": int(meta["edge_count"]),
+                    "total_index_bytes": index_size(meta),
+                }
+            )
+        if "hippo_calibrated" in args.systems:
+            if calibrator is None:
+                raise ValueError("--calibrator-checkpoint is required for hippo_calibrated")
+            rows, mismatches = run_queries(
+                qa_rows,
+                lambda row: calibrated_search(row, backend, meta, calibrator, id_to_candidate, args),
+                args,
+            )
+            systems.append(
+                {
+                    "name": "hippo_calibrated",
+                    "metrics": aggregate(rows),
+                    "_metric_rows": rows,
+                    "determinism_mismatches": mismatches,
+                    "build_latency_ms": build_ms,
+                    "memory_count": int(meta["memory_count"]),
+                    "node_record_count": int(meta["node_record_count"]),
+                    "cell_count": int(meta["cell_count"]),
+                    "edge_count": int(meta["edge_count"]),
+                    "total_index_bytes": index_size(meta),
+                }
+            )
 
     return {
         "uid": str(record.get("uid") or ""),
@@ -539,11 +625,21 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     dataset_path = load_dataset_path(args)
     records = load_records(dataset_path, args.limit_records)
     backend = build_embedding_backend(args)
+    calibrator = None
+    if "hippo_calibrated" in args.systems:
+        if not args.calibrator_checkpoint:
+            raise ValueError("--calibrator-checkpoint is required when --systems includes hippo_calibrated")
+        import torch
+
+        from python.librarian.hippo_calibrator import load_calibrator
+
+        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        calibrator = load_calibrator(args.calibrator_checkpoint, device=device)
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     evaluated = []
     for index, record in enumerate(records):
-        result = run_record(record, index, backend, work_dir, args)
+        result = run_record(record, index, backend, work_dir, args, calibrator)
         if result is not None:
             evaluated.append(result)
     question_count = sum(int(record["question_count"]) for record in evaluated)
@@ -557,6 +653,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "unit": args.unit,
         "systems": args.systems,
         "embedding_backend": backend.name,
+        "calibrator_checkpoint": args.calibrator_checkpoint,
         "dim_count": args.dim_count,
         "layers": args.layers,
         "layer_schedule": args.layer_schedule,
@@ -614,6 +711,8 @@ def main() -> None:
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--final-fetch", type=int, default=96)
+    parser.add_argument("--calibrator-checkpoint", default="")
+    parser.add_argument("--calibrator-max-candidates", type=int, default=128)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")

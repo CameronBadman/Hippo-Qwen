@@ -153,6 +153,46 @@ uv --cache-dir /tmp/uv-cache run \
   --output-md artifacts/memorycraft_retrieval/result.md
 ```
 
+Hippo calibration transformer:
+
+- `python/librarian/hippo_calibrator.py` defines a small transformer reranker
+  over Hippo candidate neighborhoods
+- `python/benchmarks/build_hippo_calibration_data.py` builds supervised
+  MemoryCraft rows from raw Hippo retrieval, including base rank/score and
+  evidence labels
+- `python/librarian/train_hippo_calibrator.py` trains the reranker with BCE plus
+  pairwise ranking loss
+- `python/benchmarks/memorycraft_retrieval.py` supports `hippo_calibrated` when
+  `--calibrator-checkpoint` is provided
+
+Colab-oriented flow:
+
+```bash
+python -m python.benchmarks.build_hippo_calibration_data \
+  --hf-file selected/sample.jsonl \
+  --limit-records 20 \
+  --limit-questions 80 \
+  --max-candidates 128 \
+  --final-fetch 128 \
+  --inject-missing-relevant \
+  --output artifacts/hippo_calibrator/memorycraft_train.jsonl
+
+python -m python.librarian.train_hippo_calibrator \
+  --dataset artifacts/hippo_calibrator/memorycraft_train.jsonl \
+  --output artifacts/hippo_calibrator/calibrator.pt \
+  --epochs 8 \
+  --batch-size 64 \
+  --max-candidates 128 \
+  --embedding-dim 1024
+
+python -m python.benchmarks.memorycraft_retrieval \
+  --hf-file selected/sample.jsonl \
+  --limit-records 3 \
+  --limit-questions 20 \
+  --systems hippo_rope_grid,hippo_calibrated \
+  --calibrator-checkpoint artifacts/hippo_calibrator/calibrator.pt
+```
+
 ## Reset Boundary
 
 No production memory database runtime is currently present. The next runtime
