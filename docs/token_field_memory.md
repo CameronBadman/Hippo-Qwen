@@ -21,12 +21,37 @@ radius search. The current implementation uses deterministic sparse random
 projections as a non-neural baseline. A trained encoder can replace token
 emission later without changing the index contract.
 
+## Layered Index
+
+The index has a dense layer 0 and sparse routing layers above it.
+
+- Layer 0 contains every memory node.
+- Higher layers contain promoted routing nodes.
+- Promotion is deterministic pseudo-random: stable node hashes are compared
+  against a configured promotion probability.
+- Promoted nodes appear in every layer from 0 through their maximum level.
+- Each layer has its own collision table keyed by
+  `(layer, action_id, bucket)`.
+
+Search runs high-to-low:
+
+1. Emit query field tokens.
+2. Search the highest sparse collision layers and keep a deterministic beam.
+3. Descend through routing layers, carrying the beam as routing pressure.
+4. Search layer 0.
+5. Include or reject candidates using collision and optional overlap gates.
+6. Rerank accepted candidates.
+
+This is the missing structure behind the token-field idea: the graph/index is a
+layered collision system, not just a flat inverted list.
+
 ## Determinism
 
 The prototype is deterministic by design:
 
 - Projection plans are derived from stable FNV-1a hashes.
 - Lexical boosts map text tokens to stable sparse action ids.
+- Promotion levels are derived from stable node hashes.
 - Candidate pruning is sorted by collision strength and node index.
 - Ranked results are tie-broken by node id.
 
@@ -48,4 +73,3 @@ The benchmark entrypoint is:
 ```bash
 python -m python.benchmarks.token_field_retrieval
 ```
-

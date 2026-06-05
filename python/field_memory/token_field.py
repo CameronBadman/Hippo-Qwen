@@ -23,13 +23,16 @@ class FieldNode:
     embedding: tuple[float, ...]
     mask: int
     tokens: tuple[FieldToken, ...]
+    level: int
 
 
 @dataclass
 class TokenFieldIndex:
     nodes: list[FieldNode]
     inverted: dict[tuple[int, int], list[int]]
+    layered_inverted: dict[tuple[int, int, int], list[int]]
     projection_plan: tuple[tuple[tuple[int, float], ...], ...]
+    layer_count: int
     build_latency_ms: float
     index_bytes: int
 
@@ -81,6 +84,33 @@ def bucket_for(value: float, bucket_width: float) -> int:
     return int(math.floor(float(value) / width))
 
 
+def hash_unit(key: str) -> float:
+    return (fnv1a64(key) >> 11) / float(1 << 53)
+
+
+def promoted_level(
+    node_id: str,
+    text: str,
+    tokens: tuple[FieldToken, ...],
+    layer_count: int,
+    promotion_probability: float,
+    promotion_bias: float,
+) -> int:
+    layer_count = max(1, int(layer_count))
+    probability = min(0.95, max(0.0, float(promotion_probability)))
+    if layer_count <= 1 or probability <= 0.0:
+        return 0
+    mean_weight = sum(token.weight for token in tokens) / max(1, len(tokens))
+    text_bias = (fnv1a64(f"field-importance:{node_id}:{len(text)}") % 1000) / 1000.0
+    biased_probability = min(0.95, probability * (1.0 + max(0.0, promotion_bias) * (0.5 * mean_weight + 0.5 * text_bias)))
+    level = 0
+    for candidate_level in range(1, layer_count):
+        if hash_unit(f"field-promote:{node_id}:{candidate_level}") > biased_probability:
+            break
+        level = candidate_level
+    return level
+
+
 def lexical_action_boosts(text: str, action_count: int) -> tuple[float, ...]:
     # Sparse lexical boosts keep this as a random action-field retriever while
     # giving exact names, dates, and entities a stable way to influence tokens.
@@ -117,8 +147,12 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
     started = time.perf_counter()
     dim_count = max(8, int(args.dim_count))
     projection_plan = make_projection_plan(dim_count, int(args.action_count), int(args.projection_width))
+    layer_count = max(1, int(getattr(args, "routing_layers", 1)))
+    promotion_probability = float(getattr(args, "promotion_probability", 0.35))
+    promotion_bias = float(getattr(args, "promotion_bias", 0.0))
     nodes = []
     inverted: dict[tuple[int, int], list[int]] = {}
+    layered_inverted: dict[tuple[int, int, int], list[int]] = {}
     for index, candidate in enumerate(sorted(row.get("candidates") or [], key=lambda item: str(item.get("id") or ""))):
         node_id = str(candidate.get("id") or "")
         text = str(candidate.get("text") or "")
@@ -130,6 +164,7 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
             int(args.node_token_count),
             float(args.bucket_width),
         )
+        level = promoted_level(node_id, text, tokens, layer_count, promotion_probability, promotion_bias)
         node = FieldNode(
             index=index,
             node_id=node_id,
@@ -137,19 +172,25 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
             embedding=embedding,
             mask=activation_mask_for_text(text),
             tokens=tokens,
+            level=level,
         )
         nodes.append(node)
         for token in tokens:
             inverted.setdefault((token.action_id, token.bucket), []).append(index)
+            for layer in range(level + 1):
+                layered_inverted.setdefault((layer, token.action_id, token.bucket), []).append(index)
     index_bytes = (
         len(nodes) * (64 + 4 * dim_count)
         + sum(len(values) for values in inverted.values()) * 8
+        + sum(len(values) for values in layered_inverted.values()) * 8
         + sum(len(node.text.encode("utf-8")) + len(node.node_id.encode("utf-8")) for node in nodes)
     )
     return TokenFieldIndex(
         nodes=nodes,
         inverted={key: sorted(values) for key, values in inverted.items()},
+        layered_inverted={key: sorted(values) for key, values in layered_inverted.items()},
         projection_plan=projection_plan,
+        layer_count=layer_count,
         build_latency_ms=(time.perf_counter() - started) * 1000.0,
         index_bytes=index_bytes,
     )
@@ -182,6 +223,66 @@ def overlap_score(query_tokens_: tuple[FieldToken, ...], node: FieldNode, bucket
     return score
 
 
+def layer_collisions(
+    index: TokenFieldIndex,
+    tokens: tuple[FieldToken, ...],
+    layer: int,
+    bucket_radius: int,
+    allowed: set[int] | None = None,
+) -> dict[int, float]:
+    collisions: dict[int, float] = {}
+    for token in tokens:
+        for delta in range(-bucket_radius, bucket_radius + 1):
+            key = (layer, token.action_id, token.bucket + delta)
+            for node_index in index.layered_inverted.get(key, []):
+                if allowed is not None and node_index not in allowed:
+                    continue
+                collisions[node_index] = collisions.get(node_index, 0.0) + token.weight / float(1 + abs(delta))
+    return collisions
+
+
+def deterministic_take(candidates: dict[int, float], limit: int) -> dict[int, float]:
+    limit = max(1, int(limit))
+    if len(candidates) <= limit:
+        return dict(sorted(candidates.items(), key=lambda item: item[0]))
+    return dict(sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:limit])
+
+
+def route_layers(
+    index: TokenFieldIndex,
+    tokens: tuple[FieldToken, ...],
+    bucket_radius: int,
+    args: Any,
+) -> tuple[dict[int, float], dict[str, float]]:
+    if index.layer_count <= 1:
+        return {}, {"routing_layer_reads": 0.0, "routing_candidate_count": 0.0}
+    beam_width = max(1, int(getattr(args, "routing_beam_width", 48)))
+    frontier: dict[int, float] = {}
+    layer_reads = 0
+    for layer in range(index.layer_count - 1, 0, -1):
+        collisions = layer_collisions(index, tokens, layer, bucket_radius)
+        layer_reads += 1
+        if frontier:
+            for node_index, score in frontier.items():
+                if index.nodes[node_index].level >= layer - 1:
+                    collisions[node_index] = collisions.get(node_index, 0.0) + 0.5 * score
+        if collisions:
+            frontier = deterministic_take(collisions, beam_width)
+    return frontier, {
+        "routing_layer_reads": float(layer_reads),
+        "routing_candidate_count": float(len(frontier)),
+    }
+
+
+def action_fallback_candidates(index: TokenFieldIndex, tokens: tuple[FieldToken, ...]) -> dict[int, float]:
+    query_action_ids = {token.action_id for token in tokens}
+    candidates: dict[int, float] = {}
+    for node in index.nodes:
+        if any(token.action_id in query_action_ids for token in node.tokens):
+            candidates.setdefault(node.index, 0.0)
+    return candidates
+
+
 def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex, args: Any) -> tuple[list[tuple[str, float, str]], dict[str, float], set[str]]:
     started = time.perf_counter()
     task = row.get("retrieval_task") or {}
@@ -189,23 +290,31 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
     raw_embedding = task.get("query_embedding") or backend.embed_one(query)
     query_embedding = fit_embedding([float(value) for value in raw_embedding], int(args.dim_count))
     tokens = query_tokens(query, query_embedding, index.projection_plan, args)
-    candidates: dict[int, float] = {}
     bucket_radius = max(0, int(args.bucket_radius))
-    for token in tokens:
-        for delta in range(-bucket_radius, bucket_radius + 1):
-            for node_index in index.inverted.get((token.action_id, token.bucket + delta), []):
-                candidates[node_index] = candidates.get(node_index, 0.0) + token.weight / float(1 + abs(delta))
+    routing_frontier, route_stats = route_layers(index, tokens, bucket_radius, args)
+    layer_zero = layer_collisions(index, tokens, 0, bucket_radius)
+    min_collision = max(0.0, float(getattr(args, "include_min_collision", 0.0)))
+    min_overlap = max(0.0, float(getattr(args, "include_min_overlap", 0.0)))
+    candidates = {}
+    for node_index, collision in layer_zero.items():
+        routed_bonus = routing_frontier.get(node_index, 0.0)
+        node = index.nodes[node_index]
+        if collision < min_collision:
+            continue
+        if min_overlap > 0.0 and overlap_score(tokens, node, bucket_radius) < min_overlap:
+            continue
+        candidates[node_index] = collision + 0.35 * routed_bonus
+    if routing_frontier:
+        for node_index, score in routing_frontier.items():
+            if node_index in layer_zero:
+                candidates.setdefault(node_index, layer_zero[node_index] + 0.35 * score)
     if len(candidates) < int(args.min_candidates):
         # Deterministic fallback: widen the field by using action-id collisions
         # only. This preserves the "shape token" path while avoiding empty hits.
-        query_action_ids = {token.action_id for token in tokens}
-        for node in index.nodes:
-            if any(token.action_id in query_action_ids for token in node.tokens):
-                candidates.setdefault(node.index, 0.0)
+        candidates.update(action_fallback_candidates(index, tokens))
     raw_candidate_count = len(candidates)
     max_candidates = max(1, int(getattr(args, "max_candidates", 192)))
-    if len(candidates) > max_candidates:
-        candidates = dict(sorted(candidates.items(), key=lambda item: (-item[1], item[0]))[:max_candidates])
+    candidates = deterministic_take(candidates, max_candidates)
     scored = []
     query_mask = activation_mask_for_text(query)
     for node_index, collision in candidates.items():
@@ -223,7 +332,9 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         "payload_reads": float(len(fetch)),
         "node_records_read": float(len(candidates)),
         "edge_reads": 0.0,
-        "edge_expansions": 0.0,
+        "edge_expansions": route_stats["routing_layer_reads"],
+        "routing_layer_reads": route_stats["routing_layer_reads"],
+        "routing_candidate_count": route_stats["routing_candidate_count"],
         "raw_final_candidate_count": float(raw_candidate_count),
         "final_candidate_count": float(len(fetch)),
         "calibrator_latency_ms": 0.0,

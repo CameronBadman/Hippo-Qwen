@@ -48,6 +48,8 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "node_records_read": float(stats.get("node_records_read") or 0.0),
         "edge_reads": float(stats.get("edge_reads") or 0.0),
         "edge_expansions": float(stats.get("edge_expansions") or 0.0),
+        "routing_layer_reads": float(stats.get("routing_layer_reads") or 0.0),
+        "routing_candidate_count": float(stats.get("routing_candidate_count") or 0.0),
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or len(ranked)),
         "calibrator_latency_ms": float(stats.get("calibrator_latency_ms") or 0.0),
@@ -205,9 +207,10 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- action_count: `{result['action_count']}`",
         f"- query_token_count: `{result['query_token_count']}`",
         f"- node_token_count: `{result['node_token_count']}`",
+        f"- routing_layers: `{result['routing_layers']}`",
         "",
-        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | mrr | deterministic |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | routed | read | mrr | deterministic |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, rollup in result["rollup"].items():
         metrics = rollup["metrics"]
@@ -220,6 +223,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('routing_candidate_count', {}).get('avg', 0.0):.1f} | "
+            f"{metrics.get('unique_nodes_read', {}).get('avg', 0.0):.1f} | "
             f"{metrics.get('mrr', {}).get('avg', 0.0):.4f} | {deterministic:.4f} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +257,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "action_count": args.action_count,
         "query_token_count": args.query_token_count,
         "node_token_count": args.node_token_count,
+        "routing_layers": args.routing_layers,
+        "promotion_probability": args.promotion_probability,
+        "include_min_collision": args.include_min_collision,
+        "include_min_overlap": args.include_min_overlap,
         "bucket_width": args.bucket_width,
         "bucket_radius": args.bucket_radius,
         "top_k": args.top_k,
@@ -293,6 +302,12 @@ def main() -> None:
     parser.add_argument("--bucket-radius", type=int, default=1)
     parser.add_argument("--min-candidates", type=int, default=16)
     parser.add_argument("--max-candidates", type=int, default=192)
+    parser.add_argument("--routing-layers", type=int, default=6)
+    parser.add_argument("--promotion-probability", type=float, default=0.35)
+    parser.add_argument("--promotion-bias", type=float, default=0.0)
+    parser.add_argument("--routing-beam-width", type=int, default=48)
+    parser.add_argument("--include-min-collision", type=float, default=0.0)
+    parser.add_argument("--include-min-overlap", type=float, default=0.0)
     parser.add_argument("--layers", type=int, default=128)
     parser.add_argument("--layer-schedule", choices=["auto", "consecutive", "spread"], default="spread")
     parser.add_argument("--cell-width", type=float, default=0.03125)
