@@ -23,10 +23,16 @@ Run shape:
 | faiss_hnsw | 0.46 | 0.9500 | 0.0697 | 0.8252 | 0.2125 | 0.8281 | 96 returned | 1.0000 |
 | hnswlib | 0.40 | 0.9500 | 0.0697 | 0.8252 | 0.2125 | 0.8281 | 96 returned | 1.0000 |
 | token_field | 25.13 | 0.7900 | 0.0669 | 0.6314 | 0.1625 | 0.6914 | 66.9 scored | 1.0000 |
+| hybrid_faiss_hnsw_token, 512 candidates | 43.15 | 1.0000 | 0.0641 | 0.8117 | 0.2000 | 0.8281 | 201.1 scored | 1.0000 |
+| hybrid_faiss_hnsw_token, 128 candidates | 15.93 | 0.9500 | 0.0678 | 0.8117 | 0.2000 | 0.8281 | 74.4 scored | 1.0000 |
 
-Result: FAISS wins this run. Token-field reads fewer candidate records than the
-full vector baseline, but quality is lower and the Python token path is slower
-than FAISS.
+Result: FAISS wins raw latency. The hybrid path is the stronger Hippo direction:
+FAISS/HNSW handles fast candidate generation, and token-field adds a deterministic
+memory-shape bias during reranking. With 128 candidates it stays well under the
+200 ms target and matches FAISS context recall on this slice, but it is still much
+slower than plain FAISS and slightly behind on recall@8/precision@8. With 512
+candidates, candidate recall reaches 1.0 and MRR improves over FAISS on this
+sample, but Python candidate scoring dominates latency.
 
 ## LongMemEval Small Slice
 
@@ -109,12 +115,14 @@ routing so higher layers reduce work instead of multiplying it.
 ## Current Verdict
 
 Hippo/token-field is not beating FAISS as a general vector database yet. The path
-worth pursuing is narrower and more interesting: beat vector-only retrieval on
-agent-memory workloads where the answer depends on learned shapes, stable graph
-growth, bridge memories, and bounded candidate reads. At 75k nodes, the current
-implementation is promising on recall for graph-shaped synthetic labels, but it
-misses the 200 ms latency target unless the token settings are tightened enough
-to collapse recall.
+worth pursuing is narrower and more interesting: use FAISS/HNSW for direct
+nearest-neighbor candidate generation, then use Hippo/token-field as a
+deterministic memory-shape reranker or graph-shaped recall path. At 75k nodes,
+the standalone token-field implementation is promising on recall for synthetic
+bridge labels, but it misses the 200 ms latency target unless the token settings
+are tightened enough to collapse recall. On direct MemoryCraft-style questions,
+the hybrid path is already under the latency budget, but still needs a trained or
+better-vectorized reranker before it can claim a quality win over FAISS.
 
 The next fair target is a benchmark with:
 
