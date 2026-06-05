@@ -123,6 +123,15 @@ def selected_layers(
     return selected, energies
 
 
+def static_node_priority(node: dict[str, Any]) -> tuple[float, int, int]:
+    flags = int(node["flags"])
+    conflict_penalty = 0.08 if flags & 2 else 0.0
+    ignored_penalty = 0.05 if flags & 4 else 0.0
+    stale_penalty = 0.05 if flags & 8 else 0.0
+    score = float(node["importance"]) + float(node["state"]) - conflict_penalty - ignored_penalty - stale_penalty
+    return (-score, int(node["node_hash"]), int(node["memory_index"]))
+
+
 def split_by_3(value: int) -> int:
     value &= 0x1FFFFF
     value = (value | (value << 32)) & 0x1F00000000FFFF
@@ -256,7 +265,7 @@ def build_rope_delta_grid(row: dict[str, Any], backend: Any, output_dir: Path, a
     last_by_layer: dict[int, int] = {}
     for cell_index, key in enumerate(cell_keys):
         layer, x, y, z = key
-        members = sorted(cell_members[key], key=lambda index: (node_frames[index]["node_hash"], index))
+        members = sorted(cell_members[key], key=lambda index: static_node_priority(node_frames[index]))
         for member_position, node_index in enumerate(members):
             node_frames[node_index]["cell_index"] = cell_index
             node_frames[node_index]["prev"] = members[member_position - 1] if member_position > 0 else NO_PTR
@@ -512,6 +521,7 @@ def search_rope_delta_grid(row: dict[str, Any], backend: Any, meta: dict[str, An
         votes: dict[int, int] = {}
         visited_nodes: set[int] = set()
         cells_touched = 0
+        max_cell_scan = int(getattr(args, "max_cell_scan", 0) or 0)
         for layer in active_layers:
             triple = triples[layer]
             qx, qy, qz = quantized_point(query_embedding, origin, triple, index.cell_width)
@@ -523,7 +533,11 @@ def search_rope_delta_grid(row: dict[str, Any], backend: Any, meta: dict[str, An
                 _, _, _, _, _, _, head, _, _, _ = index.cell(cell_index)
                 current = head
                 distance = abs(dx) + abs(dy) + abs(dz)
+                cell_scans = 0
                 while current != NO_PTR:
+                    if max_cell_scan > 0 and cell_scans >= max_cell_scan:
+                        break
+                    cell_scans += 1
                     if current in visited_nodes:
                         node = index.node(current)
                         current = int(node[10])
@@ -714,6 +728,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cell_width": args.cell_width,
         "radius": args.radius,
         "min_layer_delta": args.min_layer_delta,
+        "max_cell_scan": args.max_cell_scan,
         "min_query_layers": args.min_query_layers,
         "max_query_layers": args.max_query_layers,
         "min_node_layer_delta": args.min_node_layer_delta,
@@ -753,6 +768,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- cell_width: `{result['cell_width']}`",
         f"- radius: `{result['radius']}`",
         f"- min_layer_delta: `{result['min_layer_delta']}`",
+        f"- max_cell_scan: `{result['max_cell_scan']}`",
         f"- min_query_layers: `{result['min_query_layers']}`",
         f"- max_query_layers: `{result['max_query_layers']}`",
         f"- min_node_layer_delta: `{result['min_node_layer_delta']}`",
@@ -810,6 +826,7 @@ def main() -> None:
     parser.add_argument("--cell-width", type=float, default=0.03125)
     parser.add_argument("--radius", type=int, default=0)
     parser.add_argument("--min-layer-delta", type=float, default=0.02)
+    parser.add_argument("--max-cell-scan", type=int, default=0)
     parser.add_argument("--min-query-layers", type=int, default=1)
     parser.add_argument("--max-query-layers", type=int, default=0)
     parser.add_argument("--min-node-layer-delta", type=float, default=0.0)
