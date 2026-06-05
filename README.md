@@ -123,6 +123,36 @@ failure mode was unbounded cell fan-out, not JSON serialization; bounded
 deterministic posting scans fixed the query-time blow-up in the current
 synthetic workload.
 
+Public memory benchmark harness:
+
+- `python/benchmarks/memorycraft_retrieval.py`
+- loads MemoryCraft from Hugging Face or a local JSONL file
+- supports `selected/sample.jsonl` and `full/longmemeval.jsonl`
+- compares Python exact cosine scan, FAISS flat, FAISS HNSW, hnswlib HNSW, and
+  the Hippo rope grid
+- scores against explicit evidence IDs with recall@k, precision@k, MRR,
+  context recall/precision under a token budget, latency, index size, and
+  deterministic repeat mismatches
+- `--unit auto` uses turn-level evidence when present; for LongMemEval rows
+  where evidence labels name sessions, it uses answer-bearing turns when the
+  dataset exposes `metadata.has_answer`
+
+Example:
+
+```bash
+uv --cache-dir /tmp/uv-cache run \
+  --with huggingface_hub \
+  --with faiss-cpu \
+  --with hnswlib \
+  python -m python.benchmarks.memorycraft_retrieval \
+  --hf-file full/longmemeval.jsonl \
+  --limit-records 20 \
+  --limit-questions 1 \
+  --systems exact_vector,faiss_flat,faiss_hnsw,hnswlib,hippo_rope_grid \
+  --output-json artifacts/memorycraft_retrieval/result.json \
+  --output-md artifacts/memorycraft_retrieval/result.md
+```
+
 ## Reset Boundary
 
 No production memory database runtime is currently present. The next runtime
