@@ -84,6 +84,26 @@ def synthetic_hard_negative_cards(
             "{positive} Non-authoritative duplicate for {query}; keep the original evidence instead.",
             {"age_days": 2, "use_count": 3, "evidence_count": 0, "last_outcome": "", "importance": 0.46},
         ),
+        (
+            "same_entity_wrong_time_negative",
+            "{query} Same people and topic, but this was from a different time window and should not answer the current question.",
+            {"age_days": 180, "use_count": 12, "evidence_count": 2, "last_outcome": "ignored", "importance": 0.62},
+        ),
+        (
+            "evidence_adjacent_but_wrong_negative",
+            "{positive} Adjacent conversation context for {query}, but this line is not the evidence-bearing memory.",
+            {"age_days": 6, "use_count": 20, "evidence_count": 3, "last_outcome": "ignored", "importance": 0.66},
+        ),
+        (
+            "stale_preference_negative",
+            "{query} Old user preference with similar wording. It was replaced later and should be excluded from final context.",
+            {"age_days": 420, "use_count": 44, "evidence_count": 5, "last_outcome": "corrected", "importance": 0.59},
+        ),
+        (
+            "answer_shaped_wrong_fact_negative",
+            "Answer-shaped but wrong memory for {query}: {answer}. This is a plausible false positive, not the accepted evidence.",
+            {"age_days": 18, "use_count": 31, "evidence_count": 8, "last_outcome": "ignored", "importance": 0.74},
+        ),
     ]
     out: list[dict[str, Any]] = []
     for index in range(count):
@@ -118,6 +138,8 @@ def synthetic_hard_negative_cards(
             "last_outcome": state["last_outcome"],
             "synthetic_role": role,
             "hard_negative": True,
+            "include_label": 0.0,
+            "include_weight": float(args.synthetic_include_weight),
             "label_weight": float(args.synthetic_hard_negative_weight),
             "base_rank": 1 + int(fnv1a64(f"{key}:rank") % max(1, min(16, args.max_candidates))),
             "base_score": 0.65 + 0.30 * ((fnv1a64(f"{key}:score") % 1000) / 1000.0),
@@ -176,6 +198,12 @@ def payload_for_ranked(
             continue
         candidate["base_rank"] = rank
         candidate["base_score"] = float(score)
+        if candidate_id in relevant:
+            candidate["include_label"] = 1.0
+            candidate["include_weight"] = 1.0
+        else:
+            candidate["include_label"] = 0.0
+            candidate["include_weight"] = max(1.0, float(args.near_miss_include_weight) / float(max(1, min(rank, 32))))
         candidates.append(candidate)
         seen.add(candidate_id)
     if args.inject_missing_relevant:
@@ -185,6 +213,8 @@ def payload_for_ranked(
                 continue
             candidate["base_rank"] = args.max_candidates + 1
             candidate["base_score"] = -1.0
+            candidate["include_label"] = 1.0
+            candidate["include_weight"] = 1.0
             candidates.append(candidate)
             if len(candidates) >= args.max_candidates:
                 break
@@ -271,6 +301,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "records": len(records),
         "candidate_source": str(args.candidate_source),
         "synthetic_hard_negatives": int(args.synthetic_hard_negatives),
+        "synthetic_hard_negative_weight": float(args.synthetic_hard_negative_weight),
+        "synthetic_include_weight": float(args.synthetic_include_weight),
+        "near_miss_include_weight": float(args.near_miss_include_weight),
         "embedding_backend": backend.name,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
     }
@@ -296,6 +329,8 @@ def main() -> None:
     parser.add_argument("--inject-missing-relevant", action="store_true")
     parser.add_argument("--synthetic-hard-negatives", type=int, default=0)
     parser.add_argument("--synthetic-hard-negative-weight", type=float, default=3.0)
+    parser.add_argument("--synthetic-include-weight", type=float, default=6.0)
+    parser.add_argument("--near-miss-include-weight", type=float, default=8.0)
     parser.add_argument("--max-candidates", type=int, default=128)
     parser.add_argument("--budget", type=int, default=900)
     parser.add_argument("--work-dir", default="artifacts/hippo_calibrator/build")

@@ -43,7 +43,9 @@ class HippoCalibrationDataset(Dataset):
         candidates = torch.zeros((self.max_candidates, self.embedding_dim), dtype=torch.float32)
         features = torch.zeros((self.max_candidates, self.feature_dim), dtype=torch.float32)
         labels = torch.zeros((self.max_candidates,), dtype=torch.float32)
+        include_labels = torch.zeros((self.max_candidates,), dtype=torch.float32)
         weights = torch.ones((self.max_candidates,), dtype=torch.float32)
+        include_weights = torch.ones((self.max_candidates,), dtype=torch.float32)
         mask = torch.zeros((self.max_candidates,), dtype=torch.bool)
         for idx, candidate in enumerate((row.get("candidates") or [])[: self.max_candidates]):
             candidates[idx] = torch.tensor(fit_embedding(candidate.get("embedding") or [], self.embedding_dim), dtype=torch.float32)
@@ -58,15 +60,20 @@ class HippoCalibrationDataset(Dataset):
                 ),
                 dtype=torch.float32,
             )
-            labels[idx] = 1.0 if str(candidate.get("id") or "") in relevant else 0.0
+            is_relevant = str(candidate.get("id") or "") in relevant
+            labels[idx] = 1.0 if is_relevant else 0.0
+            include_labels[idx] = float(candidate.get("include_label", 1.0 if is_relevant else 0.0))
             weights[idx] = max(0.05, float(candidate.get("label_weight") or 1.0))
+            include_weights[idx] = max(0.05, float(candidate.get("include_weight") or candidate.get("label_weight") or 1.0))
             mask[idx] = True
         return {
             "query": query_embedding,
             "candidates": candidates,
             "features": features,
             "labels": labels,
+            "include_labels": include_labels,
             "weights": weights,
+            "include_weights": include_weights,
             "mask": mask,
         }
 
@@ -77,7 +84,9 @@ def collate(batch: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
         "candidates": torch.stack([item["candidates"] for item in batch]),
         "features": torch.stack([item["features"] for item in batch]),
         "labels": torch.stack([item["labels"] for item in batch]),
+        "include_labels": torch.stack([item["include_labels"] for item in batch]),
         "weights": torch.stack([item["weights"] for item in batch]),
+        "include_weights": torch.stack([item["include_weights"] for item in batch]),
         "mask": torch.stack([item["mask"] for item in batch]),
     }
 
@@ -97,6 +106,25 @@ def ranking_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor,
         diffs = valid_logits[positive].unsqueeze(1) - valid_logits[negative].unsqueeze(0)
         pair_weights = valid_weights[positive].unsqueeze(1) * valid_weights[negative].unsqueeze(0)
         losses.append((F.softplus(-diffs) * pair_weights).sum() / pair_weights.sum().clamp_min(1.0))
+    if not losses:
+        return logits.sum() * 0
+    return torch.stack(losses).mean()
+
+
+def topk_false_positive_loss(logits: torch.Tensor, labels: torch.Tensor, mask: torch.Tensor, top_k: int, margin: float) -> torch.Tensor:
+    losses = []
+    for item_logits, item_labels, item_mask in zip(logits, labels, mask):
+        valid_logits = item_logits[item_mask]
+        valid_labels = item_labels[item_mask]
+        if valid_logits.numel() == 0:
+            continue
+        order = torch.argsort(valid_logits, descending=True)[: max(1, int(top_k))]
+        top_logits = valid_logits[order]
+        top_labels = valid_labels[order]
+        negative_logits = top_logits[top_labels <= 0.0]
+        if negative_logits.numel() == 0:
+            continue
+        losses.append(F.softplus(negative_logits + float(margin)).mean())
     if not losses:
         return logits.sum() * 0
     return torch.stack(losses).mean()
@@ -191,20 +219,46 @@ def train(args: argparse.Namespace) -> None:
             batch = {key: value.to(device) for key, value in batch.items()}
             outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
             logits = outputs["relevance_logits"]
+            include_logits = outputs["include_logits"]
             valid = batch["mask"].bool()
             effective_weights = batch["weights"] * torch.where(
                 batch["labels"] >= 0.5,
                 torch.ones_like(batch["labels"]),
                 torch.full_like(batch["labels"], float(args.negative_weight)),
             )
-            bce = F.binary_cross_entropy_with_logits(
+            include_effective_weights = batch["include_weights"] * torch.where(
+                batch["include_labels"] >= 0.5,
+                torch.ones_like(batch["include_labels"]),
+                torch.full_like(batch["include_labels"], float(args.include_negative_weight)),
+            )
+            relevance_bce = F.binary_cross_entropy_with_logits(
                 logits[valid],
                 batch["labels"][valid],
                 pos_weight=pos_weight,
                 weight=effective_weights[valid],
             )
+            include_bce = F.binary_cross_entropy_with_logits(
+                include_logits[valid],
+                batch["include_labels"][valid],
+                pos_weight=pos_weight,
+                weight=include_effective_weights[valid],
+            )
             rank = ranking_loss(logits, batch["labels"], batch["mask"], effective_weights)
-            loss = bce + args.rank_loss_weight * rank
+            include_rank = ranking_loss(include_logits, batch["include_labels"], batch["mask"], include_effective_weights)
+            false_positive = topk_false_positive_loss(
+                include_logits,
+                batch["include_labels"],
+                batch["mask"],
+                args.top_k,
+                args.false_positive_margin,
+            )
+            loss = (
+                relevance_bce
+                + args.include_loss_weight * include_bce
+                + args.rank_loss_weight * rank
+                + args.include_rank_loss_weight * include_rank
+                + args.false_positive_loss_weight * false_positive
+            )
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
@@ -219,21 +273,48 @@ def train(args: argparse.Namespace) -> None:
                 batch = {key: value.to(device) for key, value in batch.items()}
                 outputs = model(batch["query"], batch["candidates"], batch["features"], batch["mask"])
                 logits = outputs["relevance_logits"]
+                include_logits = outputs["include_logits"]
                 valid = batch["mask"].bool()
                 effective_weights = batch["weights"] * torch.where(
                     batch["labels"] >= 0.5,
                     torch.ones_like(batch["labels"]),
                     torch.full_like(batch["labels"], float(args.negative_weight)),
                 )
-                bce = F.binary_cross_entropy_with_logits(
+                include_effective_weights = batch["include_weights"] * torch.where(
+                    batch["include_labels"] >= 0.5,
+                    torch.ones_like(batch["include_labels"]),
+                    torch.full_like(batch["include_labels"], float(args.include_negative_weight)),
+                )
+                relevance_bce = F.binary_cross_entropy_with_logits(
                     logits[valid],
                     batch["labels"][valid],
                     pos_weight=pos_weight,
                     weight=effective_weights[valid],
                 )
+                include_bce = F.binary_cross_entropy_with_logits(
+                    include_logits[valid],
+                    batch["include_labels"][valid],
+                    pos_weight=pos_weight,
+                    weight=include_effective_weights[valid],
+                )
                 rank = ranking_loss(logits, batch["labels"], batch["mask"], effective_weights)
-                val_losses.append(float((bce + args.rank_loss_weight * rank).detach().cpu().item()))
-                val_metrics.append(metrics(logits, batch["labels"], batch["mask"], args.top_k))
+                include_rank = ranking_loss(include_logits, batch["include_labels"], batch["mask"], include_effective_weights)
+                false_positive = topk_false_positive_loss(
+                    include_logits,
+                    batch["include_labels"],
+                    batch["mask"],
+                    args.top_k,
+                    args.false_positive_margin,
+                )
+                val_loss = (
+                    relevance_bce
+                    + args.include_loss_weight * include_bce
+                    + args.rank_loss_weight * rank
+                    + args.include_rank_loss_weight * include_rank
+                    + args.false_positive_loss_weight * false_positive
+                )
+                val_losses.append(float(val_loss.detach().cpu().item()))
+                val_metrics.append(metrics(include_logits, batch["include_labels"], batch["mask"], args.top_k))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         precision = sum(item["precision_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         f1 = sum(item["f1_at_k"] for item in val_metrics) / max(1, len(val_metrics))
@@ -283,8 +364,13 @@ def main() -> None:
     parser.add_argument("--lr", type=float, default=2e-4)
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--rank-loss-weight", type=float, default=0.6)
+    parser.add_argument("--include-loss-weight", type=float, default=1.0)
+    parser.add_argument("--include-rank-loss-weight", type=float, default=0.6)
+    parser.add_argument("--false-positive-loss-weight", type=float, default=0.0)
+    parser.add_argument("--false-positive-margin", type=float, default=0.0)
     parser.add_argument("--max-pos-weight", type=float, default=16.0)
     parser.add_argument("--negative-weight", type=float, default=1.0)
+    parser.add_argument("--include-negative-weight", type=float, default=1.0)
     parser.add_argument("--selection-metric", choices=["mrr", "precision", "recall", "f1", "balanced"], default="mrr")
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=8)

@@ -41,6 +41,7 @@ class HippoCalibrationTransformer(nn.Module):
         )
         self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
         self.relevance_head = nn.Linear(config.d_model, 1)
+        self.include_head = nn.Linear(config.d_model, 1)
         self.utility_head = nn.Linear(config.d_model, 1)
 
     def forward(
@@ -57,6 +58,7 @@ class HippoCalibrationTransformer(nn.Module):
         hidden = self.encoder(hidden, src_key_padding_mask=~mask.bool())
         return {
             "relevance_logits": self.relevance_head(hidden).squeeze(-1),
+            "include_logits": self.include_head(hidden).squeeze(-1),
             "utility": torch.tanh(self.utility_head(hidden).squeeze(-1)),
         }
 
@@ -155,11 +157,12 @@ def rerank_with_calibrator(model: HippoCalibrationTransformer, payload: dict[str
         tensors = {key: value.to(device) for key, value in tensors.items()}
         outputs = model(**tensors)
         logits = outputs["relevance_logits"][0].detach().cpu().tolist()
+        include_logits = outputs.get("include_logits", outputs["relevance_logits"])[0].detach().cpu().tolist()
         utility = outputs["utility"][0].detach().cpu().tolist()
     ranked = []
     for idx, candidate in enumerate(candidates):
         base_score = float(candidate.get("base_score") or 0.0)
-        score = float(logits[idx]) + 0.10 * float(utility[idx]) + 0.05 * base_score
+        score = 0.35 * float(logits[idx]) + 0.60 * float(include_logits[idx]) + 0.05 * float(base_score) + 0.05 * float(utility[idx])
         ranked.append((str(candidate.get("id") or ""), score, str(candidate.get("text") or "")))
     return sorted(ranked, key=lambda item: (-item[1], item[0]))
 
@@ -173,6 +176,6 @@ def save_calibrator(model: HippoCalibrationTransformer, path: str | Path, **meta
 def load_calibrator(path: str | Path, device: torch.device | str = "cpu") -> HippoCalibrationTransformer:
     checkpoint = torch.load(path, map_location=device)
     model = HippoCalibrationTransformer(HippoCalibratorConfig(**checkpoint["config"])).to(device)
-    model.load_state_dict(checkpoint["state_dict"])
+    model.load_state_dict(checkpoint["state_dict"], strict=False)
     model.eval()
     return model
