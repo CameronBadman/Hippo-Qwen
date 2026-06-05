@@ -50,13 +50,28 @@ EDGE = struct.Struct("<IQfff")
 NO_PTR = -1
 
 
-def dim_triples(dim_count: int, layer_count: int) -> list[tuple[int, int, int]]:
+def dim_triples(dim_count: int, layer_count: int, schedule: str = "auto") -> list[tuple[int, int, int]]:
     if dim_count <= 0:
         return [(0, 0, 0)] * layer_count
+    mode = str(schedule or "auto").lower()
+    if mode == "auto":
+        mode = "consecutive" if layer_count * 3 >= dim_count else "spread"
     triples = []
+    if mode == "consecutive":
+        for layer in range(layer_count):
+            base = (layer * 3) % dim_count
+            triples.append((base, (base + 1) % dim_count, (base + 2) % dim_count))
+        return triples
+    if mode != "spread":
+        raise ValueError(f"unknown layer schedule: {schedule}")
+    # Deterministic low-overlap triples spread over the whole embedding space.
+    # The odd strides keep dimensions mixed without data-dependent rebalancing.
+    stride_a = max(1, (dim_count // max(1, layer_count)) | 1)
+    stride_b = max(1, ((dim_count // 3) + 1) | 1)
+    stride_c = max(1, ((dim_count // 2) + 1) | 1)
     for layer in range(layer_count):
-        base = (layer * 3) % dim_count
-        triples.append((base, (base + 1) % dim_count, (base + 2) % dim_count))
+        base = (layer * stride_a) % dim_count
+        triples.append((base, (base + stride_b) % dim_count, (base + stride_c) % dim_count))
     return triples
 
 
@@ -86,6 +101,26 @@ def delta_energy(embedding: list[float], origin: list[float], triple: tuple[int,
         base = origin[dim] if dim < len(origin) else 0.0
         total += abs(float(value) - float(base))
     return total
+
+
+def selected_layers(
+    embedding: list[float],
+    origin: list[float],
+    triples: list[tuple[int, int, int]],
+    min_delta: float,
+    min_layers: int,
+    max_layers: int,
+) -> tuple[list[int], list[float]]:
+    energies = [delta_energy(embedding, origin, triple) for triple in triples]
+    selected = [layer for layer, energy in enumerate(energies) if energy >= min_delta]
+    floor = max(0, min(int(min_layers), len(triples)))
+    if len(selected) < floor:
+        ranked = sorted(range(len(triples)), key=lambda layer: (-energies[layer], layer))
+        selected = sorted(set(selected).union(ranked[:floor]))
+    if max_layers > 0 and len(selected) > max_layers:
+        selected = sorted(selected, key=lambda layer: (-energies[layer], layer))[:max_layers]
+        selected.sort()
+    return selected, energies
 
 
 def split_by_3(value: int) -> int:
@@ -138,6 +173,9 @@ def build_rope_delta_grid(row: dict[str, Any], backend: Any, output_dir: Path, a
     layer_count = max(1, int(args.layers))
     dim_count = max(3, int(args.dim_count))
     cell_width = float(args.cell_width)
+    min_node_layer_delta = float(getattr(args, "min_node_layer_delta", 0.0) or 0.0)
+    min_node_layers = int(getattr(args, "min_node_layers", 1) or 0)
+    max_node_layers = int(getattr(args, "max_node_layers", 0) or 0)
 
     cards = [dict(card) for card in row.get("candidates", [])]
     cards.sort(key=lambda card: str(card.get("id") or ""))
@@ -145,7 +183,7 @@ def build_rope_delta_grid(row: dict[str, Any], backend: Any, output_dir: Path, a
         raise ValueError("cannot build an empty rope delta grid")
     id_to_index = {str(card.get("id") or ""): index for index, card in enumerate(cards)}
     origin = read_vector(cards[0], dim_count)
-    triples = dim_triples(dim_count, layer_count)
+    triples = dim_triples(dim_count, layer_count, str(getattr(args, "layer_schedule", "auto")))
     offsets = payload_offsets(cards, payload_path)
 
     outgoing: dict[int, list[dict[str, Any]]] = {}
@@ -176,10 +214,19 @@ def build_rope_delta_grid(row: dict[str, Any], backend: Any, output_dir: Path, a
     node_frames: list[dict[str, Any]] = []
     for memory_index, card in enumerate(cards):
         embedding = read_vector(card, dim_count)
+        active_layers, _ = selected_layers(
+            embedding,
+            origin,
+            triples,
+            min_node_layer_delta,
+            min_node_layers,
+            max_node_layers,
+        )
         project_hash = fnv1a64(project_key(card))
         mask = activation_mask_for_text(f"{card.get('text', '')} {card.get('summary', '')}")
         flags = skeleton_flags(card)
-        for layer, triple in enumerate(triples):
+        for layer in active_layers:
+            triple = triples[layer]
             x, y, z = quantized_point(embedding, origin, triple, cell_width)
             cell_key = (layer, x, y, z)
             node_index = len(node_frames)
@@ -295,8 +342,12 @@ def build_rope_delta_grid(row: dict[str, Any], backend: Any, output_dir: Path, a
         "records_path": str(records_path),
         "edges_path": str(edges_path),
         "layers": layer_count,
+        "layer_schedule": str(getattr(args, "layer_schedule", "auto")),
         "dim_count": dim_count,
         "cell_width": cell_width,
+        "min_node_layer_delta": min_node_layer_delta,
+        "min_node_layers": min_node_layers,
+        "max_node_layers": max_node_layers,
         "memory_count": len(cards),
         "cell_count": len(cells),
         "edge_count": len(edge_frames),
@@ -449,15 +500,20 @@ def search_rope_delta_grid(row: dict[str, Any], backend: Any, meta: dict[str, An
     try:
         triples = [tuple(item) for item in meta["triples"]]
         origin = [float(value) for value in meta["origin"]]
+        active_layers, _ = selected_layers(
+            query_embedding,
+            origin,
+            triples,
+            float(args.min_layer_delta),
+            int(getattr(args, "min_query_layers", 1) or 0),
+            int(getattr(args, "max_query_layers", 0) or 0),
+        )
         best: dict[int, float] = {}
         votes: dict[int, int] = {}
         visited_nodes: set[int] = set()
         cells_touched = 0
-        skipped_layers = 0
-        for layer, triple in enumerate(triples):
-            if delta_energy(query_embedding, origin, triple) < float(args.min_layer_delta):
-                skipped_layers += 1
-                continue
+        for layer in active_layers:
+            triple = triples[layer]
             qx, qy, qz = quantized_point(query_embedding, origin, triple, index.cell_width)
             for dx, dy, dz in offsets:
                 cell_index = index.cell_lookup.get((layer, qx + dx, qy + dy, qz + dz))
@@ -513,7 +569,8 @@ def search_rope_delta_grid(row: dict[str, Any], backend: Any, meta: dict[str, An
         stats = {
             "latency_ms": (time.perf_counter() - started) * 1000.0,
             "cells_touched": float(cells_touched),
-            "skipped_layers": float(skipped_layers),
+            "active_query_layers": float(len(active_layers)),
+            "skipped_layers": float(len(triples) - len(active_layers)),
             "node_records_read": float(index.node_reads),
             "edge_reads": float(index.edge_reads),
             "edge_expansions": float(edge_expansions),
@@ -559,6 +616,7 @@ def evaluate_one(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], a
         "edge_reads": float(stats.get("edge_reads") or 0.0),
         "edge_expansions": float(stats.get("edge_expansions") or 0.0),
         "cells_touched": float(stats.get("cells_touched") or 0.0),
+        "active_query_layers": float(stats.get("active_query_layers") or 0.0),
         "skipped_layers": float(stats.get("skipped_layers") or 0.0),
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or 0.0),
@@ -651,10 +709,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "growth_scenarios": args.growth_scenarios,
         "determinism_repeats": args.determinism_repeats,
         "layers": args.layers,
+        "layer_schedule": args.layer_schedule,
         "dim_count": args.dim_count,
         "cell_width": args.cell_width,
         "radius": args.radius,
         "min_layer_delta": args.min_layer_delta,
+        "min_query_layers": args.min_query_layers,
+        "max_query_layers": args.max_query_layers,
+        "min_node_layer_delta": args.min_node_layer_delta,
+        "min_node_layers": args.min_node_layers,
+        "max_node_layers": args.max_node_layers,
         "edge_seed_count": args.edge_seed_count,
         "graph_depth": args.graph_depth,
         "final_fetch": args.final_fetch,
@@ -684,10 +748,16 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- pool_size: `{result['pool_size']}`",
         f"- growth_count: `{result['growth_count']}`",
         f"- layers: `{result['layers']}`",
+        f"- layer_schedule: `{result['layer_schedule']}`",
         f"- dim_count: `{result['dim_count']}`",
         f"- cell_width: `{result['cell_width']}`",
         f"- radius: `{result['radius']}`",
         f"- min_layer_delta: `{result['min_layer_delta']}`",
+        f"- min_query_layers: `{result['min_query_layers']}`",
+        f"- max_query_layers: `{result['max_query_layers']}`",
+        f"- min_node_layer_delta: `{result['min_node_layer_delta']}`",
+        f"- min_node_layers: `{result['min_node_layers']}`",
+        f"- max_node_layers: `{result['max_node_layers']}`",
         f"- edge_seed_count: `{result['edge_seed_count']}`",
         f"- graph_depth: `{result['graph_depth']}`",
         f"- final_fetch: `{result['final_fetch']}`",
@@ -735,10 +805,16 @@ def main() -> None:
     parser.add_argument("--stability-top-n", type=int, default=64)
     parser.add_argument("--determinism-repeats", type=int, default=2)
     parser.add_argument("--layers", type=int, default=12)
+    parser.add_argument("--layer-schedule", choices=["auto", "consecutive", "spread"], default="auto")
     parser.add_argument("--dim-count", type=int, default=64)
     parser.add_argument("--cell-width", type=float, default=0.03125)
     parser.add_argument("--radius", type=int, default=0)
     parser.add_argument("--min-layer-delta", type=float, default=0.02)
+    parser.add_argument("--min-query-layers", type=int, default=1)
+    parser.add_argument("--max-query-layers", type=int, default=0)
+    parser.add_argument("--min-node-layer-delta", type=float, default=0.0)
+    parser.add_argument("--min-node-layers", type=int, default=1)
+    parser.add_argument("--max-node-layers", type=int, default=0)
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--final-fetch", type=int, default=96)
