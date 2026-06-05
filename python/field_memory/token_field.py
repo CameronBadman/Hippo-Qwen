@@ -312,17 +312,26 @@ def action_fallback_candidates(index: TokenFieldIndex, tokens: tuple[FieldToken,
 
 def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex, args: Any) -> tuple[list[tuple[str, float, str]], dict[str, float], set[str]]:
     started = time.perf_counter()
+    marks: dict[str, float] = {}
     task = row.get("retrieval_task") or {}
     query = str(task.get("query") or row["anchor"]["text"])
     raw_embedding = task.get("query_embedding") or backend.embed_one(query)
     query_embedding = fit_embedding([float(value) for value in raw_embedding], int(args.dim_count))
+    marks["query_embedding_ms"] = (time.perf_counter() - started) * 1000.0
+    token_started = time.perf_counter()
     if index.token_emitter is not None:
         tokens = index.token_emitter.tokens_for_embeddings([query_embedding], "query", token_count=int(args.query_token_count))[0]
     else:
         tokens = query_tokens(query, query_embedding, index.projection_plan, args)
+    marks["query_token_ms"] = (time.perf_counter() - token_started) * 1000.0
     bucket_radius = max(0, int(args.bucket_radius))
+    route_started = time.perf_counter()
     routing_frontier, route_stats = route_layers(index, tokens, bucket_radius, args)
+    marks["routing_ms"] = (time.perf_counter() - route_started) * 1000.0
+    collide_started = time.perf_counter()
     layer_zero = layer_collisions(index, tokens, 0, bucket_radius)
+    marks["layer_zero_collision_ms"] = (time.perf_counter() - collide_started) * 1000.0
+    filter_started = time.perf_counter()
     pre_filter_limit = int(getattr(args, "pre_filter_candidates", 0) or 0)
     layer_zero_items = sorted(layer_zero.items(), key=lambda item: (-item[1], item[0]))
     if pre_filter_limit > 0:
@@ -342,13 +351,19 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         for node_index, score in routing_frontier.items():
             if node_index in layer_zero:
                 candidates.setdefault(node_index, layer_zero[node_index] + 0.35 * score)
+    marks["candidate_filter_ms"] = (time.perf_counter() - filter_started) * 1000.0
+    fallback_started = time.perf_counter()
     if len(candidates) < int(args.min_candidates):
         # Deterministic fallback: widen the field by using action-id collisions
         # only. This preserves the "shape token" path while avoiding empty hits.
         candidates.update(action_fallback_candidates(index, tokens))
+    marks["fallback_ms"] = (time.perf_counter() - fallback_started) * 1000.0
     raw_candidate_count = len(candidates)
     max_candidates = max(1, int(getattr(args, "max_candidates", 192)))
+    cap_started = time.perf_counter()
     candidates = deterministic_take(candidates, max_candidates)
+    marks["candidate_cap_ms"] = (time.perf_counter() - cap_started) * 1000.0
+    score_started = time.perf_counter()
     scored = []
     query_mask = activation_mask_for_text(query)
     for node_index, collision in candidates.items():
@@ -359,6 +374,7 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         score = 0.58 * field + 0.28 * semantic + 0.14 * activation + 0.02 * collision
         scored.append((node.node_id, float(score), node.text))
     scored.sort(key=lambda item: (-item[1], item[0]))
+    marks["candidate_score_ms"] = (time.perf_counter() - score_started) * 1000.0
     fetch = scored[: max(1, int(args.final_fetch))]
     stats = {
         "latency_ms": (time.perf_counter() - started) * 1000.0,
@@ -374,4 +390,5 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
         "final_candidate_count": float(len(fetch)),
         "calibrator_latency_ms": 0.0,
     }
+    stats.update(marks)
     return fetch, stats, {index.nodes[node_index].node_id for node_index in candidates}

@@ -76,6 +76,14 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or len(ranked)),
         "calibrator_latency_ms": float(stats.get("calibrator_latency_ms") or 0.0),
+        "query_embedding_ms": float(stats.get("query_embedding_ms") or 0.0),
+        "query_token_ms": float(stats.get("query_token_ms") or 0.0),
+        "routing_ms": float(stats.get("routing_ms") or 0.0),
+        "layer_zero_collision_ms": float(stats.get("layer_zero_collision_ms") or 0.0),
+        "candidate_filter_ms": float(stats.get("candidate_filter_ms") or 0.0),
+        "fallback_ms": float(stats.get("fallback_ms") or 0.0),
+        "candidate_cap_ms": float(stats.get("candidate_cap_ms") or 0.0),
+        "candidate_score_ms": float(stats.get("candidate_score_ms") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
     out.update(candidate_pool_metrics(row, ranked, candidate_ids))
