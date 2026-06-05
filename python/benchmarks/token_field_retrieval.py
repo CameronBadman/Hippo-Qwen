@@ -276,6 +276,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "unit": args.unit,
         "systems": args.systems,
         "embedding_backend": backend.name,
+        "token_encoder_checkpoint": args.token_encoder_checkpoint,
         "dim_count": args.dim_count,
         "action_count": args.action_count,
         "query_token_count": args.query_token_count,
@@ -350,6 +351,8 @@ def main() -> None:
     parser.add_argument("--hippo-max-length", type=int, default=128)
     parser.add_argument("--hippo-batch-size", type=int, default=128)
     parser.add_argument("--device", default="")
+    parser.add_argument("--token-encoder-checkpoint", default="")
+    parser.add_argument("--token-encoder-device", default="")
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     parser.add_argument("--print-records", action="store_true")

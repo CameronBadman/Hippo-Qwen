@@ -32,6 +32,7 @@ class TokenFieldIndex:
     inverted: dict[tuple[int, int], list[int]]
     layered_inverted: dict[tuple[int, int, int], list[int]]
     projection_plan: tuple[tuple[tuple[int, float], ...], ...]
+    token_emitter: Any | None
     layer_count: int
     build_latency_ms: float
     index_bytes: int
@@ -147,23 +148,35 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
     started = time.perf_counter()
     dim_count = max(8, int(args.dim_count))
     projection_plan = make_projection_plan(dim_count, int(args.action_count), int(args.projection_width))
+    token_emitter = load_configured_token_emitter(args)
     layer_count = max(1, int(getattr(args, "routing_layers", 1)))
     promotion_probability = float(getattr(args, "promotion_probability", 0.35))
     promotion_bias = float(getattr(args, "promotion_bias", 0.0))
     nodes = []
     inverted: dict[tuple[int, int], list[int]] = {}
     layered_inverted: dict[tuple[int, int, int], list[int]] = {}
-    for index, candidate in enumerate(sorted(row.get("candidates") or [], key=lambda item: str(item.get("id") or ""))):
+    sorted_candidates = sorted(row.get("candidates") or [], key=lambda item: str(item.get("id") or ""))
+    embeddings = [
+        fit_embedding([float(value) for value in candidate.get("embedding") or []], dim_count)
+        for candidate in sorted_candidates
+    ]
+    encoded_tokens = None
+    if token_emitter is not None and embeddings:
+        encoded_tokens = token_emitter.tokens_for_embeddings(embeddings, "node", token_count=int(args.node_token_count))
+    for index, candidate in enumerate(sorted_candidates):
         node_id = str(candidate.get("id") or "")
         text = str(candidate.get("text") or "")
-        embedding = fit_embedding([float(value) for value in candidate.get("embedding") or []], dim_count)
-        tokens = field_tokens_for(
-            text,
-            embedding,
-            projection_plan,
-            int(args.node_token_count),
-            float(args.bucket_width),
-        )
+        embedding = embeddings[index]
+        if encoded_tokens is not None:
+            tokens = encoded_tokens[index]
+        else:
+            tokens = field_tokens_for(
+                text,
+                embedding,
+                projection_plan,
+                int(args.node_token_count),
+                float(args.bucket_width),
+            )
         level = promoted_level(node_id, text, tokens, layer_count, promotion_probability, promotion_bias)
         node = FieldNode(
             index=index,
@@ -190,6 +203,7 @@ def build_token_field_index(row: dict[str, Any], args: Any) -> TokenFieldIndex:
         inverted={key: sorted(values) for key, values in inverted.items()},
         layered_inverted={key: sorted(values) for key, values in layered_inverted.items()},
         projection_plan=projection_plan,
+        token_emitter=token_emitter,
         layer_count=layer_count,
         build_latency_ms=(time.perf_counter() - started) * 1000.0,
         index_bytes=index_bytes,
@@ -209,6 +223,15 @@ def query_tokens(
         int(args.query_token_count),
         float(args.bucket_width),
     )
+
+
+def load_configured_token_emitter(args: Any) -> Any | None:
+    checkpoint = str(getattr(args, "token_encoder_checkpoint", "") or "")
+    if not checkpoint:
+        return None
+    from python.field_memory.token_encoder import TokenFieldEmitter
+
+    return TokenFieldEmitter(checkpoint, device=str(getattr(args, "token_encoder_device", "") or getattr(args, "device", "") or ""))
 
 
 def overlap_score(query_tokens_: tuple[FieldToken, ...], node: FieldNode, bucket_radius: int) -> float:
@@ -289,7 +312,10 @@ def search_token_field(row: dict[str, Any], backend: Any, index: TokenFieldIndex
     query = str(task.get("query") or row["anchor"]["text"])
     raw_embedding = task.get("query_embedding") or backend.embed_one(query)
     query_embedding = fit_embedding([float(value) for value in raw_embedding], int(args.dim_count))
-    tokens = query_tokens(query, query_embedding, index.projection_plan, args)
+    if index.token_emitter is not None:
+        tokens = index.token_emitter.tokens_for_embeddings([query_embedding], "query", token_count=int(args.query_token_count))[0]
+    else:
+        tokens = query_tokens(query, query_embedding, index.projection_plan, args)
     bucket_radius = max(0, int(args.bucket_radius))
     routing_frontier, route_stats = route_layers(index, tokens, bucket_radius, args)
     layer_zero = layer_collisions(index, tokens, 0, bucket_radius)
