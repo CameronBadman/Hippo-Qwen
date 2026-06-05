@@ -36,8 +36,26 @@ python -m python.field_memory.train_token_encoder \
   --candidate-cap 384
 ```
 
-The first metric to optimize is `val_candidate_recall`. Top-k precision is
-expected to lag until the encoder/reranker is stronger.
+The first metric to optimize is `hard_candidate_recall`, then
+`hard_recall@k`. The soft `val_candidate_recall` is still useful for tracking
+the differentiable loss, but it can overstate quality because the index uses
+exported hard tokens during retrieval.
+
+## Build Hippo-Encoder Triplets
+
+The token-field data can also be converted into Hippo-encoder triplets for a
+larger from-scratch student run:
+
+```bash
+python -m python.field_memory.build_hippo_triplets \
+  --input artifacts/token_field_encoder/train.jsonl \
+  --output artifacts/hippo_encoder/memorycraft_triplets.jsonl \
+  --max-positives 8 \
+  --max-negatives 48 \
+  --negatives-per-positive 2 \
+  --include-random-negatives \
+  --shuffle
+```
 
 ## Benchmark
 
