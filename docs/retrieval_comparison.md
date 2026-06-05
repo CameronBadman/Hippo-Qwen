@@ -53,11 +53,15 @@ Run shape:
 | hippo_calibrated_union, recall-biased | 31.74 | 0.9468 | 0.2815 | 0.9552 | 0.2989 | 1.0000 |
 | hippo_calibrated_union, precision-biased | 31.69 | 0.9489 | 0.2849 | 0.9510 | 0.2743 | 1.0000 |
 | hippo_calibrated_union, F1/negative-weight | 30.06 | 0.9448 | 0.2782 | 0.9571 | 0.2432 | 1.0000 |
+| hippo_calibrated_union, include-head balanced | 31.21 | 0.9510 | 0.2883 | 0.9470 | 0.3493 | 1.0000 |
 
 Result: the union candidate source and calibrator improve MRR and can improve
-context recall, but this small training set does not beat FAISS on top-8
-precision. The next quality target is more training rows and a precision-aware
-context inclusion policy, not more candidate widening.
+context recall. The first relevance-only training runs did not beat FAISS on
+top-8 precision. Adding synthetic hard negatives plus a separate include head
+matched FAISS on recall@8/precision@8 and beat it on context precision and MRR
+on this holdout, while staying well under the 200 ms latency target. This is a
+small slice, so it is a directionally useful result rather than a broad win
+claim.
 
 ## LongMemEval Small Slice
 
