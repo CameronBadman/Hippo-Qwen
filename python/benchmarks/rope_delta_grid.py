@@ -645,6 +645,9 @@ def evaluate_one(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], a
         "candidate_score_ms": float(stats.get("candidate_score_ms") or 0.0),
         "vector_candidate_latency_ms": float(stats.get("vector_candidate_latency_ms") or 0.0),
         "vector_candidate_count": float(stats.get("vector_candidate_count") or 0.0),
+        "token_candidate_latency_ms": float(stats.get("token_candidate_latency_ms") or 0.0),
+        "token_candidate_count": float(stats.get("token_candidate_count") or 0.0),
+        "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
         "determinism_mismatches": float(stats.get("determinism_mismatches") or 0.0),
         "deterministic": 1.0 if float(stats.get("determinism_mismatches") or 0.0) == 0.0 else 0.0,
     }

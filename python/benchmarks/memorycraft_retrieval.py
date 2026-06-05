@@ -21,7 +21,9 @@ from python.benchmarks.vector_db_compare import (
     exact_vector_search,
     faiss_search,
     hnswlib_search,
+    hybrid_union_token_search,
 )
+from python.field_memory.token_field import build_token_field_index
 from python.librarian.features import activation_mask_for_text, fnv1a64, tokens
 
 
@@ -38,6 +40,7 @@ def parse_systems(value: str) -> list[str]:
         "hnswlib",
         "hippo_rope_grid",
         "hippo_calibrated",
+        "hippo_calibrated_union",
         "agent_memory_graph",
     }
     unknown = sorted(set(systems) - valid)
@@ -336,6 +339,12 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "raw_final_candidate_count": float(stats.get("raw_final_candidate_count") or 0.0),
         "final_candidate_count": float(stats.get("final_candidate_count") or len(ranked)),
         "calibrator_latency_ms": float(stats.get("calibrator_latency_ms") or 0.0),
+        "search_latency_ms": float(stats.get("search_latency_ms") or 0.0),
+        "vector_candidate_latency_ms": float(stats.get("vector_candidate_latency_ms") or 0.0),
+        "vector_candidate_count": float(stats.get("vector_candidate_count") or 0.0),
+        "token_candidate_latency_ms": float(stats.get("token_candidate_latency_ms") or 0.0),
+        "token_candidate_count": float(stats.get("token_candidate_count") or 0.0),
+        "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
     return out
@@ -418,6 +427,29 @@ def calibrated_search(
     return ranked, out, protected
 
 
+def calibrated_union_search(
+    row: dict[str, Any],
+    backend: Any,
+    faiss_built: dict[str, Any],
+    token_index: Any,
+    calibrator: Any,
+    id_to_candidate: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float], set[str]]:
+    from python.librarian.hippo_calibrator import rerank_with_calibrator
+
+    started = time.perf_counter()
+    raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    ranked = rerank_with_calibrator(calibrator, calibrator_payload(row, raw_ranked, id_to_candidate, backend, args))
+    total_latency_ms = (time.perf_counter() - started) * 1000.0
+    search_latency_ms = float(stats.get("latency_ms") or 0.0)
+    out = dict(stats)
+    out["search_latency_ms"] = search_latency_ms
+    out["latency_ms"] = total_latency_ms
+    out["calibrator_latency_ms"] = max(0.0, total_latency_ms - search_latency_ms)
+    return ranked, out, candidate_ids
+
+
 def run_record(
     record: dict[str, Any],
     record_number: int,
@@ -497,6 +529,32 @@ def run_record(
                 "build_latency_ms": build_ms,
                 "memory_count": built["memory_count"],
                 "total_index_bytes": int(built.get("index_bytes") or 0),
+            }
+        )
+    if "hippo_calibrated_union" in args.systems:
+        if calibrator is None:
+            raise ValueError("--calibrator-checkpoint is required for hippo_calibrated_union")
+        started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, "hnsw")
+        token_index = build_token_field_index(embedded_base, args)
+        build_ms = (time.perf_counter() - started) * 1000.0
+        rows, mismatches = run_queries(
+            qa_rows,
+            lambda row: calibrated_union_search(row, backend, faiss_built, token_index, calibrator, id_to_candidate, args),
+            args,
+        )
+        systems.append(
+            {
+                "name": "hippo_calibrated_union",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": len(token_index.nodes),
+                "node_record_count": len(token_index.nodes),
+                "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
+                "edge_count": 0,
+                "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
             }
         )
     if "hippo_rope_grid" in args.systems or "hippo_calibrated" in args.systems:
@@ -657,7 +715,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     records = load_records(dataset_path, args.limit_records)
     backend = build_embedding_backend(args)
     calibrator = None
-    if "hippo_calibrated" in args.systems:
+    if "hippo_calibrated" in args.systems or "hippo_calibrated_union" in args.systems:
         if not args.calibrator_checkpoint:
             raise ValueError("--calibrator-checkpoint is required when --systems includes hippo_calibrated")
         import torch
@@ -693,6 +751,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_cell_scan": args.max_cell_scan,
         "top_k": args.top_k,
         "budget": args.budget,
+        "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+        "hybrid_token_candidate_fetch": int(args.hybrid_token_candidate_fetch),
+        "hybrid_union_vector_weight": float(args.hybrid_union_vector_weight),
+        "hybrid_union_token_weight": float(args.hybrid_union_token_weight),
+        "token_encoder_checkpoint": args.token_encoder_checkpoint,
         "repeat_searches": args.repeat_searches,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "rollup": system_rollup(evaluated, args.systems),
@@ -744,6 +807,31 @@ def main() -> None:
     parser.add_argument("--final-fetch", type=int, default=96)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-max-candidates", type=int, default=128)
+    parser.add_argument("--action-count", type=int, default=256)
+    parser.add_argument("--query-token-count", type=int, default=40)
+    parser.add_argument("--node-token-count", type=int, default=40)
+    parser.add_argument("--projection-width", type=int, default=16)
+    parser.add_argument("--bucket-width", type=float, default=0.055)
+    parser.add_argument("--bucket-radius", type=int, default=2)
+    parser.add_argument("--min-candidates", type=int, default=16)
+    parser.add_argument("--max-candidates", type=int, default=512)
+    parser.add_argument("--pre-filter-candidates", type=int, default=2048)
+    parser.add_argument("--routing-layers", type=int, default=1)
+    parser.add_argument("--promotion-probability", type=float, default=0.45)
+    parser.add_argument("--promotion-bias", type=float, default=0.12)
+    parser.add_argument("--routing-beam-width", type=int, default=32)
+    parser.add_argument("--include-min-collision", type=float, default=1.0)
+    parser.add_argument("--include-min-overlap", type=float, default=0.01)
+    parser.add_argument("--token-encoder-checkpoint", default="")
+    parser.add_argument("--token-encoder-device", default="")
+    parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-token-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-union-vector-weight", type=float, default=0.70)
+    parser.add_argument("--hybrid-union-token-weight", type=float, default=0.30)
+    parser.add_argument("--hybrid-source-weight", type=float, default=0.75)
+    parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
+    parser.add_argument("--hybrid-field-weight", type=float, default=0.08)
+    parser.add_argument("--hybrid-activation-weight", type=float, default=0.02)
     parser.add_argument("--memory-graph-layers", type=int, default=8)
     parser.add_argument("--memory-graph-route-degree", type=int, default=24)
     parser.add_argument("--memory-graph-projection-count", type=int, default=3)

@@ -28,14 +28,23 @@ from python.benchmarks.memorycraft_retrieval import (
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import build_faiss, build_hnswlib, exact_vector_search, faiss_search, hnswlib_search
-from python.benchmarks.vector_db_compare import hybrid_faiss_token_search
+from python.benchmarks.vector_db_compare import hybrid_faiss_token_search, hybrid_union_token_search
 from python.benchmarks.vector_db_compare import metric_cell
 from python.field_memory.token_field import build_token_field_index, search_token_field
 
 
 def parse_systems(value: str) -> list[str]:
     systems = [item.strip() for item in value.split(",") if item.strip()]
-    valid = {"exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid", "token_field", "hybrid_faiss_hnsw_token"}
+    valid = {
+        "exact_vector",
+        "faiss_flat",
+        "faiss_hnsw",
+        "hnswlib",
+        "hippo_rope_grid",
+        "token_field",
+        "hybrid_faiss_hnsw_token",
+        "hybrid_union_token",
+    }
     unknown = sorted(set(systems) - valid)
     if unknown:
         raise argparse.ArgumentTypeError(f"unknown systems: {','.join(unknown)}")
@@ -87,6 +96,9 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "candidate_score_ms": float(stats.get("candidate_score_ms") or 0.0),
         "vector_candidate_latency_ms": float(stats.get("vector_candidate_latency_ms") or 0.0),
         "vector_candidate_count": float(stats.get("vector_candidate_count") or 0.0),
+        "token_candidate_latency_ms": float(stats.get("token_candidate_latency_ms") or 0.0),
+        "token_candidate_count": float(stats.get("token_candidate_count") or 0.0),
+        "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
     out.update(candidate_pool_metrics(row, ranked, candidate_ids))
@@ -227,6 +239,31 @@ def run_record(record: dict[str, Any], record_number: int, backend: Any, work_di
                 "memory_count": len(index.nodes),
                 "total_index_bytes": int(index.index_bytes) + int(faiss_built["index_bytes"]),
                 "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+                "hybrid_source_weight": float(args.hybrid_source_weight),
+                "hybrid_semantic_weight": float(args.hybrid_semantic_weight),
+                "hybrid_field_weight": float(args.hybrid_field_weight),
+                "hybrid_activation_weight": float(args.hybrid_activation_weight),
+            }
+        )
+    if "hybrid_union_token" in args.systems:
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, "hnsw")
+        index = build_token_field_index(embedded_base, args)
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        rows, mismatches = repeated(qa_rows, lambda row: hybrid_union_token_search(row, backend, faiss_built, index, args), args)
+        systems.append(
+            {
+                "name": "hybrid_union_token",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": len(index.nodes),
+                "total_index_bytes": int(index.index_bytes) + int(faiss_built["index_bytes"]),
+                "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+                "hybrid_token_candidate_fetch": int(getattr(args, "hybrid_token_candidate_fetch", args.max_candidates)),
+                "hybrid_union_vector_weight": float(args.hybrid_union_vector_weight),
+                "hybrid_union_token_weight": float(args.hybrid_union_token_weight),
                 "hybrid_source_weight": float(args.hybrid_source_weight),
                 "hybrid_semantic_weight": float(args.hybrid_semantic_weight),
                 "hybrid_field_weight": float(args.hybrid_field_weight),
@@ -432,6 +469,9 @@ def main() -> None:
     parser.add_argument("--token-encoder-checkpoint", default="")
     parser.add_argument("--token-encoder-device", default="")
     parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-token-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-union-vector-weight", type=float, default=0.70)
+    parser.add_argument("--hybrid-union-token-weight", type=float, default=0.30)
     parser.add_argument("--hybrid-source-weight", type=float, default=0.75)
     parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
     parser.add_argument("--hybrid-field-weight", type=float, default=0.08)

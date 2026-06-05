@@ -22,6 +22,8 @@ from python.benchmarks.memorycraft_retrieval import (
     unit_mode,
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, query_embedding_for, search_rope_delta_grid
+from python.benchmarks.vector_db_compare import build_faiss, hybrid_union_token_search
+from python.field_memory.token_field import build_token_field_index
 from python.librarian.features import fnv1a64
 
 
@@ -218,7 +220,14 @@ def build_rows(records: list[dict[str, Any]], backend: Any, args: argparse.Names
         first = query_row(base, {"question": base["anchor"]["text"], "qa_id": "index"}, set(), args.budget)
         embedded_base = ensure_backend_embeddings(first, backend)
         id_to_candidate = {str(candidate.get("id") or ""): dict(candidate) for candidate in embedded_base.get("candidates", [])}
-        meta = build_rope_delta_grid(embedded_base, backend, work_dir / f"record_{record_index:05d}" / "hippo_rope", args)
+        meta = None
+        faiss_built = None
+        token_index = None
+        if args.candidate_source in {"rope", "union"}:
+            meta = build_rope_delta_grid(embedded_base, backend, work_dir / f"record_{record_index:05d}" / "hippo_rope", args)
+        if args.candidate_source in {"union"}:
+            faiss_built = build_faiss(embedded_base, args, "hnsw")
+            token_index = build_token_field_index(embedded_base, args)
         qa_count = 0
         for qa in record.get("qa") or []:
             if bool(qa.get("abstention")) and not args.include_abstention:
@@ -228,7 +237,14 @@ def build_rows(records: list[dict[str, Any]], backend: Any, args: argparse.Names
                 continue
             row = query_row(embedded_base, qa, relevant, args.budget)
             row = ensure_backend_embeddings(row, backend)
-            ranked, _, _ = search_rope_delta_grid(row, backend, meta, args)
+            if args.candidate_source == "union":
+                if faiss_built is None or token_index is None:
+                    raise ValueError("union candidate source was not initialized")
+                ranked, _, _ = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+            else:
+                if meta is None:
+                    raise ValueError("rope candidate source was not initialized")
+                ranked, _, _ = search_rope_delta_grid(row, backend, meta, args)
             query_embedding = query_embedding_for(row, backend)
             output_rows.append(payload_for_ranked(row, ranked, id_to_candidate, relevant, query_embedding, backend, args))
             qa_count += 1
@@ -253,6 +269,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "output": str(output),
         "rows": len(rows),
         "records": len(records),
+        "candidate_source": str(args.candidate_source),
         "synthetic_hard_negatives": int(args.synthetic_hard_negatives),
         "embedding_backend": backend.name,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -275,6 +292,7 @@ def main() -> None:
     parser.add_argument("--limit-questions", type=int, default=20)
     parser.add_argument("--include-abstention", action="store_true")
     parser.add_argument("--unit", choices=["auto", "turn", "session"], default="auto")
+    parser.add_argument("--candidate-source", choices=["rope", "union"], default="rope")
     parser.add_argument("--inject-missing-relevant", action="store_true")
     parser.add_argument("--synthetic-hard-negatives", type=int, default=0)
     parser.add_argument("--synthetic-hard-negative-weight", type=float, default=3.0)
@@ -296,6 +314,33 @@ def main() -> None:
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--final-fetch", type=int, default=128)
+    parser.add_argument("--faiss-hnsw-m", type=int, default=32)
+    parser.add_argument("--faiss-ef-construction", type=int, default=200)
+    parser.add_argument("--faiss-ef-search", type=int, default=128)
+    parser.add_argument("--action-count", type=int, default=256)
+    parser.add_argument("--query-token-count", type=int, default=40)
+    parser.add_argument("--node-token-count", type=int, default=40)
+    parser.add_argument("--projection-width", type=int, default=16)
+    parser.add_argument("--bucket-width", type=float, default=0.055)
+    parser.add_argument("--bucket-radius", type=int, default=2)
+    parser.add_argument("--min-candidates", type=int, default=16)
+    parser.add_argument("--pre-filter-candidates", type=int, default=2048)
+    parser.add_argument("--routing-layers", type=int, default=1)
+    parser.add_argument("--promotion-probability", type=float, default=0.45)
+    parser.add_argument("--promotion-bias", type=float, default=0.12)
+    parser.add_argument("--routing-beam-width", type=int, default=32)
+    parser.add_argument("--include-min-collision", type=float, default=1.0)
+    parser.add_argument("--include-min-overlap", type=float, default=0.01)
+    parser.add_argument("--token-encoder-checkpoint", default="")
+    parser.add_argument("--token-encoder-device", default="")
+    parser.add_argument("--hybrid-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-token-candidate-fetch", type=int, default=512)
+    parser.add_argument("--hybrid-union-vector-weight", type=float, default=0.70)
+    parser.add_argument("--hybrid-union-token-weight", type=float, default=0.30)
+    parser.add_argument("--hybrid-source-weight", type=float, default=0.75)
+    parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
+    parser.add_argument("--hybrid-field-weight", type=float, default=0.08)
+    parser.add_argument("--hybrid-activation-weight", type=float, default=0.02)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")
