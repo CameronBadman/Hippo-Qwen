@@ -314,7 +314,10 @@ def train(args: argparse.Namespace) -> None:
                     + args.false_positive_loss_weight * false_positive
                 )
                 val_losses.append(float(val_loss.detach().cpu().item()))
-                val_metrics.append(metrics(include_logits, batch["include_labels"], batch["mask"], args.top_k))
+                if args.metric_head == "relevance":
+                    val_metrics.append(metrics(logits, batch["labels"], batch["mask"], args.top_k))
+                else:
+                    val_metrics.append(metrics(include_logits, batch["include_labels"], batch["mask"], args.top_k))
         recall = sum(item["recall_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         precision = sum(item["precision_at_k"] for item in val_metrics) / max(1, len(val_metrics))
         f1 = sum(item["f1_at_k"] for item in val_metrics) / max(1, len(val_metrics))
@@ -340,6 +343,7 @@ def train(args: argparse.Namespace) -> None:
         dataset=args.dataset,
         best_val_score=best_score,
         best_val_metrics=best_metrics,
+        metric_head=args.metric_head,
         selection_metric=args.selection_metric,
         max_candidates=args.max_candidates,
         feature_dim=args.feature_dim,
@@ -375,6 +379,7 @@ def main() -> None:
     parser.add_argument("--max-pos-weight", type=float, default=16.0)
     parser.add_argument("--negative-weight", type=float, default=1.0)
     parser.add_argument("--include-negative-weight", type=float, default=1.0)
+    parser.add_argument("--metric-head", choices=["include", "relevance"], default="include")
     parser.add_argument("--selection-metric", choices=["mrr", "precision", "recall", "f1", "balanced"], default="mrr")
     parser.add_argument("--rerank-relevance-weight", type=float, default=0.35)
     parser.add_argument("--rerank-include-weight", type=float, default=0.60)
