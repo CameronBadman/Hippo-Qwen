@@ -167,7 +167,7 @@ Hippo calibration transformer:
 - `python/benchmarks/memorycraft_ablation_suite.py` runs clean/adversarial
   MemoryCraft ablations across FAISS/HNSW, raw hybrid union, calibrated Hippo
   union, calibrator checkpoints, and candidate-pool sizes; see
-  `docs/memorycraft_ablation_suite.md`
+  `MEMORYCRAFT_ABLATION_README.md` and `docs/memorycraft_ablation_suite.md`
 
 Colab-oriented flow:
 
