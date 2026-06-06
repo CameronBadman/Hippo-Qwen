@@ -210,6 +210,109 @@ def card_for_unit(record: dict[str, Any], unit: dict[str, Any], index: int) -> d
     }
 
 
+def stable_pick(values: list[str], key: str) -> str:
+    return values[fnv1a64(key) % len(values)]
+
+
+def adversarial_cards_for_qa(
+    base: dict[str, Any],
+    qa: dict[str, Any],
+    relevant: set[str],
+    args: argparse.Namespace,
+) -> list[dict[str, Any]]:
+    count = max(0, int(args.adversarial_negatives))
+    if count <= 0:
+        return []
+    query = str(qa.get("question") or "")
+    answer = str(qa.get("answer") or "")
+    qa_id = str(qa.get("qa_id") or "qa")
+    id_to_candidate = {str(candidate.get("id") or ""): candidate for candidate in base.get("candidates", [])}
+    positive_text = " ".join(str(id_to_candidate[item].get("text") or "") for item in sorted(relevant) if item in id_to_candidate)[:360]
+    project = str((base.get("anchor") or {}).get("cluster") or (base.get("anchor") or {}).get("id") or "memorycraft")
+    templates = [
+        (
+            "eval_query_echo_negative",
+            "{query} This memory repeats the query wording but is not the evidence-bearing turn.",
+            {"age_days": 5, "use_count": 24, "evidence_count": 4, "last_outcome": "ignored", "importance": 0.70},
+        ),
+        (
+            "eval_same_answer_wrong_source",
+            "{query} Plausible answer-shaped memory: {answer}. It came from a different session and should be excluded.",
+            {"age_days": 18, "use_count": 30, "evidence_count": 6, "last_outcome": "corrected", "importance": 0.72},
+        ),
+        (
+            "eval_superseded_conflict",
+            "{query} Older conflicting note near the accepted evidence: {positive} This note was superseded.",
+            {"age_days": 260, "use_count": 2, "evidence_count": 0, "last_outcome": "ignored", "importance": 0.42},
+        ),
+        (
+            "eval_non_authoritative_duplicate",
+            "{positive} Duplicate-looking memory for {query}; it is not authoritative evidence.",
+            {"age_days": 2, "use_count": 5, "evidence_count": 0, "last_outcome": "", "importance": 0.50},
+        ),
+        (
+            "eval_stale_preference",
+            "{query} Stale user preference from an older context. Later evidence replaced it.",
+            {"age_days": 420, "use_count": 48, "evidence_count": 5, "last_outcome": "ignored", "importance": 0.58},
+        ),
+    ]
+    out = []
+    for index in range(count):
+        key = f"{qa_id}:{query}:{index}:{','.join(sorted(relevant))}"
+        role, template, state = templates[fnv1a64(key) % len(templates)]
+        fallback_positive = stable_pick(
+            [
+                "a nearby conversation note with overlapping entities",
+                "an old memory from the same project",
+                "a similar session turn without the answer",
+            ],
+            key,
+        )
+        text = template.format(query=query, answer=answer or "unknown", positive=positive_text or fallback_positive).strip()
+        out.append(
+            {
+                "id": f"adversarial_eval::{qa_id or 'qa'}::{index}",
+                "text": text,
+                "summary": "",
+                "cluster": project,
+                "importance": state["importance"],
+                "age_days": state["age_days"] + int(fnv1a64(f"{key}:age") % 9),
+                "use_count": state["use_count"],
+                "evidence_count": state["evidence_count"],
+                "last_outcome": state["last_outcome"],
+                "synthetic_role": role,
+                "metadata": {
+                    "project": project,
+                    "adversarial": True,
+                    "adversarial_type": role,
+                    "qa_id": qa_id,
+                },
+            }
+        )
+    return out
+
+
+def add_adversarial_candidates(
+    base: dict[str, Any],
+    qa_items: list[tuple[dict[str, Any], set[str]]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    if int(args.adversarial_negatives) <= 0:
+        return base
+    out = dict(base)
+    candidates = [dict(candidate) for candidate in base.get("candidates", [])]
+    seen = {str(candidate.get("id") or "") for candidate in candidates}
+    for qa, relevant in qa_items:
+        for candidate in adversarial_cards_for_qa(base, qa, relevant, args):
+            candidate_id = str(candidate.get("id") or "")
+            if candidate_id in seen:
+                continue
+            candidates.append(candidate)
+            seen.add(candidate_id)
+    out["candidates"] = candidates
+    return out
+
+
 def build_edges(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     edges = []
     by_speaker: dict[str, str] = {}
@@ -417,7 +520,14 @@ def calibrated_search(
 
     started = time.perf_counter()
     raw_ranked, stats, protected = search_rope_delta_grid(row, backend, meta, args)
-    ranked = rerank_with_calibrator(calibrator, calibrator_payload(row, raw_ranked, id_to_candidate, backend, args))
+    ranked = rerank_with_calibrator(
+        calibrator,
+        calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
+        relevance_weight=args.rerank_relevance_weight,
+        include_weight=args.rerank_include_weight,
+        base_weight=args.rerank_base_weight,
+        utility_weight=args.rerank_utility_weight,
+    )
     total_latency_ms = (time.perf_counter() - started) * 1000.0
     search_latency_ms = float(stats.get("latency_ms") or 0.0)
     out = dict(stats)
@@ -440,7 +550,14 @@ def calibrated_union_search(
 
     started = time.perf_counter()
     raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
-    ranked = rerank_with_calibrator(calibrator, calibrator_payload(row, raw_ranked, id_to_candidate, backend, args))
+    ranked = rerank_with_calibrator(
+        calibrator,
+        calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
+        relevance_weight=args.rerank_relevance_weight,
+        include_weight=args.rerank_include_weight,
+        base_weight=args.rerank_base_weight,
+        utility_weight=args.rerank_utility_weight,
+    )
     total_latency_ms = (time.perf_counter() - started) * 1000.0
     search_latency_ms = float(stats.get("latency_ms") or 0.0)
     out = dict(stats)
@@ -462,7 +579,7 @@ def run_record(
     base = record_index_row(record, mode)
     if len(base.get("candidates") or []) < 1:
         return None
-    qa_rows = []
+    qa_items = []
     qa_count = 0
     for qa in record.get("qa") or []:
         if bool(qa.get("abstention")) and not args.include_abstention:
@@ -470,12 +587,14 @@ def run_record(
         relevant = normalize_evidence(record, qa, mode)
         if not relevant:
             continue
-        qa_rows.append(query_row(base, qa, relevant, args.budget))
+        qa_items.append((qa, relevant))
         qa_count += 1
         if args.limit_questions > 0 and qa_count >= args.limit_questions:
             break
-    if not qa_rows:
+    if not qa_items:
         return None
+    base = add_adversarial_candidates(base, qa_items, args)
+    qa_rows = [query_row(base, qa, relevant, args.budget) for qa, relevant in qa_items]
 
     embedded_base = ensure_backend_embeddings(qa_rows[0], backend)
     for row in qa_rows:
@@ -757,6 +876,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "hybrid_union_token_weight": float(args.hybrid_union_token_weight),
         "token_encoder_checkpoint": args.token_encoder_checkpoint,
         "repeat_searches": args.repeat_searches,
+        "adversarial_negatives": int(args.adversarial_negatives),
+        "rerank_relevance_weight": args.rerank_relevance_weight,
+        "rerank_include_weight": args.rerank_include_weight,
+        "rerank_base_weight": args.rerank_base_weight,
+        "rerank_utility_weight": args.rerank_utility_weight,
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "rollup": system_rollup(evaluated, args.systems),
         "records": public_records(evaluated),
@@ -781,6 +905,7 @@ def main() -> None:
     parser.add_argument("--unit", choices=["auto", "turn", "session"], default="auto")
     parser.add_argument("--systems", type=parse_systems, default=["exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid"])
     parser.add_argument("--repeat-searches", type=int, default=1)
+    parser.add_argument("--adversarial-negatives", type=int, default=0)
     parser.add_argument("--work-dir", default="artifacts/memorycraft_retrieval")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
@@ -807,6 +932,10 @@ def main() -> None:
     parser.add_argument("--final-fetch", type=int, default=96)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-max-candidates", type=int, default=128)
+    parser.add_argument("--rerank-relevance-weight", type=float, default=None)
+    parser.add_argument("--rerank-include-weight", type=float, default=None)
+    parser.add_argument("--rerank-base-weight", type=float, default=None)
+    parser.add_argument("--rerank-utility-weight", type=float, default=None)
     parser.add_argument("--action-count", type=int, default=256)
     parser.add_argument("--query-token-count", type=int, default=40)
     parser.add_argument("--node-token-count", type=int, default=40)

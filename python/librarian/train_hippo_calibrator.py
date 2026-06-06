@@ -343,6 +343,10 @@ def train(args: argparse.Namespace) -> None:
         selection_metric=args.selection_metric,
         max_candidates=args.max_candidates,
         feature_dim=args.feature_dim,
+        rerank_relevance_weight=args.rerank_relevance_weight,
+        rerank_include_weight=args.rerank_include_weight,
+        rerank_base_weight=args.rerank_base_weight,
+        rerank_utility_weight=args.rerank_utility_weight,
     )
     print(f"saved {args.output}", flush=True)
 
@@ -372,6 +376,10 @@ def main() -> None:
     parser.add_argument("--negative-weight", type=float, default=1.0)
     parser.add_argument("--include-negative-weight", type=float, default=1.0)
     parser.add_argument("--selection-metric", choices=["mrr", "precision", "recall", "f1", "balanced"], default="mrr")
+    parser.add_argument("--rerank-relevance-weight", type=float, default=0.35)
+    parser.add_argument("--rerank-include-weight", type=float, default=0.60)
+    parser.add_argument("--rerank-base-weight", type=float, default=0.05)
+    parser.add_argument("--rerank-utility-weight", type=float, default=0.05)
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--seed", type=int, default=9101)

@@ -145,7 +145,25 @@ def fit_embedding(values: list[float], dim: int) -> list[float]:
     return out
 
 
-def rerank_with_calibrator(model: HippoCalibrationTransformer, payload: dict[str, Any]) -> list[tuple[str, float, str]]:
+def rerank_with_calibrator(
+    model: HippoCalibrationTransformer,
+    payload: dict[str, Any],
+    *,
+    relevance_weight: float | None = None,
+    include_weight: float | None = None,
+    base_weight: float | None = None,
+    utility_weight: float | None = None,
+) -> list[tuple[str, float, str]]:
+    metadata = getattr(model, "metadata", {}) or {}
+    has_trained_include_head = bool(getattr(model, "has_trained_include_head", True))
+    if relevance_weight is None:
+        relevance_weight = float(metadata.get("rerank_relevance_weight", 0.35 if has_trained_include_head else 0.90))
+    if include_weight is None:
+        include_weight = float(metadata.get("rerank_include_weight", 0.60 if has_trained_include_head else 0.0))
+    if base_weight is None:
+        base_weight = float(metadata.get("rerank_base_weight", 0.05))
+    if utility_weight is None:
+        utility_weight = float(metadata.get("rerank_utility_weight", 0.05))
     with torch.no_grad():
         device = next(model.parameters()).device
         tensors, candidates = tensorize_calibration_payload(
@@ -162,7 +180,12 @@ def rerank_with_calibrator(model: HippoCalibrationTransformer, payload: dict[str
     ranked = []
     for idx, candidate in enumerate(candidates):
         base_score = float(candidate.get("base_score") or 0.0)
-        score = 0.35 * float(logits[idx]) + 0.60 * float(include_logits[idx]) + 0.05 * float(base_score) + 0.05 * float(utility[idx])
+        score = (
+            relevance_weight * float(logits[idx])
+            + include_weight * float(include_logits[idx])
+            + base_weight * float(base_score)
+            + utility_weight * float(utility[idx])
+        )
         ranked.append((str(candidate.get("id") or ""), score, str(candidate.get("text") or "")))
     return sorted(ranked, key=lambda item: (-item[1], item[0]))
 
@@ -176,6 +199,9 @@ def save_calibrator(model: HippoCalibrationTransformer, path: str | Path, **meta
 def load_calibrator(path: str | Path, device: torch.device | str = "cpu") -> HippoCalibrationTransformer:
     checkpoint = torch.load(path, map_location=device)
     model = HippoCalibrationTransformer(HippoCalibratorConfig(**checkpoint["config"])).to(device)
-    model.load_state_dict(checkpoint["state_dict"], strict=False)
+    state_dict = checkpoint["state_dict"]
+    model.has_trained_include_head = any(str(key).startswith("include_head.") for key in state_dict)
+    model.load_state_dict(state_dict, strict=False)
+    model.metadata = dict(checkpoint.get("metadata") or {})
     model.eval()
     return model
