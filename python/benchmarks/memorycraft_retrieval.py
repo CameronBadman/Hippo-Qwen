@@ -29,6 +29,16 @@ from python.librarian.features import activation_mask_for_text, fnv1a64, tokens
 
 DEFAULT_HF_REPO = "daven3/MemoryCraft"
 DEFAULT_HF_FILE = "selected/sample.jsonl"
+ADVERSARIAL_PROFILES = {
+    "mixed",
+    "query_echo",
+    "answer_shaped",
+    "superseded_conflict",
+    "near_duplicate",
+    "stale_preference",
+    "same_entity_wrong_time",
+    "evidence_adjacent",
+}
 
 
 def parse_systems(value: str) -> list[str]:
@@ -232,31 +242,46 @@ def adversarial_cards_for_qa(
     project = str((base.get("anchor") or {}).get("cluster") or (base.get("anchor") or {}).get("id") or "memorycraft")
     templates = [
         (
-            "eval_query_echo_negative",
+            "query_echo",
             "{query} This memory repeats the query wording but is not the evidence-bearing turn.",
             {"age_days": 5, "use_count": 24, "evidence_count": 4, "last_outcome": "ignored", "importance": 0.70},
         ),
         (
-            "eval_same_answer_wrong_source",
+            "answer_shaped",
             "{query} Plausible answer-shaped memory: {answer}. It came from a different session and should be excluded.",
             {"age_days": 18, "use_count": 30, "evidence_count": 6, "last_outcome": "corrected", "importance": 0.72},
         ),
         (
-            "eval_superseded_conflict",
+            "superseded_conflict",
             "{query} Older conflicting note near the accepted evidence: {positive} This note was superseded.",
             {"age_days": 260, "use_count": 2, "evidence_count": 0, "last_outcome": "ignored", "importance": 0.42},
         ),
         (
-            "eval_non_authoritative_duplicate",
+            "near_duplicate",
             "{positive} Duplicate-looking memory for {query}; it is not authoritative evidence.",
             {"age_days": 2, "use_count": 5, "evidence_count": 0, "last_outcome": "", "importance": 0.50},
         ),
         (
-            "eval_stale_preference",
+            "stale_preference",
             "{query} Stale user preference from an older context. Later evidence replaced it.",
             {"age_days": 420, "use_count": 48, "evidence_count": 5, "last_outcome": "ignored", "importance": 0.58},
         ),
+        (
+            "same_entity_wrong_time",
+            "{query} Same people and topic, but from the wrong time window. It should not answer the current question.",
+            {"age_days": 180, "use_count": 12, "evidence_count": 2, "last_outcome": "ignored", "importance": 0.62},
+        ),
+        (
+            "evidence_adjacent",
+            "{positive} Adjacent context for {query}, but this line is not the evidence-bearing memory.",
+            {"age_days": 6, "use_count": 20, "evidence_count": 3, "last_outcome": "ignored", "importance": 0.66},
+        ),
     ]
+    profile = str(getattr(args, "adversarial_profile", "mixed") or "mixed")
+    if profile not in ADVERSARIAL_PROFILES:
+        raise ValueError(f"unknown adversarial profile: {profile}")
+    if profile != "mixed":
+        templates = [item for item in templates if item[0] == profile]
     out = []
     for index in range(count):
         key = f"{qa_id}:{query}:{index}:{','.join(sorted(relevant))}"
@@ -286,11 +311,16 @@ def adversarial_cards_for_qa(
                     "project": project,
                     "adversarial": True,
                     "adversarial_type": role,
+                    "adversarial_profile": profile,
                     "qa_id": qa_id,
                 },
             }
         )
     return out
+
+
+def is_hard_negative_id(candidate_id: str) -> bool:
+    return candidate_id.startswith("adversarial_eval::") or candidate_id.startswith("synthetic_hard_negative::")
 
 
 def add_adversarial_candidates(
@@ -393,6 +423,7 @@ def query_row(base: dict[str, Any], qa: dict[str, Any], relevant: set[str], budg
 def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: int) -> dict[str, float]:
     relevant = {str(item) for item in (row.get("retrieval_task") or {}).get("relevant_ids") or []}
     top_ids = [item[0] for item in ranked[:top_k]]
+    hard_top_k = sum(1 for candidate_id in top_ids if is_hard_negative_id(candidate_id))
     if not relevant:
         return {
             "recall_at_k": 0.0,
@@ -403,6 +434,10 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
             "context_noise": 0.0,
             "included_count": 0.0,
             "relevant_count": 0.0,
+            "hard_negative_top_k_count": float(hard_top_k),
+            "hard_negative_top_k_rate": hard_top_k / max(1, len(top_ids)),
+            "hard_negative_context_count": 0.0,
+            "hard_negative_context_rate": 0.0,
         }
     hits_at_k = len(relevant & set(top_ids))
     mrr = 0.0
@@ -420,6 +455,7 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
         used += cost
     included_set = set(included)
     context_hits = len(relevant & included_set)
+    hard_context = sum(1 for candidate_id in included if is_hard_negative_id(candidate_id))
     return {
         "recall_at_k": hits_at_k / len(relevant),
         "precision_at_k": hits_at_k / max(1, min(top_k, len(ranked))),
@@ -429,6 +465,10 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
         "context_noise": float(len(included) - context_hits),
         "included_count": float(len(included)),
         "relevant_count": float(len(relevant)),
+        "hard_negative_top_k_count": float(hard_top_k),
+        "hard_negative_top_k_rate": hard_top_k / max(1, len(top_ids)),
+        "hard_negative_context_count": float(hard_context),
+        "hard_negative_context_rate": hard_context / max(1, len(included)),
     }
 
 
@@ -828,9 +868,11 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- dim_count: `{result['dim_count']}`",
         f"- top_k: `{result['top_k']}`",
         f"- budget: `{result['budget']}`",
+        f"- adversarial_negatives: `{result['adversarial_negatives']}`",
+        f"- adversarial_profile: `{result['adversarial_profile']}`",
         "",
-        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | mrr | deterministic |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | hard neg@k | mrr | deterministic |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, rollup in result["rollup"].items():
         metrics = rollup["metrics"]
@@ -846,6 +888,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('hard_negative_top_k_rate', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('mrr', {}).get('avg', 0.0):.4f} | "
             f"{deterministic:.4f} |"
         )
@@ -902,6 +945,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "token_encoder_checkpoint": args.token_encoder_checkpoint,
         "repeat_searches": args.repeat_searches,
         "adversarial_negatives": int(args.adversarial_negatives),
+        "adversarial_profile": str(args.adversarial_profile),
         "rerank_relevance_weight": args.rerank_relevance_weight,
         "rerank_include_weight": args.rerank_include_weight,
         "rerank_base_weight": args.rerank_base_weight,
@@ -931,6 +975,7 @@ def main() -> None:
     parser.add_argument("--systems", type=parse_systems, default=["exact_vector", "faiss_flat", "faiss_hnsw", "hnswlib", "hippo_rope_grid"])
     parser.add_argument("--repeat-searches", type=int, default=1)
     parser.add_argument("--adversarial-negatives", type=int, default=0)
+    parser.add_argument("--adversarial-profile", choices=sorted(ADVERSARIAL_PROFILES), default="mixed")
     parser.add_argument("--work-dir", default="artifacts/memorycraft_retrieval")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
