@@ -164,6 +164,10 @@ Hippo calibration transformer:
   pairwise ranking loss
 - `python/benchmarks/memorycraft_retrieval.py` supports `hippo_calibrated` when
   `--calibrator-checkpoint` is provided
+- `python/benchmarks/memorycraft_ablation_suite.py` runs clean/adversarial
+  MemoryCraft ablations across FAISS/HNSW, raw hybrid union, calibrated Hippo
+  union, calibrator checkpoints, and candidate-pool sizes; see
+  `docs/memorycraft_ablation_suite.md`
 
 Colab-oriented flow:
 
