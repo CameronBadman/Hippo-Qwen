@@ -41,6 +41,7 @@ def parse_systems(value: str) -> list[str]:
         "hippo_rope_grid",
         "hippo_calibrated",
         "hippo_calibrated_union",
+        "hybrid_union_token",
         "agent_memory_graph",
     }
     unknown = sorted(set(systems) - valid)
@@ -665,6 +666,30 @@ def run_record(
         systems.append(
             {
                 "name": "hippo_calibrated_union",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": len(token_index.nodes),
+                "node_record_count": len(token_index.nodes),
+                "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
+                "edge_count": 0,
+                "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
+            }
+        )
+    if "hybrid_union_token" in args.systems:
+        started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, "hnsw")
+        token_index = build_token_field_index(embedded_base, args)
+        build_ms = (time.perf_counter() - started) * 1000.0
+        rows, mismatches = run_queries(
+            qa_rows,
+            lambda row: hybrid_union_token_search(row, backend, faiss_built, token_index, args),
+            args,
+        )
+        systems.append(
+            {
+                "name": "hybrid_union_token",
                 "metrics": aggregate(rows),
                 "_metric_rows": rows,
                 "determinism_mismatches": mismatches,
