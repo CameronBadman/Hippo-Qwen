@@ -398,6 +398,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     rows: list[dict[str, Any]] = []
     run_plan: list[dict[str, Any]] = []
+
+    def write_checkpoint() -> None:
+        if rows:
+            write_outputs(args, output_dir, rows, run_plan)
+
     for profile in profiles:
         adversarial_negatives = 0 if profile == "clean" else int(args.adversarial_negatives)
         memorycraft_profile = "mixed" if profile == "clean" else profile
@@ -427,6 +432,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 output_dir=output_dir,
             )
         )
+        write_checkpoint()
         for calibrator_name, checkpoint in calibrators:
             for candidate_pool in candidate_pools:
                 suite_name = f"{profile}_{calibrator_name}_pool{candidate_pool}"
@@ -456,6 +462,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         output_dir=output_dir,
                     )
                 )
+                write_checkpoint()
     write_outputs(args, output_dir, rows, run_plan)
     return {"summary_json": str(output_dir / "summary.json"), "summary_md": str(output_dir / "summary.md"), "rows": len(rows)}
 
