@@ -62,6 +62,98 @@ sequenceDiagram
     Qwen->>Client: answer
 ```
 
+## Hot-Path Data Structures
+
+The runtime is designed around a two-stage retrieval path:
+
+1. Cheap candidate generation pulls a bounded candidate set from compact indexes.
+2. A small calibrator spends more compute only on that bounded neighborhood.
+
+```mermaid
+flowchart TD
+    subgraph snapshot[Snapshot Version N]
+        records[Memory records<br/>stable memory_id, text, metadata, state]
+        payloads[Payload store<br/>lazy text reads]
+        embeddings[Embedding matrix<br/>memory_id -> vector]
+        token_index[Token-field inverted index<br/>token/layer -> memory ids]
+        vector_index[Vector candidate index<br/>FAISS/HNSW or deterministic Hippo index]
+        trace_store[Trace rows<br/>query_id, snapshot, scores, selected ids]
+    end
+
+    query[Query text] --> qvec[Query embedding]
+    query --> qtokens[Query tokens / fields]
+
+    qvec --> vector_index
+    qtokens --> token_index
+
+    vector_index --> vector_hits[Top vector candidates<br/>bounded fetch]
+    token_index --> token_hits[Top token/field candidates<br/>bounded fetch]
+
+    vector_hits --> union[Candidate union map<br/>memory_id -> vector/token/base scores]
+    token_hits --> union
+
+    union --> stable_sort[Stable deterministic sort<br/>score desc, memory_id tie-break]
+    stable_sort --> pool[Candidate pool<br/>usually 64]
+
+    pool --> matrix[Calibrator tensors<br/>query, candidate vectors, rank/state features]
+    records --> matrix
+    embeddings --> matrix
+
+    matrix --> calibrator[Compact transformer calibrator]
+    calibrator --> ranked[Ranked context frame]
+    ranked --> payloads
+    ranked --> trace_store
+```
+
+### Why This Stays Relatively Quick
+
+- The expensive transformer does not scan all memories. It reranks a small pool,
+  currently `64` candidates by default.
+- Vector and token indexes are used as candidate generators, not as the final
+  source of truth.
+- Payload text is read after ranking, so the hot path works mostly with IDs,
+  vectors, and compact features.
+- Stable ordering means ties are deterministic and debuggable.
+- The returned frame is bounded by the context budget, not by the number of
+  memories in storage.
+
+### Why It Is More Informative Than Plain ANN
+
+The calibrator receives more than vector distance:
+
+- base rank and base score
+- query/candidate embedding interaction
+- token overlap
+- memory importance
+- use count
+- evidence count
+- age and recency features
+- last outcome, such as helpful, ignored, or corrected
+- conflict/decoy markers learned from hard-negative training
+
+That lets Hippo-Qwen learn that a nearby memory can still be wrong if it is
+stale, corrected, query-shaped, or from the wrong context.
+
+## Write-Side State
+
+```mermaid
+flowchart LR
+    event[Memory event] --> seq[Assign sequence number]
+    seq --> wal[Append-only WAL]
+    wal --> record[Record arena<br/>id, metadata, state offsets]
+    wal --> payload[Payload arena<br/>raw text / summary]
+    wal --> embed[Embedding job]
+    embed --> emb[Embedding matrix update]
+    emb --> rebuild[Deterministic index update]
+    record --> snapshot[Publish snapshot N+1]
+    payload --> snapshot
+    rebuild --> snapshot
+```
+
+This is the part that protects reproducibility. The intended production service
+should publish immutable snapshots and answer reads against a pinned snapshot,
+while writes advance the log in a single deterministic order.
+
 ## Training And Evaluation Loop
 
 ```mermaid
