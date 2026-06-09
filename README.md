@@ -72,6 +72,8 @@ target.
 
 Full results: [docs/memorycraft_ablation_results_2026-06-06.md](docs/memorycraft_ablation_results_2026-06-06.md)
 
+Architecture diagram: [docs/hippo_qwen_architecture.md](docs/hippo_qwen_architecture.md)
+
 ## What It Is Good At
 
 Hippo-Qwen is strongest when a memory system must avoid plausible but wrong
@@ -108,6 +110,7 @@ python/field_memory/
   token_encoder.py                  # prototype encoder work
 
 docs/
+  hippo_qwen_architecture.md
   memorycraft_ablation_results_2026-06-06.md
   memorycraft_ablation_suite.md
   retrieval_comparison.md
