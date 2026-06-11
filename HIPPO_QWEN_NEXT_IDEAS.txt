@@ -1004,6 +1004,81 @@ Next action:
   instead of top-k ranking.
 
 
+24. Typed-edge expansion before calibration
+
+Implemented and tested.
+
+Architecture:
+- Stage 0: retrieve the normal FAISS+token union candidate pool.
+- Stage 1: from the top deterministic seed candidates, follow one hop along
+  selected typed edges.
+- Stage 2: inject bounded edge neighbors into the calibrator pool.
+- Stage 3: run the existing calibrator over the expanded pool.
+
+Default edge types:
+- `correction`
+- `temporal_next`
+- `same_context`
+
+Code changes:
+- MemoryCraft graph edges now use the relevant EDGE_TYPES names instead of the
+  old ad hoc `chronological` / `same_speaker` labels.
+- Added `--typed-edge-expansion`.
+- Added `--typed-edge-types`, `--typed-edge-seed-count`,
+  `--typed-edge-max-injections`, and `--typed-edge-seed-score-weight`.
+- Expansion is deterministic: sorted edge traversal, bounded injection count,
+  score/id tie-breaking.
+- Existing union metrics remain visible. `typed_edge_injections` reports how
+  many neighbors were injected on average.
+
+A/B test:
+- Runtime: Colab.
+- Model: previous set3 calibrator from the cascade loop.
+- Eval split: MemoryCraft records 80-119.
+- Profiles: `evidence_adjacent,mixed`.
+- Queries: 180 per profile.
+- Candidate pool: 64.
+- Union fetch: 256 vector + 256 token.
+- Edge expansion: top 32 seeds, max 128 injected neighbors.
+
+Results:
+
+| scenario | mode | p95 ms | recall@8 | context recall | context precision | evidence in pool | hard neg@8 | edge inject |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| evidence_adjacent | off | 62.55 | 0.5942 | 0.6127 | 0.1371 | 0.6560 | 0.3104 | 0.0 |
+| evidence_adjacent | on | 65.68 | 0.5974 | 0.6289 | 0.1375 | 0.6669 | 0.2493 | 18.0 |
+| mixed | off | 61.51 | 0.6099 | 0.6346 | 0.1505 | 0.6764 | 0.1625 | 0.0 |
+| mixed | on | 65.13 | 0.6143 | 0.6483 | 0.1509 | 0.6809 | 0.1361 | 17.6 |
+
+Interpretation:
+- Typed-edge expansion is directionally useful but not a large recall unlock in
+  this version.
+- It did improve the metric it was meant to attack most directly:
+  context recall rose by about +1.6 points on evidence_adjacent and +1.4
+  points on mixed.
+- Hard-negative top-k exposure improved more clearly:
+  evidence_adjacent 0.3104 -> 0.2493, mixed 0.1625 -> 0.1361.
+- Top-k recall barely moved: +0.3 points on evidence_adjacent and +0.4 points
+  on mixed.
+- Latency cost was modest, about +3-4 ms p95.
+- This suggests typed edges help the calibrator see nearby supporting context,
+  but the current edge graph is too generic to solve pool recall by itself.
+
+Verdict:
+- Keep it behind a flag.
+- It is probably worth enabling in larger graph-memory experiments because the
+  latency cost is low and context recall improves.
+- It is not strong enough to be a headline until the write path creates better
+  semantic/correction edges instead of mostly temporal/same-context edges.
+
+Next action:
+- Add stage-specific edge attribution: evidence already in union, evidence
+  added by typed edge expansion, evidence lost by calibrator.
+- Test with real correction/supersedes edges from feedback/consolidation.
+- Try expansion before pointwise cascade at `1024 -> 128`, where extra
+  evidence-adjacent candidates should matter more.
+
+
 Updated Priorities After Experiments
 ------------------------------------
 
@@ -1035,3 +1110,8 @@ Updated Priorities After Experiments
 7. Cascaded calibration is worth keeping in the architecture. The first trained
    test improved recall while staying below 200 ms p95, but it needs a larger
    50k+ memory test and a prefilter trained for survivor recall.
+
+8. Typed-edge expansion should stay as an optional retrieval-stage feature. The
+   first A/B improved context recall and hard-negative exposure with small
+   latency cost, but it needs better write-time edges before it can materially
+   lift recall.
