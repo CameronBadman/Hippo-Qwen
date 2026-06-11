@@ -178,6 +178,8 @@ def memorycraft_args(
         adversarial_negatives=adversarial_negatives,
         adversarial_profile=profile,
         adversarial_style=args.adversarial_style,
+        adversarial_families=args.adversarial_families,
+        adversarial_exclude_families=args.adversarial_exclude_families,
         work_dir=str(output_dir / "work" / suite_name),
         top_k=args.top_k,
         budget=args.budget,
@@ -322,6 +324,8 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         f"- latency target: `{args.latency_target_ms:.1f} ms`",
         f"- repeat searches: `{args.repeat_searches}`",
         f"- adversarial style: `{args.adversarial_style}`",
+        f"- adversarial families: `{args.adversarial_families}`",
+        f"- adversarial exclude families: `{args.adversarial_exclude_families}`",
         f"- calibrator feature ablation: `{args.calibrator_feature_ablation}`",
         "",
         "## Leaderboard",
@@ -418,6 +422,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             "candidate_pool": 0,
             "calibrator": "none",
             "adversarial_negatives": adversarial_negatives,
+            "adversarial_families": args.adversarial_families,
+            "adversarial_exclude_families": args.adversarial_exclude_families,
         }
         run_plan.append(plan)
         print(f"RUN {suite_base}", flush=True)
@@ -448,6 +454,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                     "calibrator": calibrator_name,
                     "checkpoint": checkpoint,
                     "adversarial_negatives": adversarial_negatives,
+                    "adversarial_families": args.adversarial_families,
+                    "adversarial_exclude_families": args.adversarial_exclude_families,
                 }
                 run_plan.append(plan)
                 print(f"RUN {suite_name}", flush=True)
@@ -487,6 +495,8 @@ def main() -> None:
     parser.add_argument("--profiles", default=DEFAULT_PROFILES)
     parser.add_argument("--adversarial-negatives", type=int, default=8)
     parser.add_argument("--adversarial-style", choices=["legacy", "forensic"], default="forensic")
+    parser.add_argument("--adversarial-families", default="")
+    parser.add_argument("--adversarial-exclude-families", default="")
     parser.add_argument("--candidate-pools", default="64,128,256")
     parser.add_argument("--calibrator", action="append", default=[])
     parser.add_argument("--baseline-systems", default=DEFAULT_BASELINE_SYSTEMS)

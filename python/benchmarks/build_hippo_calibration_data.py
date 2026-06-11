@@ -14,6 +14,7 @@ from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ens
 from python.benchmarks.memorycraft_retrieval import (
     DEFAULT_HF_FILE,
     DEFAULT_HF_REPO,
+    filter_decoy_templates,
     load_dataset_path,
     load_records,
     normalize_evidence,
@@ -120,6 +121,12 @@ def synthetic_hard_negative_cards(
     ]
     negative_style = str(getattr(args, "synthetic_hard_negative_style", "forensic") or "forensic")
     templates = legacy_templates if negative_style == "legacy" else forensic_templates
+    templates = filter_decoy_templates(
+        templates,
+        include_raw=str(getattr(args, "synthetic_hard_negative_families", "") or ""),
+        exclude_raw=str(getattr(args, "synthetic_hard_negative_exclude_families", "") or ""),
+        label="training",
+    )
     donor_pool = [candidate for candidate_id, candidate in id_to_candidate.items() if candidate_id not in relevant] or list(id_to_candidate.values())
     out: list[dict[str, Any]] = []
     for index in range(count):
@@ -332,6 +339,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_source": str(args.candidate_source),
         "synthetic_hard_negatives": int(args.synthetic_hard_negatives),
         "synthetic_hard_negative_style": str(args.synthetic_hard_negative_style),
+        "synthetic_hard_negative_families": str(args.synthetic_hard_negative_families),
+        "synthetic_hard_negative_exclude_families": str(args.synthetic_hard_negative_exclude_families),
         "synthetic_hard_negative_weight": float(args.synthetic_hard_negative_weight),
         "synthetic_include_weight": float(args.synthetic_include_weight),
         "near_miss_include_weight": float(args.near_miss_include_weight),
@@ -360,6 +369,8 @@ def main() -> None:
     parser.add_argument("--inject-missing-relevant", action="store_true")
     parser.add_argument("--synthetic-hard-negatives", type=int, default=0)
     parser.add_argument("--synthetic-hard-negative-style", choices=["legacy", "forensic"], default="forensic")
+    parser.add_argument("--synthetic-hard-negative-families", default="")
+    parser.add_argument("--synthetic-hard-negative-exclude-families", default="")
     parser.add_argument("--synthetic-hard-negative-weight", type=float, default=3.0)
     parser.add_argument("--synthetic-include-weight", type=float, default=6.0)
     parser.add_argument("--near-miss-include-weight", type=float, default=8.0)

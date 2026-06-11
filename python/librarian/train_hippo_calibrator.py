@@ -17,6 +17,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from python.librarian.hippo_calibrator import (
     HippoCalibrationTransformer,
     HippoCalibratorConfig,
+    apply_feature_ablation,
     calibration_features,
     fit_embedding,
     save_calibrator,
@@ -24,11 +25,19 @@ from python.librarian.hippo_calibrator import (
 
 
 class HippoCalibrationDataset(Dataset):
-    def __init__(self, path: str | Path, max_candidates: int, feature_dim: int, embedding_dim: int):
+    def __init__(
+        self,
+        path: str | Path,
+        max_candidates: int,
+        feature_dim: int,
+        embedding_dim: int,
+        feature_ablation: str = "none",
+    ):
         self.path = Path(path)
         self.max_candidates = int(max_candidates)
         self.feature_dim = int(feature_dim)
         self.embedding_dim = int(embedding_dim)
+        self.feature_ablation = str(feature_ablation or "none")
         with self.path.open("r", encoding="utf-8") as handle:
             self.rows = [json.loads(line) for line in handle if line.strip()]
 
@@ -50,13 +59,16 @@ class HippoCalibrationDataset(Dataset):
         for idx, candidate in enumerate((row.get("candidates") or [])[: self.max_candidates]):
             candidates[idx] = torch.tensor(fit_embedding(candidate.get("embedding") or [], self.embedding_dim), dtype=torch.float32)
             features[idx] = torch.tensor(
-                calibration_features(
-                    query,
-                    candidate,
-                    int(candidate.get("base_rank") or idx + 1),
-                    float(candidate.get("base_score") or 0.0),
-                    int(row.get("budget") or 900),
-                    self.feature_dim,
+                apply_feature_ablation(
+                    calibration_features(
+                        query,
+                        candidate,
+                        int(candidate.get("base_rank") or idx + 1),
+                        float(candidate.get("base_score") or 0.0),
+                        int(row.get("budget") or 900),
+                        self.feature_dim,
+                    ),
+                    self.feature_ablation,
                 ),
                 dtype=torch.float32,
             )
@@ -188,7 +200,13 @@ def positive_weight(dataset: HippoCalibrationDataset, max_weight: float) -> floa
 
 def train(args: argparse.Namespace) -> None:
     torch.manual_seed(args.seed)
-    dataset = HippoCalibrationDataset(args.dataset, args.max_candidates, args.feature_dim, args.embedding_dim)
+    dataset = HippoCalibrationDataset(
+        args.dataset,
+        args.max_candidates,
+        args.feature_dim,
+        args.embedding_dim,
+        args.feature_ablation,
+    )
     val_count = max(1, int(len(dataset) * args.val_fraction))
     train_count = max(1, len(dataset) - val_count)
     train_set, val_set = random_split(dataset, [train_count, val_count])
@@ -351,6 +369,7 @@ def train(args: argparse.Namespace) -> None:
         rerank_include_weight=args.rerank_include_weight,
         rerank_base_weight=args.rerank_base_weight,
         rerank_utility_weight=args.rerank_utility_weight,
+        feature_ablation=args.feature_ablation,
     )
     print(f"saved {args.output}", flush=True)
 
@@ -381,6 +400,7 @@ def main() -> None:
     parser.add_argument("--include-negative-weight", type=float, default=1.0)
     parser.add_argument("--metric-head", choices=["include", "relevance"], default="include")
     parser.add_argument("--selection-metric", choices=["mrr", "precision", "recall", "f1", "balanced"], default="mrr")
+    parser.add_argument("--feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=0.35)
     parser.add_argument("--rerank-include-weight", type=float, default=0.60)
     parser.add_argument("--rerank-base-weight", type=float, default=0.05)

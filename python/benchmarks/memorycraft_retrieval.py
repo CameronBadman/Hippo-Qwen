@@ -39,6 +39,50 @@ ADVERSARIAL_PROFILES = {
     "same_entity_wrong_time",
     "evidence_adjacent",
 }
+DECOY_FAMILY_ALIASES = {
+    "semantic_query_echo_negative": "query_echo",
+    "contradicted_positive_negative": "superseded_conflict",
+    "same_context_wrong_answer_negative": "answer_shaped",
+    "stale_popular_negative": "stale_preference",
+    "near_duplicate_non_authoritative_negative": "near_duplicate",
+    "same_entity_wrong_time_negative": "same_entity_wrong_time",
+    "evidence_adjacent_but_wrong_negative": "evidence_adjacent",
+    "stale_preference_negative": "stale_preference",
+    "answer_shaped_wrong_fact_negative": "answer_shaped",
+}
+
+
+def normalize_decoy_family(value: str) -> str:
+    raw = value.strip()
+    return DECOY_FAMILY_ALIASES.get(raw, raw)
+
+
+def parse_decoy_families(raw: str) -> set[str]:
+    return {normalize_decoy_family(item) for item in raw.split(",") if item.strip()}
+
+
+def filter_decoy_templates(
+    templates: list[tuple[str, str, dict[str, Any]]],
+    *,
+    include_raw: str = "",
+    exclude_raw: str = "",
+    label: str = "adversarial",
+) -> list[tuple[str, str, dict[str, Any]]]:
+    include = parse_decoy_families(include_raw)
+    exclude = parse_decoy_families(exclude_raw)
+    available = {normalize_decoy_family(role) for role, _, _ in templates}
+    unknown = sorted((include | exclude) - available)
+    if unknown:
+        raise ValueError(f"unknown {label} decoy families: {','.join(unknown)}; available={','.join(sorted(available))}")
+    filtered = [
+        item
+        for item in templates
+        if (not include or normalize_decoy_family(item[0]) in include)
+        and normalize_decoy_family(item[0]) not in exclude
+    ]
+    if not filtered:
+        raise ValueError(f"{label} decoy family filters removed every template")
+    return filtered
 
 
 def parse_systems(value: str) -> list[str]:
@@ -339,11 +383,19 @@ def adversarial_cards_for_qa(
     ]
     adversarial_style = str(getattr(args, "adversarial_style", "forensic") or "forensic")
     templates = legacy_templates if adversarial_style == "legacy" else forensic_templates
+    templates = filter_decoy_templates(
+        templates,
+        include_raw=str(getattr(args, "adversarial_families", "") or ""),
+        exclude_raw=str(getattr(args, "adversarial_exclude_families", "") or ""),
+        label="eval",
+    )
     profile = str(getattr(args, "adversarial_profile", "mixed") or "mixed")
     if profile not in ADVERSARIAL_PROFILES:
         raise ValueError(f"unknown adversarial profile: {profile}")
     if profile != "mixed":
         templates = [item for item in templates if item[0] == profile]
+        if not templates:
+            raise ValueError(f"eval decoy family filters removed the {profile} profile")
     out = []
     non_relevant_candidates = [candidate for candidate in base.get("candidates", []) if str(candidate.get("id") or "") not in relevant]
     donor_pool = non_relevant_candidates or list(base.get("candidates", []))
@@ -949,6 +1001,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
         f"- adversarial_style: `{result['adversarial_style']}`",
+        f"- adversarial_families: `{result['adversarial_families']}`",
+        f"- adversarial_exclude_families: `{result['adversarial_exclude_families']}`",
         f"- calibrator_feature_ablation: `{result['calibrator_feature_ablation']}`",
         "",
         "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | hard neg@k | mrr | deterministic |",
@@ -1027,6 +1081,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "adversarial_negatives": int(args.adversarial_negatives),
         "adversarial_profile": str(args.adversarial_profile),
         "adversarial_style": str(args.adversarial_style),
+        "adversarial_families": str(args.adversarial_families),
+        "adversarial_exclude_families": str(args.adversarial_exclude_families),
         "calibrator_feature_ablation": str(args.calibrator_feature_ablation),
         "rerank_relevance_weight": args.rerank_relevance_weight,
         "rerank_include_weight": args.rerank_include_weight,
@@ -1059,6 +1115,8 @@ def main() -> None:
     parser.add_argument("--adversarial-negatives", type=int, default=0)
     parser.add_argument("--adversarial-profile", choices=sorted(ADVERSARIAL_PROFILES), default="mixed")
     parser.add_argument("--adversarial-style", choices=["legacy", "forensic"], default="forensic")
+    parser.add_argument("--adversarial-families", default="")
+    parser.add_argument("--adversarial-exclude-families", default="")
     parser.add_argument("--work-dir", default="artifacts/memorycraft_retrieval")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
