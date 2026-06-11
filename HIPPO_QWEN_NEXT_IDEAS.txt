@@ -1082,45 +1082,61 @@ Next action:
 Updated Priorities After Experiments
 ------------------------------------
 
-1. Budget packing / learned stop is now the highest-impact next build.
-   The top-3 cap raised Hippo context precision to 0.5185 while keeping context
-   recall at 0.9308 in clean and mixed scenarios. Build this as one
-   include/global-stop head that can also abstain.
+1. Candidate generation is now the binding constraint.
+   The harder 180-query runs changed the diagnosis. Evidence-in-pool fell to
+   about 0.66-0.73 and recall@8 fell to about 0.61-0.64. The calibrator is
+   recovering roughly 90% of the evidence that reaches its pool, so most
+   remaining misses are upstream candidate-generation misses, not ranking
+   misses.
 
 2. Evidence-in-pool attribution is implemented and should stay in every run.
-   It did not expose a bottleneck on the small holdout, so the next useful
-   attribution run is at 50k+ memories.
+   It already exposed the pool bottleneck on the 40-record / 180-query eval.
+   The old 36-query slices were too easy and should not drive priority order.
 
-3. Pointwise MLP is a serious baseline. Do not claim set attention is the
+3. Hippo encoder on the 180-query eval is the decisive next run.
+   All recent hard runs used hash embeddings, which are a weak bag-of-token
+   backend. Rerun the same attribution table with `--embedding-backend hippo`.
+   If evidence-in-pool jumps toward 0.9, the encoder was the constraint. If it
+   does not, the union/candidate strategy itself needs work.
+
+4. Cascade remains worth keeping, but retest it only after the encoder-backed
+   candidate generator is known.
+   The current cascade cannot exceed the stage-0 union ceiling. Also vectorize
+   pointwise prefilter tensorization before judging cascade latency; the 0-layer
+   model cost should be much smaller than the current Python feature-building
+   path.
+
+5. Budget packing / learned stop stays important but is no longer first.
+   The top-3 cap result came from an easy 36-query slice. Revalidate packing on
+   the 180-query eval after candidate generation improves. Build it as one
+   include/global-stop head that can also abstain.
+
+6. Pointwise MLP is a serious baseline. Do not claim set attention is the
    differentiator yet. First build a relational-required eval; only shrink to
    pointwise if set attention still cannot win when candidate comparison is
-   genuinely required.
+   genuinely required. Re-run set-vs-pointwise on the harder 180-query eval.
 
-4. The mined-negative verdict is deferred. The loop tested no-synthetic
+7. The mined-negative verdict is deferred. The loop tested no-synthetic
    training, not true mined negatives. The likely right answer is mined +
    synthetic + mutated real-turn negatives, but it still needs a fair run.
 
-5. Abstention needs a larger eval and the same global-stop mechanism as budget
+8. Abstention needs a larger eval and the same global-stop mechanism as budget
    packing. The corrected run produced one false-memory event in four
    abstention questions, but n=4 is only directional.
 
-6. The external headline table still needs Hippo encoder, larger holdout,
+9. The external headline table still needs Hippo encoder, larger holdout,
    cross-encoder baseline, and eventually Qwen answer accuracy.
 
-7. Cascaded calibration is worth keeping in the architecture. The first trained
-   test improved recall while staying below 200 ms p95, but it needs a larger
-   50k+ memory test and a prefilter trained for survivor recall.
-
-8. Typed-edge expansion should stay as an optional retrieval-stage feature. The
+10. Typed-edge expansion should stay as an optional retrieval-stage feature. The
    first A/B improved context recall and hard-negative exposure with small
    latency cost, but it needs better write-time edges before it can materially
    lift recall.
 
-9. Entity profiles should move into the write path. The benchmark version used
+11. Entity profiles should move into the write path. The benchmark version used
    labels to test the representation, but the result is strong enough to build
    deterministic log-derived profiles next.
 
-10. Anti-memories should become the correction primitive. They are not a recall
+12. Anti-memories should become the correction primitive. They are not a recall
     lever by themselves, but they clearly reduce hard-negative context exposure
     and make stale/corrected memory behavior explainable.
 
@@ -1222,3 +1238,49 @@ Next action:
   consolidation creates derived cards.
 - Combine this with learned stop/budget packing. Profiles compress context;
   learned stop decides whether the compressed profile is enough.
+
+
+26. Candidate-generation bottleneck from the 180-query runs
+
+Finding:
+- The harder 180-query evals changed the system diagnosis.
+- Earlier 36-query slices showed recall@8 around 0.96 and evidence-in-pool at
+  or near 1.0.
+- The newer 180-query runs show evidence-in-pool around 0.66-0.73 and recall@8
+  around 0.61-0.64.
+
+Interpretation:
+- The calibrator is not the primary bottleneck on these runs.
+- Approximate ceiling check: recall@8 / evidence-in-pool is about 0.85-0.92
+  across the harder runs. That means the calibrator captures most evidence that
+  reaches its pool.
+- Most remaining misses are candidate-generation misses: the right memories do
+  not reach the calibrator at all.
+- This invalidates the older priority ordering where budget packing was first
+  and evidence-in-pool was described as not yet exposing a bottleneck.
+
+Why Hippo encoder is now first:
+- These hard runs used hash embeddings. That backend is useful for deterministic
+  fast validation, but it is a weak semantic candidate generator.
+- The decisive next experiment is the same 180-query attribution eval with
+  `--embedding-backend hippo`.
+- If evidence-in-pool moves toward 0.9+, the architecture story becomes:
+  candidate generation was limited by the encoder, Hippo encoder fixed the
+  pool, and the calibrator was already close to its ceiling.
+- If evidence-in-pool does not move, the union/index strategy needs redesign:
+  larger candidate pools, better lexical-semantic fusion, typed-edge expansion
+  before cascade, or learned query expansion.
+
+Blocked state:
+- Current Colab runtime does not have the `hippo_encoder` package or a Hippo
+  encoder checkpoint under `/content`.
+- The notebook cells were cleaned after the probe; runtime artifacts such as
+  `/content/Hippo-Qwen` and prior benchmark outputs remain on disk.
+
+Next action:
+- Restore or clone the Hippo-encoder source into Colab.
+- Restore the trained Hippo encoder checkpoint.
+- Run the exact 180-query suite with full attribution and compare
+  evidence-in-pool, recall@8, context recall, and hard-negative rates against
+  the hash-backed run.
+- Only after that, retest cascade and packing decisions.
