@@ -103,6 +103,37 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
     return values + [0.0] * (feature_dim - len(values))
 
 
+def apply_feature_ablation(values: list[float], ablation: str) -> list[float]:
+    out = list(values)
+
+    def zero_range(start: int, stop: int) -> None:
+        for index in range(start, min(stop, len(out))):
+            out[index] = 0.0
+
+    def zero_index(index: int) -> None:
+        if 0 <= index < len(out):
+            out[index] = 0.0
+
+    mode = (ablation or "none").strip().lower()
+    if mode in {"", "none"}:
+        return out
+    if mode in {"metadata", "no_metadata"}:
+        zero_range(10, 15)
+    elif mode in {"state", "no_state"}:
+        zero_index(8)
+        zero_index(9)
+        zero_range(16, 21)
+    elif mode in {"state_metadata", "shortcut", "shortcuts", "no_shortcuts"}:
+        zero_range(8, 16)
+        zero_range(16, 21)
+        zero_index(21)
+    elif mode in {"conflict_terms", "no_conflict_terms"}:
+        zero_index(21)
+    else:
+        raise ValueError(f"unknown calibrator feature ablation: {ablation}")
+    return out
+
+
 def tensorize_calibration_payload(
     payload: dict[str, Any],
     max_candidates: int,
@@ -113,19 +144,23 @@ def tensorize_calibration_payload(
     query_embedding = [float(value) for value in payload.get("query_embedding") or []]
     query_embedding = fit_embedding(query_embedding, embedding_dim)
     candidates = [dict(item) for item in payload.get("candidates", [])[:max_candidates]]
+    feature_ablation = str(payload.get("feature_ablation") or "none")
     candidate_tensor = torch.zeros((1, max_candidates, embedding_dim), dtype=torch.float32)
     feature_tensor = torch.zeros((1, max_candidates, feature_dim), dtype=torch.float32)
     mask = torch.zeros((1, max_candidates), dtype=torch.bool)
     for idx, candidate in enumerate(candidates):
         candidate_tensor[0, idx] = torch.tensor(fit_embedding(candidate.get("embedding") or [], embedding_dim), dtype=torch.float32)
         feature_tensor[0, idx] = torch.tensor(
-            calibration_features(
-                query,
-                candidate,
-                int(candidate.get("base_rank") or idx + 1),
-                float(candidate.get("base_score") or 0.0),
-                int(payload.get("budget") or 900),
-                feature_dim,
+            apply_feature_ablation(
+                calibration_features(
+                    query,
+                    candidate,
+                    int(candidate.get("base_rank") or idx + 1),
+                    float(candidate.get("base_score") or 0.0),
+                    int(payload.get("budget") or 900),
+                    feature_dim,
+                ),
+                feature_ablation,
             ),
             dtype=torch.float32,
         )
@@ -197,11 +232,14 @@ def save_calibrator(model: HippoCalibrationTransformer, path: str | Path, **meta
 
 
 def load_calibrator(path: str | Path, device: torch.device | str = "cpu") -> HippoCalibrationTransformer:
-    checkpoint = torch.load(path, map_location=device)
+    try:
+        checkpoint = torch.load(path, map_location=device, weights_only=True)
+    except TypeError:
+        checkpoint = torch.load(path, map_location=device)
     model = HippoCalibrationTransformer(HippoCalibratorConfig(**checkpoint["config"])).to(device)
     state_dict = checkpoint["state_dict"]
     model.has_trained_include_head = any(str(key).startswith("include_head.") for key in state_dict)
-    model.load_state_dict(state_dict, strict=False)
+    model.load_state_dict(state_dict, strict=True)
     model.metadata = dict(checkpoint.get("metadata") or {})
     model.eval()
     return model

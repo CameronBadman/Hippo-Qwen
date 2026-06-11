@@ -38,6 +38,7 @@ def parse_systems(value: str) -> list[str]:
         "token_field",
         "hybrid_faiss_hnsw_token",
         "hybrid_union_token",
+        "hippo_calibrated_union",
     }
     unknown = sorted(set(systems) - valid)
     if unknown:
@@ -229,6 +230,64 @@ def hybrid_union_token_search(
     return ranked, stats, candidate_ids
 
 
+def calibrator_payload(
+    row: dict[str, Any],
+    ranked: Ranked,
+    id_to_candidate: dict[str, dict[str, Any]],
+    backend: Any,
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    candidates = []
+    task = row.get("retrieval_task") or {}
+    query_embedding = query_embedding_for(row, backend)
+    for rank, (candidate_id, score, _) in enumerate(ranked[: int(args.calibrator_max_candidates)], start=1):
+        candidate = dict(id_to_candidate.get(str(candidate_id)) or {})
+        if not candidate:
+            continue
+        candidate["base_rank"] = rank
+        candidate["base_score"] = float(score)
+        candidates.append(candidate)
+    return {
+        "query": str(task.get("query") or ""),
+        "qa_id": str(task.get("qa_id") or ""),
+        "question_type": str(task.get("question_type") or ""),
+        "query_embedding": query_embedding,
+        "budget": int(task.get("budget") or args.budget),
+        "feature_ablation": str(getattr(args, "calibrator_feature_ablation", "none") or "none"),
+        "candidates": candidates,
+    }
+
+
+def calibrated_union_search(
+    row: dict[str, Any],
+    backend: Any,
+    faiss_built: dict[str, Any],
+    token_index: TokenFieldIndex,
+    calibrator: Any,
+    id_to_candidate: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float], set[str]]:
+    from python.librarian.hippo_calibrator import rerank_with_calibrator
+
+    started = time.perf_counter()
+    raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    ranked = rerank_with_calibrator(
+        calibrator,
+        calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
+        relevance_weight=args.rerank_relevance_weight,
+        include_weight=args.rerank_include_weight,
+        base_weight=args.rerank_base_weight,
+        utility_weight=args.rerank_utility_weight,
+    )
+    total_latency_ms = (time.perf_counter() - started) * 1000.0
+    search_latency_ms = float(stats.get("latency_ms") or 0.0)
+    out = dict(stats)
+    out["search_latency_ms"] = search_latency_ms
+    out["latency_ms"] = total_latency_ms
+    out["calibrator_latency_ms"] = max(0.0, total_latency_ms - search_latency_ms)
+    return ranked, out, candidate_ids
+
+
 def build_hnswlib(row: dict[str, Any], args: argparse.Namespace) -> dict[str, Any]:
     try:
         import hnswlib
@@ -319,6 +378,7 @@ def run_dataset(
     backend: Any,
     work_dir: Path,
     args: argparse.Namespace,
+    calibrator: Any = None,
 ) -> dict[str, Any]:
     systems = []
     if "exact_vector" in args.systems:
@@ -482,6 +542,36 @@ def run_dataset(
             }
         )
         systems.append(union_result)
+    if "hippo_calibrated_union" in args.systems:
+        if calibrator is None:
+            raise ValueError("--calibrator-checkpoint is required when --systems includes hippo_calibrated_union")
+        build_started = time.perf_counter()
+        faiss_built = build_faiss(row, args, "hnsw")
+        token_index = build_token_field_index(row, args)
+        id_to_candidate = {str(candidate.get("id") or ""): dict(candidate) for candidate in row.get("candidates", [])}
+        build_ms = (time.perf_counter() - build_started) * 1000.0
+        calibrated_result = run_repeated(
+            "hippo_calibrated_union",
+            row,
+            lambda item: calibrated_union_search(item, backend, faiss_built, token_index, calibrator, id_to_candidate, args),
+            args,
+        )
+        calibrated_result.update(
+            {
+                "build_latency_ms": build_ms,
+                "memory_count": len(token_index.nodes),
+                "node_record_count": len(token_index.nodes),
+                "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
+                "edge_count": 0,
+                "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
+                "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
+                "hybrid_token_candidate_fetch": int(getattr(args, "hybrid_token_candidate_fetch", args.max_candidates)),
+                "calibrator_max_candidates": int(args.calibrator_max_candidates),
+                "hybrid_union_vector_weight": float(args.hybrid_union_vector_weight),
+                "hybrid_union_token_weight": float(args.hybrid_union_token_weight),
+            }
+        )
+        systems.append(calibrated_result)
     return {"name": name, "systems": systems}
 
 
@@ -498,8 +588,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- dim_count: `{result['dim_count']}`",
         f"- max_cell_scan: `{result['max_cell_scan']}`",
         "",
-        "| dataset | system | memories | index MB | build ms | p50 ms | p95 ms | recall | precision | payload p95 | known vector scan p95 | candidates/read p95 | deterministic |",
-        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| dataset | system | memories | index MB | build ms | p50 ms | p95 ms | search p95 | calibrator p95 | recall | precision | payload p95 | known vector scan p95 | candidates/read p95 | deterministic |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for dataset in result["datasets"]:
         for system in dataset["systems"]:
@@ -513,6 +603,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
                 f"{system['build_latency_ms']:.2f} | "
                 f"{metrics.get('latency_ms', {}).get('p50', 0.0):.2f} | "
                 f"{metrics.get('latency_ms', {}).get('p95', 0.0):.2f} | "
+                f"{metric_cell(metrics, 'search_latency_ms')} | "
+                f"{metric_cell(metrics, 'calibrator_latency_ms')} | "
                 f"{metrics.get('retrieval_context_recall', {}).get('avg', 0.0):.4f} | "
                 f"{metrics.get('retrieval_context_precision', {}).get('avg', 0.0):.4f} | "
                 f"{metric_cell(metrics, 'payload_reads')} | "
@@ -527,13 +619,23 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     backend = build_embedding_backend(args)
+    calibrator = None
+    if "hippo_calibrated_union" in args.systems:
+        if not args.calibrator_checkpoint:
+            raise ValueError("--calibrator-checkpoint is required when --systems includes hippo_calibrated_union")
+        import torch
+
+        from python.librarian.hippo_calibrator import load_calibrator
+
+        device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
+        calibrator = load_calibrator(args.calibrator_checkpoint, device=device)
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     base = ensure_backend_embeddings(build_large_pool_case(args.seed, args.pool_size), backend)
-    datasets = [run_dataset("baseline", base, backend, work_dir, args)]
+    datasets = [run_dataset("baseline", base, backend, work_dir, args, calibrator)]
     for scenario in args.growth_scenarios:
         grown = ensure_backend_embeddings(grow_row(base, scenario, args.growth_count, args.seed), backend)
-        datasets.append(run_dataset(scenario, grown, backend, work_dir, args))
+        datasets.append(run_dataset(scenario, grown, backend, work_dir, args, calibrator))
     result = {
         "benchmark": "vector_db_compare",
         "embedding_backend": backend.name,
@@ -542,6 +644,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "growth_scenarios": args.growth_scenarios,
         "repeat_searches": args.repeat_searches,
         "systems": args.systems,
+        "calibrator_checkpoint": args.calibrator_checkpoint,
+        "calibrator_max_candidates": args.calibrator_max_candidates,
+        "calibrator_feature_ablation": args.calibrator_feature_ablation,
         "seed": args.seed,
         "dim_count": args.dim_count,
         "layers": args.layers,
@@ -619,6 +724,13 @@ def main() -> None:
     parser.add_argument("--hybrid-semantic-weight", type=float, default=0.15)
     parser.add_argument("--hybrid-field-weight", type=float, default=0.08)
     parser.add_argument("--hybrid-activation-weight", type=float, default=0.02)
+    parser.add_argument("--calibrator-checkpoint", default="")
+    parser.add_argument("--calibrator-max-candidates", type=int, default=64)
+    parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
+    parser.add_argument("--rerank-relevance-weight", type=float, default=None)
+    parser.add_argument("--rerank-include-weight", type=float, default=None)
+    parser.add_argument("--rerank-base-weight", type=float, default=None)
+    parser.add_argument("--rerank-utility-weight", type=float, default=None)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--hippo-checkpoint", default="")
     parser.add_argument("--hippo-encoder-src", default="")

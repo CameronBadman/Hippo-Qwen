@@ -177,6 +177,7 @@ def memorycraft_args(
         repeat_searches=args.repeat_searches,
         adversarial_negatives=adversarial_negatives,
         adversarial_profile=profile,
+        adversarial_style=args.adversarial_style,
         work_dir=str(output_dir / "work" / suite_name),
         top_k=args.top_k,
         budget=args.budget,
@@ -203,6 +204,7 @@ def memorycraft_args(
         final_fetch=args.final_fetch,
         calibrator_checkpoint=calibrator_checkpoint,
         calibrator_max_candidates=candidate_pool,
+        calibrator_feature_ablation=args.calibrator_feature_ablation,
         rerank_relevance_weight=args.rerank_relevance_weight,
         rerank_include_weight=args.rerank_include_weight,
         rerank_base_weight=args.rerank_base_weight,
@@ -319,6 +321,8 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         f"- budget: `{args.budget}`",
         f"- latency target: `{args.latency_target_ms:.1f} ms`",
         f"- repeat searches: `{args.repeat_searches}`",
+        f"- adversarial style: `{args.adversarial_style}`",
+        f"- calibrator feature ablation: `{args.calibrator_feature_ablation}`",
         "",
         "## Leaderboard",
         "",
@@ -482,6 +486,7 @@ def main() -> None:
     parser.add_argument("--unit", choices=["auto", "turn", "session"], default="auto")
     parser.add_argument("--profiles", default=DEFAULT_PROFILES)
     parser.add_argument("--adversarial-negatives", type=int, default=8)
+    parser.add_argument("--adversarial-style", choices=["legacy", "forensic"], default="forensic")
     parser.add_argument("--candidate-pools", default="64,128,256")
     parser.add_argument("--calibrator", action="append", default=[])
     parser.add_argument("--baseline-systems", default=DEFAULT_BASELINE_SYSTEMS)
@@ -511,6 +516,7 @@ def main() -> None:
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--final-fetch", type=int, default=128)
+    parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)
     parser.add_argument("--rerank-base-weight", type=float, default=None)

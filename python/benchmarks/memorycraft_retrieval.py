@@ -225,6 +225,29 @@ def stable_pick(values: list[str], key: str) -> str:
     return values[fnv1a64(key) % len(values)]
 
 
+def stable_candidate_pick(candidates: list[dict[str, Any]], key: str) -> dict[str, Any]:
+    if not candidates:
+        return {}
+    ordered = sorted(candidates, key=lambda item: str(item.get("id") or ""))
+    return dict(ordered[fnv1a64(key) % len(ordered)])
+
+
+def real_card_state(candidate: dict[str, Any], fallback_project: str) -> dict[str, Any]:
+    metadata = dict(candidate.get("metadata") or {})
+    if not metadata:
+        metadata = {"project": fallback_project}
+    return {
+        "summary": str(candidate.get("summary") or "")[:240],
+        "cluster": str(candidate.get("cluster") or fallback_project),
+        "importance": float(candidate.get("importance") or 0.5),
+        "age_days": int(candidate.get("age_days") or 0),
+        "use_count": int(candidate.get("use_count") or 0),
+        "evidence_count": int(candidate.get("evidence_count") or 0),
+        "last_outcome": str(candidate.get("last_outcome") or ""),
+        "metadata": metadata,
+    }
+
+
 def adversarial_cards_for_qa(
     base: dict[str, Any],
     qa: dict[str, Any],
@@ -240,7 +263,7 @@ def adversarial_cards_for_qa(
     id_to_candidate = {str(candidate.get("id") or ""): candidate for candidate in base.get("candidates", [])}
     positive_text = " ".join(str(id_to_candidate[item].get("text") or "") for item in sorted(relevant) if item in id_to_candidate)[:360]
     project = str((base.get("anchor") or {}).get("cluster") or (base.get("anchor") or {}).get("id") or "memorycraft")
-    templates = [
+    legacy_templates = [
         (
             "query_echo",
             "{query} This memory repeats the query wording but is not the evidence-bearing turn.",
@@ -277,15 +300,76 @@ def adversarial_cards_for_qa(
             {"age_days": 6, "use_count": 20, "evidence_count": 3, "last_outcome": "ignored", "importance": 0.66},
         ),
     ]
+    forensic_templates = [
+        (
+            "query_echo",
+            "{query} Follow-up note from the same conversation thread.",
+            {},
+        ),
+        (
+            "answer_shaped",
+            "{query} The remembered response was: {answer}.",
+            {},
+        ),
+        (
+            "superseded_conflict",
+            "Earlier note near the same topic: {positive}",
+            {},
+        ),
+        (
+            "near_duplicate",
+            "{positive} Related note for {query}.",
+            {},
+        ),
+        (
+            "stale_preference",
+            "{query} Older preference note from a previous session.",
+            {},
+        ),
+        (
+            "same_entity_wrong_time",
+            "{query} Same topic appeared in a different weekly review.",
+            {},
+        ),
+        (
+            "evidence_adjacent",
+            "{positive} Adjacent conversation context for {query}.",
+            {},
+        ),
+    ]
+    adversarial_style = str(getattr(args, "adversarial_style", "forensic") or "forensic")
+    templates = legacy_templates if adversarial_style == "legacy" else forensic_templates
     profile = str(getattr(args, "adversarial_profile", "mixed") or "mixed")
     if profile not in ADVERSARIAL_PROFILES:
         raise ValueError(f"unknown adversarial profile: {profile}")
     if profile != "mixed":
         templates = [item for item in templates if item[0] == profile]
     out = []
+    non_relevant_candidates = [candidate for candidate in base.get("candidates", []) if str(candidate.get("id") or "") not in relevant]
+    donor_pool = non_relevant_candidates or list(base.get("candidates", []))
     for index in range(count):
         key = f"{qa_id}:{query}:{index}:{','.join(sorted(relevant))}"
         role, template, state = templates[fnv1a64(key) % len(templates)]
+        donor_state = real_card_state(stable_candidate_pick(donor_pool, key), project)
+        if adversarial_style == "legacy":
+            card_state = {
+                "summary": "",
+                "cluster": project,
+                "importance": state["importance"],
+                "age_days": state["age_days"] + int(fnv1a64(f"{key}:age") % 9),
+                "use_count": state["use_count"],
+                "evidence_count": state["evidence_count"],
+                "last_outcome": state["last_outcome"],
+                "metadata": {
+                    "project": project,
+                    "adversarial": True,
+                    "adversarial_type": role,
+                    "adversarial_profile": profile,
+                    "qa_id": qa_id,
+                },
+            }
+        else:
+            card_state = donor_state
         fallback_positive = stable_pick(
             [
                 "a nearby conversation note with overlapping entities",
@@ -299,21 +383,15 @@ def adversarial_cards_for_qa(
             {
                 "id": f"adversarial_eval::{qa_id or 'qa'}::{index}",
                 "text": text,
-                "summary": "",
-                "cluster": project,
-                "importance": state["importance"],
-                "age_days": state["age_days"] + int(fnv1a64(f"{key}:age") % 9),
-                "use_count": state["use_count"],
-                "evidence_count": state["evidence_count"],
-                "last_outcome": state["last_outcome"],
+                "summary": card_state["summary"],
+                "cluster": card_state["cluster"],
+                "importance": card_state["importance"],
+                "age_days": card_state["age_days"],
+                "use_count": card_state["use_count"],
+                "evidence_count": card_state["evidence_count"],
+                "last_outcome": card_state["last_outcome"],
                 "synthetic_role": role,
-                "metadata": {
-                    "project": project,
-                    "adversarial": True,
-                    "adversarial_type": role,
-                    "adversarial_profile": profile,
-                    "qa_id": qa_id,
-                },
+                "metadata": card_state["metadata"],
             }
         )
     return out
@@ -544,7 +622,7 @@ def calibrator_payload(
         "question_type": str(task.get("question_type") or ""),
         "query_embedding": query_embedding_for(row, backend),
         "budget": int(task.get("budget") or args.budget),
-        "relevant_ids": list(task.get("relevant_ids") or []),
+        "feature_ablation": str(getattr(args, "calibrator_feature_ablation", "none") or "none"),
         "candidates": candidates,
     }
 
@@ -870,6 +948,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- budget: `{result['budget']}`",
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
+        f"- adversarial_style: `{result['adversarial_style']}`",
+        f"- calibrator_feature_ablation: `{result['calibrator_feature_ablation']}`",
         "",
         "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | hard neg@k | mrr | deterministic |",
         "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
@@ -946,6 +1026,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "repeat_searches": args.repeat_searches,
         "adversarial_negatives": int(args.adversarial_negatives),
         "adversarial_profile": str(args.adversarial_profile),
+        "adversarial_style": str(args.adversarial_style),
+        "calibrator_feature_ablation": str(args.calibrator_feature_ablation),
         "rerank_relevance_weight": args.rerank_relevance_weight,
         "rerank_include_weight": args.rerank_include_weight,
         "rerank_base_weight": args.rerank_base_weight,
@@ -976,6 +1058,7 @@ def main() -> None:
     parser.add_argument("--repeat-searches", type=int, default=1)
     parser.add_argument("--adversarial-negatives", type=int, default=0)
     parser.add_argument("--adversarial-profile", choices=sorted(ADVERSARIAL_PROFILES), default="mixed")
+    parser.add_argument("--adversarial-style", choices=["legacy", "forensic"], default="forensic")
     parser.add_argument("--work-dir", default="artifacts/memorycraft_retrieval")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
@@ -1002,6 +1085,7 @@ def main() -> None:
     parser.add_argument("--final-fetch", type=int, default=96)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-max-candidates", type=int, default=128)
+    parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)
     parser.add_argument("--rerank-base-weight", type=float, default=None)

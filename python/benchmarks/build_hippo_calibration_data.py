@@ -19,6 +19,8 @@ from python.benchmarks.memorycraft_retrieval import (
     normalize_evidence,
     query_row,
     record_index_row,
+    real_card_state,
+    stable_candidate_pick,
     unit_mode,
 )
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, query_embedding_for, search_rope_delta_grid
@@ -58,7 +60,7 @@ def synthetic_hard_negative_cards(
     positive_text = " ".join(str(candidate.get("text") or "") for candidate in positives)[:360]
     anchor = row.get("anchor") or {}
     project = str((anchor.get("metadata") or {}).get("project") or anchor.get("cluster") or "memorycraft")
-    templates = [
+    legacy_templates = [
         (
             "semantic_query_echo_negative",
             "{query} This note repeats the question terms but is a distractor. It was not the accepted evidence.",
@@ -105,10 +107,41 @@ def synthetic_hard_negative_cards(
             {"age_days": 18, "use_count": 31, "evidence_count": 8, "last_outcome": "ignored", "importance": 0.74},
         ),
     ]
+    forensic_templates = [
+        ("semantic_query_echo_negative", "{query} Follow-up note from the same conversation thread.", {}),
+        ("contradicted_positive_negative", "Earlier note near the same topic: {positive}", {}),
+        ("same_context_wrong_answer_negative", "{query} The remembered response was: {answer}.", {}),
+        ("stale_popular_negative", "{query} Older preference note from a previous session.", {}),
+        ("near_duplicate_non_authoritative_negative", "{positive} Related note for {query}.", {}),
+        ("same_entity_wrong_time_negative", "{query} Same topic appeared in a different weekly review.", {}),
+        ("evidence_adjacent_but_wrong_negative", "{positive} Adjacent conversation context for {query}.", {}),
+        ("stale_preference_negative", "{query} Previous session preference note with similar wording.", {}),
+        ("answer_shaped_wrong_fact_negative", "Remembered answer for {query}: {answer}.", {}),
+    ]
+    negative_style = str(getattr(args, "synthetic_hard_negative_style", "forensic") or "forensic")
+    templates = legacy_templates if negative_style == "legacy" else forensic_templates
+    donor_pool = [candidate for candidate_id, candidate in id_to_candidate.items() if candidate_id not in relevant] or list(id_to_candidate.values())
     out: list[dict[str, Any]] = []
     for index in range(count):
         key = f"{qa_id}:{query}:{index}:{','.join(sorted(relevant))}"
         role, template, state = templates[fnv1a64(key) % len(templates)]
+        donor_state = real_card_state(stable_candidate_pick([dict(candidate) for candidate in donor_pool], key), project)
+        if negative_style == "legacy":
+            card_state = {
+                "summary": "",
+                "importance": state["importance"],
+                "cluster": project,
+                "metadata": {
+                    "project": project,
+                    "hard_negative_type": role,
+                },
+                "age_days": state["age_days"] + int(fnv1a64(f"{key}:age") % 11),
+                "use_count": state["use_count"],
+                "evidence_count": state["evidence_count"],
+                "last_outcome": state["last_outcome"],
+            }
+        else:
+            card_state = donor_state
         fallback_positive = stable_pick(
             [
                 "a similar looking memory from the same project",
@@ -125,17 +158,14 @@ def synthetic_hard_negative_cards(
         candidate = {
             "id": f"synthetic_hard_negative::{qa_id or 'qa'}::{index}",
             "text": text,
-            "summary": "",
-            "importance": state["importance"],
-            "cluster": project,
-            "metadata": {
-                "project": project,
-                "hard_negative_type": role,
-            },
-            "age_days": state["age_days"] + int(fnv1a64(f"{key}:age") % 11),
-            "use_count": state["use_count"],
-            "evidence_count": state["evidence_count"],
-            "last_outcome": state["last_outcome"],
+            "summary": card_state["summary"],
+            "importance": card_state["importance"],
+            "cluster": card_state["cluster"],
+            "metadata": card_state["metadata"],
+            "age_days": card_state["age_days"],
+            "use_count": card_state["use_count"],
+            "evidence_count": card_state["evidence_count"],
+            "last_outcome": card_state["last_outcome"],
             "synthetic_role": role,
             "hard_negative": True,
             "include_label": 0.0,
@@ -301,6 +331,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "records": len(records),
         "candidate_source": str(args.candidate_source),
         "synthetic_hard_negatives": int(args.synthetic_hard_negatives),
+        "synthetic_hard_negative_style": str(args.synthetic_hard_negative_style),
         "synthetic_hard_negative_weight": float(args.synthetic_hard_negative_weight),
         "synthetic_include_weight": float(args.synthetic_include_weight),
         "near_miss_include_weight": float(args.near_miss_include_weight),
@@ -328,6 +359,7 @@ def main() -> None:
     parser.add_argument("--candidate-source", choices=["rope", "union"], default="rope")
     parser.add_argument("--inject-missing-relevant", action="store_true")
     parser.add_argument("--synthetic-hard-negatives", type=int, default=0)
+    parser.add_argument("--synthetic-hard-negative-style", choices=["legacy", "forensic"], default="forensic")
     parser.add_argument("--synthetic-hard-negative-weight", type=float, default=3.0)
     parser.add_argument("--synthetic-include-weight", type=float, default=6.0)
     parser.add_argument("--near-miss-include-weight", type=float, default=8.0)
