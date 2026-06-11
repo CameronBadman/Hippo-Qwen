@@ -1462,3 +1462,84 @@ Likely fixes to test next:
   of filling a large budget with weak neighbors.
 - Cache embeddings and vector indexes so repeated stress sweeps measure
   retrieval choices rather than rebuild cost.
+
+
+29. Deterministic metadata and typed-graph expansion
+
+Implemented and tested.
+
+Setup:
+- Hippo-Qwen commit: `53ae732`.
+- Runtime: Colab A100.
+- Benchmark: `python/benchmarks/session_memory_stress.py`.
+- Added structured `brand` and `entities` metadata to stress memories.
+- Added candidate-source attribution:
+  vector fetch, token fetch, metadata fetch, graph fetch, final pool, recall@8,
+  recall@16, recall@32, and hit-any-relevant.
+- Added deterministic metadata expansion over user, project, brand, session, and
+  entity fields.
+- Added deterministic typed graph expansion over same-session, same-project,
+  same-brand, and same-user edges.
+- Baseline settings: vector fetch 1024, token fetch 1024, candidate pool 128.
+- Expanded settings: metadata fetch 256, graph fetch 256, graph seed count 48,
+  graph per seed 24, candidate pool 128.
+- Calibrator: fresh 768-d set calibrator trained on MemoryCraft-style Hippo
+  rows, not yet trained on the stress distribution.
+
+Artifacts:
+- `/content/session_memory_stress_expansion/10000_baseline/summary.md`
+- `/content/session_memory_stress_expansion/10000_expanded/summary.md`
+- `/content/session_memory_stress_expansion/50000_baseline/summary.md`
+- `/content/session_memory_stress_expansion/50000_expanded/summary.md`
+- `/content/session_memory_stress_expansion/combined_summary.json`
+
+Results:
+
+| memories | mode | system | pool | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context precision |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10k | baseline | calibrated | 0.2694 | 0.0000 | 0.0000 | 0.2139 | 0.2194 | 0.2250 | 0.6417 | 0.0802 | 0.0292 | 0.0201 |
+| 10k | expanded | calibrated | 1.0000 | 1.0000 | 1.0000 | 0.6444 | 0.8139 | 0.9944 | 0.9500 | 0.2417 | 0.2573 | 0.0749 |
+| 50k | baseline | calibrated | 0.2444 | 0.0000 | 0.0000 | 0.1722 | 0.1917 | 0.1972 | 0.5167 | 0.0646 | 0.0479 | 0.0175 |
+| 50k | expanded | calibrated | 1.0000 | 1.0000 | 1.0000 | 0.7194 | 0.8722 | 0.9972 | 0.9917 | 0.2698 | 0.2750 | 0.0706 |
+| 50k | expanded | hybrid | 1.0000 | 1.0000 | 1.0000 | 0.7056 | 0.9500 | 1.0000 | 0.9417 | 0.2646 | 0.5896 | 0.0707 |
+| 50k | expanded | vector | 0.1028 | 1.0000 | 1.0000 | 0.0083 | 0.0222 | 0.0611 | 0.0250 | 0.0031 | 0.7542 | 0.0052 |
+
+Interpretation:
+- The graph/entity candidate-generation hypothesis is strongly supported on the
+  stress benchmark.
+- The previous 50k failure was mostly a candidate-generation failure. Once
+  deterministic metadata and graph expansion are enabled, evidence-in-pool moves
+  from 0.2444 to 1.0000.
+- 50k calibrated recall@8 moves from 0.1722 to 0.7194. This clears the rough
+  0.50 recall threshold discussed as the minimum credible go-to-market target
+  for this benchmark.
+- Recall@16 and recall@32 are very strong after expansion: 0.8722 and 0.9972 at
+  50k. This confirms that the right evidence is now present and near the top.
+- The calibrator still matters: at 50k expanded, it cuts hard-negative top-k
+  exposure from 0.5896 for hybrid to 0.2750.
+- However, hard-negative exposure is still too high for a polished memory API.
+  Candidate generation is no longer the main bottleneck under this synthetic
+  benchmark; reranker training and learned packing are now the bottlenecks.
+
+Important caveat:
+- Metadata expansion has perfect access to the benchmark's structured user,
+  project, and brand fields. That is realistic for many agent memory systems,
+  but it is also an easier workload than unstructured memory ingestion.
+- The next test should include partial/missing metadata and noisy entity
+  extraction so the graph layer is evaluated under realistic write-path errors.
+
+Verdict:
+- Keep typed graph/entity expansion as a core part of the architecture.
+- This is the first run where the 50k stress benchmark looks technically
+  promising rather than only diagnostic.
+- Do not claim production quality yet because precision and hard-negative
+  suppression are still weak.
+
+Next action:
+- Train the calibrator on session-stress candidate pools, including the new
+  metadata and graph candidates.
+- Add a learned include/stop packer to prevent large weak contexts.
+- Run partial-metadata ablations:
+  100%, 70%, 40%, and 0% metadata availability.
+- Run quota sweeps to find the smallest metadata/graph quota that keeps 50k
+  recall@8 above 0.50.

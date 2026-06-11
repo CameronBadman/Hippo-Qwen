@@ -27,7 +27,7 @@ The latest stress run used:
 - Token fetch 1024.
 - Fresh 768-d set calibrator.
 
-## Benchmark Result
+## Original Benchmark Result
 
 The 50k result is not market-ready.
 
@@ -48,6 +48,29 @@ Interpretation:
 - The calibrator cannot recover memories that never enter the pool.
 - The calibrator is still useful because it cuts hard-negative exposure from
   0.5000 to 0.0490 at 50k.
+
+## Updated Benchmark Result
+
+After adding deterministic metadata/entity expansion and typed graph candidate
+expansion, the 50k result changed materially.
+
+| memories | mode | system | evidence in pool | recall@8 | recall@16 | recall@32 | hard neg@8 |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: |
+| 50k | baseline | calibrated | 0.2444 | 0.1722 | 0.1917 | 0.1972 | 0.0479 |
+| 50k | expanded | calibrated | 1.0000 | 0.7194 | 0.8722 | 0.9972 | 0.2750 |
+| 50k | expanded | hybrid | 1.0000 | 0.7056 | 0.9500 | 1.0000 | 0.5896 |
+
+Interpretation:
+
+- The graph/entity candidate-generation hypothesis worked on the synthetic
+  stress benchmark.
+- Candidate generation is no longer the main blocker when structured metadata
+  and typed graph expansion are available.
+- 50k recall@8 moved past the rough 0.50 go-to-market threshold for this
+  benchmark.
+- Hard-negative exposure is now the main quality problem.
+- The calibrator suppresses hard negatives compared with hybrid, but 0.2750 is
+  still too high.
 
 ## Core Diagnosis
 
@@ -73,7 +96,8 @@ Examples:
 - Recent related preference.
 
 The next architecture should make the graph a candidate generator, not just a
-storage or visualization layer.
+storage or visualization layer. The first implementation confirmed this on the
+session stress benchmark.
 
 ## Next Architecture
 
@@ -281,14 +305,22 @@ generation and recall-oriented training.
 
 ## Immediate Next Commit Target
 
-Build this in the next implementation loop:
+The first implementation loop is complete:
 
-1. Add attribution metrics to `session_memory_stress.py`.
-2. Add deterministic metadata/entity candidate expansion.
-3. Add typed graph expansion as an optional candidate source.
-4. Run 10k and 50k sweeps.
-5. Update `HIPPO_QWEN_NEXT_IDEAS.txt` with whether evidence-in-pool reaches the
-   0.65+ range.
+1. Added attribution metrics to `session_memory_stress.py`.
+2. Added deterministic metadata/entity candidate expansion.
+3. Added typed graph expansion as an optional candidate source.
+4. Ran 10k and 50k baseline vs expanded comparisons.
+5. Updated `HIPPO_QWEN_NEXT_IDEAS.txt`.
 
-If this lifts 50k `recall@8` above 0.50 while keeping hard-negative top-k below
-0.10, the project becomes much closer to a credible pilot.
+Next implementation loop:
+
+1. Generate calibrator training rows from `session_memory_stress.py`.
+2. Train on expanded metadata/graph candidate pools.
+3. Add partial metadata ablations: 100%, 70%, 40%, and 0% metadata availability.
+4. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
+   recall@8 above 0.50.
+5. Add learned include/stop packing.
+
+The current 50k recall@8 is promising, but hard-negative top-k must move from
+0.2750 toward 0.10 or lower before this is a credible memory API quality claim.
