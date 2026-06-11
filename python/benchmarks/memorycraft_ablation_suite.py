@@ -124,6 +124,8 @@ def summarize_result(
                 "p95_ms": float(latency.get("p95", 0.0)),
                 "search_p95_ms": float((metrics.get("search_latency_ms") or {}).get("p95", 0.0)),
                 "calibrator_p95_ms": float((metrics.get("calibrator_latency_ms") or {}).get("p95", 0.0)),
+                "cascade_prefilter_candidates": float((metrics.get("cascade_prefilter_candidate_count") or {}).get("avg", 0.0)),
+                "cascade_survivor_candidates": float((metrics.get("cascade_survivor_count") or {}).get("avg", 0.0)),
                 "recall_at_8": float((metrics.get("recall_at_k") or {}).get("avg", 0.0)),
                 "precision_at_8": float((metrics.get("precision_at_k") or {}).get("avg", 0.0)),
                 "context_recall": float((metrics.get("context_recall") or {}).get("avg", 0.0)),
@@ -210,6 +212,13 @@ def memorycraft_args(
         final_fetch=args.final_fetch,
         calibrator_checkpoint=calibrator_checkpoint,
         calibrator_max_candidates=candidate_pool,
+        cascade_prefilter_checkpoint=args.cascade_prefilter_checkpoint,
+        cascade_prefilter_candidates=args.cascade_prefilter_candidates,
+        cascade_survivor_candidates=candidate_pool if candidate_pool > 0 else args.cascade_survivor_candidates,
+        cascade_prefilter_relevance_weight=args.cascade_prefilter_relevance_weight,
+        cascade_prefilter_include_weight=args.cascade_prefilter_include_weight,
+        cascade_prefilter_base_weight=args.cascade_prefilter_base_weight,
+        cascade_prefilter_utility_weight=args.cascade_prefilter_utility_weight,
         calibrator_feature_ablation=args.calibrator_feature_ablation,
         rerank_relevance_weight=args.rerank_relevance_weight,
         rerank_include_weight=args.rerank_include_weight,
@@ -376,6 +385,7 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         "- retrieval system: FAISS/HNSW, raw FAISS+token union, calibrated Hippo union",
         "- adversarial profile: clean or one deterministic hard-negative family",
         "- candidate pool: number of union candidates passed into the calibrator",
+        "- cascade: optional pointwise prefilter over a larger pool, followed by set calibration over survivors",
         "- calibrator checkpoint: named model artifact supplied with `--calibrator name=path`",
         "",
         "## Metrics",
@@ -534,6 +544,13 @@ def main() -> None:
     parser.add_argument("--edge-seed-count", type=int, default=48)
     parser.add_argument("--graph-depth", type=int, default=2)
     parser.add_argument("--final-fetch", type=int, default=128)
+    parser.add_argument("--cascade-prefilter-checkpoint", default="")
+    parser.add_argument("--cascade-prefilter-candidates", type=int, default=1024)
+    parser.add_argument("--cascade-survivor-candidates", type=int, default=64)
+    parser.add_argument("--cascade-prefilter-relevance-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-include-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-base-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-utility-weight", type=float, default=None)
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)

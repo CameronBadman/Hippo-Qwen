@@ -95,6 +95,7 @@ def parse_systems(value: str) -> list[str]:
         "hippo_rope_grid",
         "hippo_calibrated",
         "hippo_calibrated_union",
+        "hippo_cascade_union",
         "hybrid_union_token",
         "agent_memory_graph",
     }
@@ -668,6 +669,8 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "token_candidate_latency_ms": float(stats.get("token_candidate_latency_ms") or 0.0),
         "token_candidate_count": float(stats.get("token_candidate_count") or 0.0),
         "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
+        "cascade_prefilter_candidate_count": float(stats.get("cascade_prefilter_candidate_count") or 0.0),
+        "cascade_survivor_count": float(stats.get("cascade_survivor_count") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget, int(getattr(args, "context_max_items", 0) or 0)))
     out.update(evidence_pool_metrics(row, ranked, stats, args.top_k))
@@ -707,9 +710,11 @@ def calibrator_payload(
     id_to_candidate: dict[str, dict[str, Any]],
     backend: Any,
     args: argparse.Namespace,
+    max_candidates: int | None = None,
 ) -> dict[str, Any]:
     candidates = []
-    for rank, (candidate_id, score, _) in enumerate(ranked[: int(args.calibrator_max_candidates)], start=1):
+    limit = int(max_candidates if max_candidates is not None else args.calibrator_max_candidates)
+    for rank, (candidate_id, score, _) in enumerate(ranked[:limit], start=1):
         candidate = dict(id_to_candidate.get(candidate_id) or {})
         if not candidate:
             continue
@@ -746,6 +751,7 @@ def calibrated_search(
     ranked = rerank_with_calibrator(
         calibrator,
         calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
+        max_candidates=int(args.calibrator_max_candidates),
         relevance_weight=args.rerank_relevance_weight,
         include_weight=args.rerank_include_weight,
         base_weight=args.rerank_base_weight,
@@ -777,6 +783,7 @@ def calibrated_union_search(
     ranked = rerank_with_calibrator(
         calibrator,
         calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
+        max_candidates=int(args.calibrator_max_candidates),
         relevance_weight=args.rerank_relevance_weight,
         include_weight=args.rerank_include_weight,
         base_weight=args.rerank_base_weight,
@@ -791,6 +798,53 @@ def calibrated_union_search(
     return ranked, out, candidate_ids
 
 
+def cascaded_calibrated_union_search(
+    row: dict[str, Any],
+    backend: Any,
+    faiss_built: dict[str, Any],
+    token_index: Any,
+    prefilter_calibrator: Any,
+    set_calibrator: Any,
+    id_to_candidate: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float], set[str]]:
+    from python.librarian.hippo_calibrator import rerank_with_calibrator
+
+    started = time.perf_counter()
+    raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    prefilter_count = max(int(args.cascade_prefilter_candidates), int(args.cascade_survivor_candidates))
+    survivor_count = int(args.cascade_survivor_candidates)
+    stage1_ranked = rerank_with_calibrator(
+        prefilter_calibrator,
+        calibrator_payload(row, raw_ranked, id_to_candidate, backend, args, max_candidates=prefilter_count),
+        max_candidates=prefilter_count,
+        relevance_weight=args.cascade_prefilter_relevance_weight,
+        include_weight=args.cascade_prefilter_include_weight,
+        base_weight=args.cascade_prefilter_base_weight,
+        utility_weight=args.cascade_prefilter_utility_weight,
+    )
+    survivors = stage1_ranked[:survivor_count]
+    stats["_calibrator_candidate_ids"] = {item[0] for item in survivors}
+    ranked = rerank_with_calibrator(
+        set_calibrator,
+        calibrator_payload(row, survivors, id_to_candidate, backend, args, max_candidates=survivor_count),
+        max_candidates=survivor_count,
+        relevance_weight=args.rerank_relevance_weight,
+        include_weight=args.rerank_include_weight,
+        base_weight=args.rerank_base_weight,
+        utility_weight=args.rerank_utility_weight,
+    )
+    total_latency_ms = (time.perf_counter() - started) * 1000.0
+    search_latency_ms = float(stats.get("latency_ms") or 0.0)
+    out = dict(stats)
+    out["search_latency_ms"] = search_latency_ms
+    out["latency_ms"] = total_latency_ms
+    out["calibrator_latency_ms"] = max(0.0, total_latency_ms - search_latency_ms)
+    out["cascade_prefilter_candidate_count"] = float(prefilter_count)
+    out["cascade_survivor_count"] = float(len(survivors))
+    return ranked, out, candidate_ids
+
+
 def run_record(
     record: dict[str, Any],
     record_number: int,
@@ -798,6 +852,7 @@ def run_record(
     work_dir: Path,
     args: argparse.Namespace,
     calibrator: Any = None,
+    cascade_prefilter: Any = None,
 ) -> dict[str, Any] | None:
     mode = unit_mode(record, args.unit)
     base = record_index_row(record, mode)
@@ -890,6 +945,41 @@ def run_record(
         systems.append(
             {
                 "name": "hippo_calibrated_union",
+                "metrics": aggregate(rows),
+                "_metric_rows": rows,
+                "determinism_mismatches": mismatches,
+                "build_latency_ms": build_ms,
+                "memory_count": len(token_index.nodes),
+                "node_record_count": len(token_index.nodes),
+                "cell_count": int(sum(len(values) for values in token_index.layered_inverted.values())),
+                "edge_count": 0,
+                "total_index_bytes": int(token_index.index_bytes) + int(faiss_built["index_bytes"]),
+            }
+        )
+    if "hippo_cascade_union" in args.systems:
+        if calibrator is None or cascade_prefilter is None:
+            raise ValueError("--calibrator-checkpoint and --cascade-prefilter-checkpoint are required for hippo_cascade_union")
+        started = time.perf_counter()
+        faiss_built = build_faiss(embedded_base, args, "hnsw")
+        token_index = build_token_field_index(embedded_base, args)
+        build_ms = (time.perf_counter() - started) * 1000.0
+        rows, mismatches = run_queries(
+            qa_rows,
+            lambda row: cascaded_calibrated_union_search(
+                row,
+                backend,
+                faiss_built,
+                token_index,
+                cascade_prefilter,
+                calibrator,
+                id_to_candidate,
+                args,
+            ),
+            args,
+        )
+        systems.append(
+            {
+                "name": "hippo_cascade_union",
                 "metrics": aggregate(rows),
                 "_metric_rows": rows,
                 "determinism_mismatches": mismatches,
@@ -1053,6 +1143,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- top_k: `{result['top_k']}`",
         f"- budget: `{result['budget']}`",
         f"- context_max_items: `{result['context_max_items']}`",
+        f"- cascade_prefilter_candidates: `{result['cascade_prefilter_candidates']}`",
+        f"- cascade_survivor_candidates: `{result['cascade_survivor_candidates']}`",
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
         f"- adversarial_style: `{result['adversarial_style']}`",
@@ -1093,7 +1185,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     records = load_records(dataset_path, args.limit_records)
     backend = build_embedding_backend(args)
     calibrator = None
-    if "hippo_calibrated" in args.systems or "hippo_calibrated_union" in args.systems:
+    cascade_prefilter = None
+    needs_calibrator = any(system in args.systems for system in ("hippo_calibrated", "hippo_calibrated_union", "hippo_cascade_union"))
+    if needs_calibrator:
         if not args.calibrator_checkpoint:
             raise ValueError("--calibrator-checkpoint is required when --systems includes hippo_calibrated")
         import torch
@@ -1102,11 +1196,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
         device = torch.device(args.device if args.device else ("cuda" if torch.cuda.is_available() else "cpu"))
         calibrator = load_calibrator(args.calibrator_checkpoint, device=device)
+        if "hippo_cascade_union" in args.systems:
+            if not args.cascade_prefilter_checkpoint:
+                raise ValueError("--cascade-prefilter-checkpoint is required when --systems includes hippo_cascade_union")
+            cascade_prefilter = load_calibrator(args.cascade_prefilter_checkpoint, device=device)
     work_dir = Path(args.work_dir)
     work_dir.mkdir(parents=True, exist_ok=True)
     evaluated = []
     for index, record in enumerate(records):
-        result = run_record(record, index, backend, work_dir, args, calibrator)
+        result = run_record(record, index, backend, work_dir, args, calibrator, cascade_prefilter)
         if result is not None:
             evaluated.append(result)
     question_count = sum(int(record["question_count"]) for record in evaluated)
@@ -1121,6 +1219,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "systems": args.systems,
         "embedding_backend": backend.name,
         "calibrator_checkpoint": args.calibrator_checkpoint,
+        "cascade_prefilter_checkpoint": args.cascade_prefilter_checkpoint,
+        "cascade_prefilter_candidates": int(args.cascade_prefilter_candidates),
+        "cascade_survivor_candidates": int(args.cascade_survivor_candidates),
         "dim_count": args.dim_count,
         "layers": args.layers,
         "layer_schedule": args.layer_schedule,
@@ -1202,6 +1303,13 @@ def main() -> None:
     parser.add_argument("--final-fetch", type=int, default=96)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-max-candidates", type=int, default=128)
+    parser.add_argument("--cascade-prefilter-checkpoint", default="")
+    parser.add_argument("--cascade-prefilter-candidates", type=int, default=1024)
+    parser.add_argument("--cascade-survivor-candidates", type=int, default=64)
+    parser.add_argument("--cascade-prefilter-relevance-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-include-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-base-weight", type=float, default=None)
+    parser.add_argument("--cascade-prefilter-utility-weight", type=float, default=None)
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)

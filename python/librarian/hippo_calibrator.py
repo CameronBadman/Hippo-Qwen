@@ -187,6 +187,7 @@ def rerank_with_calibrator(
     model: HippoCalibrationTransformer,
     payload: dict[str, Any],
     *,
+    max_candidates: int | None = None,
     relevance_weight: float | None = None,
     include_weight: float | None = None,
     base_weight: float | None = None,
@@ -206,7 +207,7 @@ def rerank_with_calibrator(
         device = next(model.parameters()).device
         tensors, candidates = tensorize_calibration_payload(
             payload,
-            model.config.max_candidates,
+            int(max_candidates or model.config.max_candidates),
             model.config.feature_dim,
             model.config.embedding_dim,
         )
