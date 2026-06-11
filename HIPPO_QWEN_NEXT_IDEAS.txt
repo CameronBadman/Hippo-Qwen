@@ -1284,3 +1284,87 @@ Next action:
   evidence-in-pool, recall@8, context recall, and hard-negative rates against
   the hash-backed run.
 - Only after that, retest cascade and packing decisions.
+
+
+27. Hippo encoder 180-query attribution run
+
+Implemented and tested.
+
+Setup:
+- Runtime: Colab A100.
+- Hippo-Qwen commit: `b1c7115`.
+- Hippo-encoder commit: `0e48287`.
+- Encoder checkpoint:
+  `/content/hippoencoder-model/hippoencoder-bge-small-all-nli-pair-500k-c025-epoch3`
+- The checkpoint was restored from the split chunks in `Hippo-encoder` and
+  verified against SHA256 `22ca9b219497fb8e7ea9c45df6d30608137fd2a8e50db3d290ddea8bd8a438d0`.
+- Hippo encoder output dimension: 768.
+- Trained a fresh 768-d set calibrator because the previous `set3.pt` was
+  trained on 1024-d hash embeddings.
+- Train split: MemoryCraft records 0-79, 144 calibration rows.
+- Eval split: MemoryCraft records 80-119.
+- Eval profiles: `clean,mixed`.
+- Queries: 180 per profile.
+- Candidate pool: 64.
+- Union fetch: 256 vector + 256 token.
+- Budget: 900 tokens.
+
+Artifacts:
+- `/content/hippo_encoder_180_eval/train_summary.json`
+- `/content/hippo_encoder_180_eval/set3_hippo.pt`
+- `/content/hippo_encoder_180_eval/suite_clean_mixed/summary.md`
+- `/content/hippo_encoder_180_eval/suite_clean_mixed/summary.json`
+
+Results:
+
+| scenario | system | p95 ms | evidence in pool | recall@8 | context recall | context precision | hard neg@8 | hard neg ctx | mrr |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| clean | hybrid_union_token | 42.97 | 0.9352 | 0.7145 | 0.7474 | 0.1871 | 0.0000 | 0.0000 | 0.6393 |
+| clean | faiss_hnsw | 0.39 | 0.9324 | 0.7177 | 0.7619 | 0.1805 | 0.0000 | 0.0000 | 0.6322 |
+| clean | hippo_calibrated_union | 59.40 | 0.8995 | 0.7063 | 0.8130 | 0.2473 | 0.0000 | 0.0000 | 0.6947 |
+| mixed | hybrid_union_token | 43.69 | 0.9176 | 0.2754 | 0.6211 | 0.0822 | 0.8521 | 0.6112 | 0.1153 |
+| mixed | faiss_hnsw | 0.46 | 0.9165 | 0.2886 | 0.6433 | 0.0855 | 0.8375 | 0.5930 | 0.1215 |
+| mixed | hippo_calibrated_union | 60.70 | 0.8866 | 0.6798 | 0.7600 | 0.2320 | 0.1799 | 0.1877 | 0.6650 |
+
+Comparison against the hash-backed 180-query calibrated run:
+
+| scenario | backend | evidence in pool | recall@8 | context recall | context precision | hard neg@8 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: |
+| clean | hash | 0.6804 | 0.6164 | 0.6381 | 0.1705 | 0.0000 |
+| clean | Hippo encoder | 0.8995 | 0.7063 | 0.8130 | 0.2473 | 0.0000 |
+| mixed | hash | 0.6764 | 0.6099 | 0.6346 | 0.1505 | 0.1625 |
+| mixed | Hippo encoder | 0.8866 | 0.6798 | 0.7600 | 0.2320 | 0.1799 |
+
+Interpretation:
+- This confirms the bottleneck diagnosis. The weak hash candidate generator was
+  the main reason evidence-in-pool collapsed on the 180-query runs.
+- Hippo encoder moved calibrated evidence-in-pool from about 0.68 to about
+  0.89-0.90.
+- Raw candidate generation is even stronger: Hippo-backed FAISS/HNSW and hybrid
+  union both reached about 0.92-0.94 evidence-in-pool.
+- The calibrator improves context quality and suppresses mixed hard negatives
+  dramatically, but recall@8 is now below the raw evidence-in-pool ceiling.
+  That means the next quality work shifts back toward calibration/packing once
+  the Hippo encoder is used.
+- Clean recall did not exceed FAISS/HNSW because the fresh 4-epoch calibrator is
+  undertrained, but it raised MRR and context precision.
+- Mixed is the key result: raw Hippo-backed retrieval finds evidence but is
+  dominated by decoys; the calibrator turns that into usable context.
+
+Verdict:
+- Hippo encoder should replace hash as the default serious benchmark backend.
+- The architecture story is now stronger and more specific:
+  candidate generation was the binding constraint under hash embeddings; Hippo
+  encoder largely fixes pool recall; the calibrator is still needed to suppress
+  adversarial/query-echo context.
+- The next cascade test should use Hippo encoder, larger prefilter pools, and a
+  prefilter trained for survivor recall rather than top-k ranking.
+
+Next action:
+- Train the Hippo-backed calibrator longer or with the stronger training recipe
+  before treating top-k recall as final.
+- Rerun cascade at `1024 -> 64` using Hippo encoder.
+- Revalidate top-3/learned-stop packing and set-vs-pointwise on the Hippo
+  encoder 180-query eval.
+- Add a cached encoder embedding path; the current benchmark reloads the encoder
+  per run, which is fine for correctness but noisy for latency.
