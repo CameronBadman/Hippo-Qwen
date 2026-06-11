@@ -572,6 +572,17 @@ Run shape:
 - Top k: 8
 - Context cap experiment: context_max_items=3
 
+Corrections after review:
+- The set-attention result should be read as "no detectable difference on this
+  benchmark," not as proof that set attention is useless. The current profiles
+  are mostly solvable from per-candidate signals.
+- The "mined negatives" loop did not actually implement mined negatives. It
+  tested a no-synthetic control, so the mined-negative verdict is still open.
+- The abstention result is directional only. It has 4 abstention queries, which
+  is too small for an external claim.
+- The clean/mixed top-3 context metrics were sanity checked. The mixed run did
+  inject decoys; identical recall/precision was not a clean/mixed config bug.
+
 
 What Was Implemented
 --------------------
@@ -616,18 +627,24 @@ Results:
 | mixed | 0.9594 | 0.9573 | 0.2142 | 0.2084 | 0.1354 | 0.1250 |
 
 Interpretation:
-- Set attention did not produce a decisive win in this run.
+- Set attention did not produce a detectable win in this run, but this is not
+  an architectural verdict.
 - Pointwise is surprisingly competitive and faster, with p95 around 24-26 ms
   versus 27-29 ms for set attention.
-- Set attention looked slightly better on same_entity_wrong_time and
-  stale_preference context precision, but pointwise had lower hard-negative
-  rate on near_duplicate, superseded_conflict, and mixed.
+- Most of these deltas are on 36-question slices and should be treated as
+  inside confidence/noise until repeated at larger scale.
+- The current synthetic decoys are mostly identifiable in isolation through
+  text shape, query echo, or per-candidate state. This benchmark does not force
+  candidate-to-candidate reasoning.
 - The current data does not justify a strong novelty claim that set-level
   attention beats pointwise reranking.
 
 Next action:
-- Either shrink the production calibrator toward pointwise, or make the
-  set-attention task harder with explicit cross-candidate labels/features.
+- Keep pointwise as a serious baseline, but do not shrink the production
+  calibrator solely from this result.
+- Build a relational-required eval: K near-identical memories where only the
+  newest/correct one should be selected, and no individual candidate marks
+  itself stale except through the existence of its newer sibling in the set.
 - The novelty claim likely needs relational heads, cross-candidate features,
   or true candidate-set supervision. Plain attention over candidates is not
   enough evidence yet.
@@ -656,10 +673,16 @@ Interpretation:
   or one of the four abstention queries returning context when it should not.
 - Training with abstention rows helped normal context quality, but it did not
   fully solve abstention.
+- This is only a directional finding. Four abstention queries is too small to
+  report externally; one event changes the abstention-specific failure rate by
+  25 points.
 - This confirms the product need for a real learned stop/no-memory threshold.
 
 Next action:
-- Add an explicit no-memory decision head or global stop score.
+- Add an explicit include/global-stop mechanism. The same head should be able
+  to return 3 memories instead of 8, or 0 memories instead of 3.
+- Expand abstention/no-evidence evaluation to 50+ queries using more records or
+  deterministic no-evidence questions.
 - Report abstention-specific false-memory rate directly, not only averaged
   across all queries.
 
@@ -720,16 +743,27 @@ Interpretation:
 - Simply returning fewer memories drastically improved context precision while
   preserving high context recall for Hippo.
 - The system does not need to stuff the full budget to be useful.
+- Sanity check: clean ran with adversarial_negatives=0, mixed ran with
+  adversarial_negatives=8. The mixed run also reported hard_neg@8=0.1354 and
+  hard_neg_context=0.0463, so decoys were definitely injected.
+- The identical Hippo top-3 context recall/precision across clean and mixed
+  means decoys rarely displaced evidence in the aggregate top-3 result, not
+  that the mixed run silently became clean.
 
 Next action:
-- Replace fixed top-3 with a learned stop threshold or include-score threshold.
+- Replace fixed top-3 with one learned include/global-stop threshold.
+- Treat budget packing and abstention as the same decision problem: return only
+  memories whose marginal value clears the threshold, and return none when no
+  candidate clears it.
 - Train the utility/include head on marginal value per token.
 - Report tokens_returned and evidence_tokens_per_context_token.
 
 
-7. Mined hard negatives
+7. No-synthetic control / mined hard negatives
 
-Tested as "no synthetic hard negatives" training.
+True mined negatives were not implemented in this loop. This test removed
+synthetic hard negatives and compared that no-synthetic control against the
+normal synthetic-negative training run.
 
 Result:
 
@@ -740,12 +774,21 @@ Result:
 | mixed | 0.9594 | 0.9551 | 0.2142 | 0.1312 | 0.1354 | 0.3785 |
 
 Interpretation:
-- Mined-only training preserved recall, but hard-negative suppression got much
-  worse.
-- The forensic synthetic negatives are still doing important work.
-- Mined negatives are not enough by themselves yet.
+- Removing synthetic negatives preserved recall, but hard-negative suppression
+  got much worse on the synthetic-template eval.
+- This shows the forensic synthetic negatives are doing important work against
+  the current synthetic stress suite.
+- It does not show that real mined negatives are insufficient, because
+  cross-query evidence, same-session term-sharing turns, and union-retriever
+  near-misses were not mined into the training set.
+- Because the eval also uses synthetic decoys, the benefit of synthetic
+  training is partly expected. The real verdict needs mutated real-turn evals.
 
 Next action:
+- Implement true mined negatives:
+  union-retriever top non-evidence candidates weighted by rank, evidence for
+  other questions in the same record, and same-session term-sharing
+  non-evidence turns.
 - Use mined negatives plus a smaller amount of synthetic stress negatives.
 - Add mutated real-turn hard negatives so we are not dependent on templates.
 - Evaluate held-out template families after any mixed-negative training change.
@@ -892,23 +935,25 @@ Updated Priorities After Experiments
 
 1. Budget packing / learned stop is now the highest-impact next build.
    The top-3 cap raised Hippo context precision to 0.5185 while keeping context
-   recall at 0.9308 in clean and mixed scenarios.
+   recall at 0.9308 in clean and mixed scenarios. Build this as one
+   include/global-stop head that can also abstain.
 
 2. Evidence-in-pool attribution is implemented and should stay in every run.
    It did not expose a bottleneck on the small holdout, so the next useful
    attribution run is at 50k+ memories.
 
 3. Pointwise MLP is a serious baseline. Do not claim set attention is the
-   differentiator yet. Either prove it with harder relational supervision or
-   ship the smaller pointwise model if it keeps matching quality.
+   differentiator yet. First build a relational-required eval; only shrink to
+   pointwise if set attention still cannot win when candidate comparison is
+   genuinely required.
 
-4. Synthetic hard negatives should not be removed. Mined-only preserved recall
-   but failed hard-negative suppression. The likely right answer is mined +
-   synthetic + mutated real-turn negatives.
+4. The mined-negative verdict is deferred. The loop tested no-synthetic
+   training, not true mined negatives. The likely right answer is mined +
+   synthetic + mutated real-turn negatives, but it still needs a fair run.
 
-5. Abstention needs a real no-memory decision. Treating abstention as normal
-   reranking is insufficient; the corrected run still produced one false-memory
-   event in four abstention questions.
+5. Abstention needs a larger eval and the same global-stop mechanism as budget
+   packing. The corrected run produced one false-memory event in four
+   abstention questions, but n=4 is only directional.
 
 6. The external headline table still needs Hippo encoder, larger holdout,
    cross-encoder baseline, and eventually Qwen answer accuracy.
