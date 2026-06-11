@@ -1543,3 +1543,87 @@ Next action:
   100%, 70%, 40%, and 0% metadata availability.
 - Run quota sweeps to find the smallest metadata/graph quota that keeps 50k
   recall@8 above 0.50.
+
+
+30. Stress-trained calibrator on expanded graph/entity pools
+
+Implemented and tested.
+
+Setup:
+- Hippo-Qwen commit: `e318035`.
+- Runtime: Colab A100.
+- Fixed the stress benchmark so embedded memory vectors are copied back onto
+  candidate dictionaries before calibrator inference/training.
+- Added calibration JSONL export to `session_memory_stress.py`.
+- Added optional provenance features to `hippo_calibrator.py` for wider feature
+  vectors:
+  vector source, token source, metadata source, graph source, source count,
+  query user/project/brand match, and all-metadata match.
+- Existing 16-d calibrators are unaffected because the added features are only
+  used when `--feature-dim` is larger.
+- Training data:
+  `/content/session_stress_calibrator/stress_train_seed73000.jsonl`
+- Training set:
+  30k memories, 360 queries, seed `73000`.
+- Evaluation set:
+  50k memories, 120 queries, seed `72000`.
+- This avoids exact query leakage between stress training and eval, but the
+  generator family is still shared.
+- Stress calibrator:
+  `/content/session_stress_calibrator/stress_feature33.pt`
+- Stress model config:
+  embedding dim 768, feature dim 33, 3 transformer layers, 4 heads, 10 epochs.
+
+Artifacts:
+- `/content/session_stress_calibrator/stress_train_seed73000.jsonl`
+- `/content/session_stress_calibrator/stress_train_build_summary.json`
+- `/content/session_stress_calibrator/stress_feature33.pt`
+- `/content/session_stress_calibrator/eval_50k_memorycraft_calibrator/summary.json`
+- `/content/session_stress_calibrator/eval_50k_stress_calibrator/summary.json`
+
+Results:
+
+| 50k system | pool | recall@8 | recall@16 | recall@32 | precision@8 | hard neg@8 | hard neg ctx | context precision | hit any |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vector | 0.1028 | 0.0083 | 0.0222 | 0.0611 | 0.0031 | 0.7542 | 0.5544 | 0.0052 | 0.0250 |
+| hybrid expanded | 1.0000 | 0.7222 | 0.9528 | 1.0000 | 0.2708 | 0.5802 | 0.3948 | 0.0707 | 0.9667 |
+| MemoryCraft calibrator, embeddings fixed | 1.0000 | 0.6167 | 0.6611 | 0.6722 | 0.2313 | 0.0083 | 0.0721 | 0.0522 | 1.0000 |
+| stress-trained calibrator | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.3750 | 0.0656 | 0.1371 | 0.0791 | 1.0000 |
+
+Interpretation:
+- Stress-specific calibration works on this benchmark.
+- The main previous hard-negative problem was train/eval mismatch plus missing
+  candidate embeddings in the stress benchmark path.
+- The stress-trained model clears the rough technical target for this synthetic
+  50k benchmark:
+  recall@8 = 1.0000 and hard-negative top-k = 0.0656.
+- The MemoryCraft-trained calibrator is more conservative after the embedding
+  fix: it nearly eliminates top-k hard negatives, but recall@8 falls to 0.6167.
+- The stress-trained calibrator recovers all three evidence memories in the
+  top-8 while keeping hard negatives below 0.10.
+- Context precision is still low because the current packer includes many
+  memories. This is now a packing/stop-head issue rather than top-k recall.
+
+Important caveats:
+- The stress benchmark has clean structured metadata. It is realistic for
+  well-instrumented agent memory, but too generous for messy ingestion.
+- The stress train and eval use different seeds, but they share generator rules.
+  This is a distribution-generalization test, not a true real-world holdout.
+- Perfect recall on this synthetic task is useful, but should not be pitched as
+  production recall until partial/noisy metadata and external datasets pass.
+
+Verdict:
+- This is the best technical result so far for the 50k memory path.
+- The architecture now has a plausible high-recall path:
+  typed graph/entity expansion gets evidence into the pool; stress-trained
+  calibration suppresses hard negatives without killing recall.
+- The next work should make the benchmark less forgiving before claiming
+  market-level quality.
+
+Next action:
+- Run partial/noisy metadata ablations:
+  100%, 70%, 40%, 0% metadata availability, and wrong-entity noise.
+- Add learned include/stop packing to lift context precision while preserving
+  recall.
+- Add a real-ish write-path entity extractor or Qwen teacher to produce metadata
+  instead of giving the benchmark perfect labels.

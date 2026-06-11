@@ -59,6 +59,7 @@ expansion, the 50k result changed materially.
 | 50k | baseline | calibrated | 0.2444 | 0.1722 | 0.1917 | 0.1972 | 0.0479 |
 | 50k | expanded | calibrated | 1.0000 | 0.7194 | 0.8722 | 0.9972 | 0.2750 |
 | 50k | expanded | hybrid | 1.0000 | 0.7056 | 0.9500 | 1.0000 | 0.5896 |
+| 50k | expanded + stress-trained calibrator | calibrated | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.0656 |
 
 Interpretation:
 
@@ -68,9 +69,11 @@ Interpretation:
   and typed graph expansion are available.
 - 50k recall@8 moved past the rough 0.50 go-to-market threshold for this
   benchmark.
-- Hard-negative exposure is now the main quality problem.
-- The calibrator suppresses hard negatives compared with hybrid, but 0.2750 is
-  still too high.
+- After training on the expanded stress candidate pools, the calibrator reached
+  recall@8 1.0000 with hard-negative top-k 0.0656.
+- This is promising, but it is still a synthetic metadata-rich benchmark.
+- The next risk is benchmark generosity: the graph layer currently gets clean
+  user/project/brand metadata.
 
 ## Core Diagnosis
 
@@ -315,12 +318,14 @@ The first implementation loop is complete:
 
 Next implementation loop:
 
-1. Generate calibrator training rows from `session_memory_stress.py`.
-2. Train on expanded metadata/graph candidate pools.
-3. Add partial metadata ablations: 100%, 70%, 40%, and 0% metadata availability.
-4. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
+1. Add partial metadata ablations: 100%, 70%, 40%, and 0% metadata availability.
+2. Add wrong-entity/noisy-metadata ablations.
+3. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
    recall@8 above 0.50.
-5. Add learned include/stop packing.
+4. Add learned include/stop packing.
+5. Add a real-ish write-path entity extractor or Qwen teacher path to generate
+   metadata instead of giving the benchmark perfect metadata.
 
-The current 50k recall@8 is promising, but hard-negative top-k must move from
-0.2750 toward 0.10 or lower before this is a credible memory API quality claim.
+The current 50k synthetic result is strong enough to continue. It should not be
+marketed as production quality until it survives missing/noisy metadata and a
+less template-driven holdout.
