@@ -72,6 +72,8 @@ target.
 
 Full results: [docs/memorycraft_ablation_results_2026-06-06.md](docs/memorycraft_ablation_results_2026-06-06.md)
 
+Hardened adversarial retest: [docs/memorycraft_hardened_retest_2026-06-11.md](docs/memorycraft_hardened_retest_2026-06-11.md)
+
 Architecture diagram: [docs/hippo_qwen_architecture.md](docs/hippo_qwen_architecture.md)
 
 ## What It Is Good At
@@ -111,6 +113,7 @@ python/field_memory/
 
 docs/
   hippo_qwen_architecture.md
+  memorycraft_hardened_retest_2026-06-11.md
   memorycraft_ablation_results_2026-06-06.md
   memorycraft_ablation_suite.md
   retrieval_comparison.md
