@@ -51,6 +51,7 @@ def card(
     *,
     user_id: str,
     project_id: str,
+    brand: str,
     session_id: str,
     turn_id: str,
     timestamp: str,
@@ -70,10 +71,12 @@ def card(
         "metadata": {
             "user_id": user_id,
             "project": project_id,
+            "brand": brand,
             "session_id": session_id,
             "turn_id": turn_id,
             "timestamp": timestamp,
             "speaker": "user",
+            "entities": [user_id, project_id, brand],
         },
         "age_days": int(age_days),
         "use_count": int(use_count),
@@ -113,6 +116,7 @@ def build_query_case(index: int, seed: int) -> tuple[list[dict[str, Any]], dict[
             use_count=12,
             evidence_count=5,
             last_outcome="helpful",
+            brand=brand,
         ),
         card(
             f"evidence::{index}::correction",
@@ -131,6 +135,7 @@ def build_query_case(index: int, seed: int) -> tuple[list[dict[str, Any]], dict[
             use_count=9,
             evidence_count=4,
             last_outcome="corrected",
+            brand=brand,
         ),
         card(
             f"evidence::{index}::tool",
@@ -149,6 +154,7 @@ def build_query_case(index: int, seed: int) -> tuple[list[dict[str, Any]], dict[
             use_count=6,
             evidence_count=3,
             last_outcome="helpful",
+            brand=brand,
         ),
     ]
     hard = []
@@ -190,6 +196,7 @@ def build_query_case(index: int, seed: int) -> tuple[list[dict[str, Any]], dict[
                 role,
                 user_id=user_id,
                 project_id=project_id if "wrong_project" not in role else wrong_project,
+                brand=brand,
                 session_id=f"{session_id}_hard_{slot}",
                 turn_id=f"{session_id}_h{slot}",
                 timestamp=timestamp,
@@ -209,6 +216,7 @@ def build_query_case(index: int, seed: int) -> tuple[list[dict[str, Any]], dict[
         "relevant_ids": [item["id"] for item in evidence],
         "user_id": user_id,
         "project_id": project_id,
+        "brand": brand,
         "answer_tag": answer_tag,
         "scenario": "session_current_preference",
     }
@@ -241,6 +249,7 @@ def build_background_memory(index: int, seed: int) -> dict[str, Any]:
         "stress_background",
         user_id=user_id,
         project_id=project_id,
+        brand=brand,
         session_id=session_id,
         turn_id=f"{session_id}_t{index % 6}",
         timestamp=timestamp,
@@ -292,6 +301,152 @@ def build_token_index(memories: list[dict[str, Any]], max_postings: int) -> dict
             if len(bucket) < max_postings:
                 bucket.append(index)
     return postings
+
+
+def metadata_value(memory: dict[str, Any], key: str) -> str:
+    metadata = memory.get("metadata") or {}
+    return str(metadata.get(key) or "")
+
+
+def build_metadata_index(memories: list[dict[str, Any]]) -> dict[str, dict[str, list[int]]]:
+    indexes: dict[str, dict[str, list[int]]] = {
+        "user_id": {},
+        "project": {},
+        "brand": {},
+        "session_id": {},
+        "entity": {},
+    }
+    for index, memory in enumerate(memories):
+        metadata = memory.get("metadata") or {}
+        for key in ("user_id", "project", "brand", "session_id"):
+            value = str(metadata.get(key) or "")
+            if value:
+                indexes[key].setdefault(value, []).append(index)
+        for entity in metadata.get("entities") or []:
+            value = str(entity or "")
+            if value:
+                indexes["entity"].setdefault(value, []).append(index)
+    return indexes
+
+
+def bounded_bucket(
+    bucket: list[int],
+    limit: int,
+    *,
+    preferred_project: str = "",
+    preferred_brand: str = "",
+    memories: list[dict[str, Any]],
+) -> list[int]:
+    ordered = sorted(
+        bucket,
+        key=lambda index: (
+            0 if not preferred_project or metadata_value(memories[index], "project") == preferred_project else 1,
+            0 if not preferred_brand or metadata_value(memories[index], "brand") == preferred_brand else 1,
+            -float(memories[index].get("importance") or 0.0),
+            int(memories[index].get("age_days") or 0),
+            str(memories[index].get("id") or ""),
+        ),
+    )
+    return ordered[:limit]
+
+
+def metadata_scores(
+    query: dict[str, Any],
+    metadata_index: dict[str, dict[str, list[int]]],
+    memories: list[dict[str, Any]],
+    limit: int,
+    per_bucket: int,
+) -> list[tuple[int, float, str]]:
+    if limit <= 0:
+        return []
+    user_id = str(query.get("user_id") or "")
+    project = str(query.get("project_id") or "")
+    brand = str(query.get("brand") or "")
+    weighted_sources = [
+        ("user_id", user_id, 1.00, "metadata:user"),
+        ("project", project, 1.20, "metadata:project"),
+        ("brand", brand, 0.90, "metadata:brand"),
+        ("entity", user_id, 0.60, "metadata:entity_user"),
+        ("entity", project, 0.70, "metadata:entity_project"),
+        ("entity", brand, 0.55, "metadata:entity_brand"),
+    ]
+    scores: dict[int, tuple[float, set[str]]] = {}
+    for key, value, weight, source in weighted_sources:
+        if not value:
+            continue
+        bucket = metadata_index.get(key, {}).get(value) or []
+        for index in bounded_bucket(bucket, per_bucket, preferred_project=project, preferred_brand=brand, memories=memories):
+            score, sources = scores.setdefault(index, (0.0, set()))
+            sources.add(source)
+            scores[index] = (score + weight, sources)
+    boosted = []
+    for index, (score, sources) in scores.items():
+        memory = memories[index]
+        if project and metadata_value(memory, "project") == project:
+            score += 1.25
+        if user_id and metadata_value(memory, "user_id") == user_id:
+            score += 0.95
+        if brand and metadata_value(memory, "brand") == brand:
+            score += 0.75
+        score += 0.10 * float(memory.get("importance") or 0.0)
+        score -= 0.0005 * float(memory.get("age_days") or 0.0)
+        boosted.append((index, score, ",".join(sorted(sources))))
+    return sorted(boosted, key=lambda item: (-item[1], str(memories[item[0]].get("id") or "")))[:limit]
+
+
+def build_graph_index(memories: list[dict[str, Any]]) -> dict[int, list[tuple[int, str, float]]]:
+    buckets = build_metadata_index(memories)
+    graph: dict[int, list[tuple[int, str, float]]] = {index: [] for index in range(len(memories))}
+    edge_specs = [
+        ("session_id", "same_session", 1.00, 18),
+        ("project", "same_project", 0.65, 24),
+        ("brand", "same_brand", 0.45, 24),
+        ("user_id", "same_user", 0.35, 24),
+    ]
+    for key, edge_type, weight, per_node_limit in edge_specs:
+        for bucket in buckets.get(key, {}).values():
+            ordered = sorted(bucket, key=lambda index: str(memories[index].get("id") or ""))
+            for position, source in enumerate(ordered):
+                window = ordered[max(0, position - per_node_limit) : position] + ordered[position + 1 : position + 1 + per_node_limit]
+                for target in window:
+                    graph[source].append((target, edge_type, weight))
+    for source, edges in graph.items():
+        dedup: dict[int, tuple[str, float]] = {}
+        for target, edge_type, weight in edges:
+            current = dedup.get(target)
+            if current is None or weight > current[1]:
+                dedup[target] = (edge_type, weight)
+        graph[source] = sorted(
+            [(target, edge_type, weight) for target, (edge_type, weight) in dedup.items()],
+            key=lambda item: (-item[2], item[1], str(memories[item[0]].get("id") or "")),
+        )
+    return graph
+
+
+def graph_scores(
+    seeds: list[tuple[int, float]],
+    graph: dict[int, list[tuple[int, str, float]]],
+    memories: list[dict[str, Any]],
+    limit: int,
+    per_seed: int,
+) -> list[tuple[int, float, str]]:
+    if limit <= 0 or per_seed <= 0:
+        return []
+    scores: dict[int, tuple[float, set[str]]] = {}
+    for seed_rank, (seed_index, seed_score) in enumerate(seeds, start=1):
+        seed_bonus = max(0.0, seed_score) / max(1.0, abs(seed_score)) if seed_score else 0.0
+        for target, edge_type, weight in (graph.get(seed_index) or [])[:per_seed]:
+            score, sources = scores.setdefault(target, (0.0, set()))
+            sources.add(f"graph:{edge_type}")
+            rank_penalty = 1.0 / math.sqrt(seed_rank)
+            memory = memories[target]
+            value = score + weight * rank_penalty + 0.05 * seed_bonus + 0.05 * float(memory.get("importance") or 0.0)
+            scores[target] = (value, sources)
+    ordered = [
+        (index, score, ",".join(sorted(sources)))
+        for index, (score, sources) in scores.items()
+    ]
+    return sorted(ordered, key=lambda item: (-item[1], str(memories[item[0]].get("id") or "")))[:limit]
 
 
 def token_scores(query: str, postings: dict[str, list[int]], memory_count: int, limit: int) -> list[tuple[int, float]]:
@@ -355,9 +510,13 @@ def hybrid_candidates(
     query: str,
     vector_pairs: list[tuple[int, float]],
     token_pairs: list[tuple[int, float]],
+    metadata_pairs: list[tuple[int, float, str]],
+    graph_pairs: list[tuple[int, float, str]],
     memories: list[dict[str, Any]],
     vector_weight: float,
     token_weight: float,
+    metadata_weight: float,
+    graph_weight: float,
 ) -> list[dict[str, Any]]:
     best: dict[int, dict[str, Any]] = {}
     if vector_pairs:
@@ -368,18 +527,32 @@ def hybrid_candidates(
         token_max = max(abs(score) for _, score in token_pairs) or 1.0
     else:
         token_max = 1.0
+    metadata_max = max((abs(score) for _, score, _ in metadata_pairs), default=1.0) or 1.0
+    graph_max = max((abs(score) for _, score, _ in graph_pairs), default=1.0) or 1.0
     for rank, (index, score) in enumerate(vector_pairs, start=1):
-        best[index] = {"score": vector_weight * (score / vector_max), "rank": rank}
+        best[index] = {"score": vector_weight * (score / vector_max), "rank": rank, "sources": {"vector"}}
     for rank, (index, score) in enumerate(token_pairs, start=1):
-        item = best.setdefault(index, {"score": 0.0, "rank": rank})
+        item = best.setdefault(index, {"score": 0.0, "rank": rank, "sources": set()})
         item["score"] += token_weight * (score / token_max)
         item["rank"] = min(int(item["rank"]), rank)
+        item["sources"].add("token")
+    for rank, (index, score, source) in enumerate(metadata_pairs, start=1):
+        item = best.setdefault(index, {"score": 0.0, "rank": rank, "sources": set()})
+        item["score"] += metadata_weight * (score / metadata_max)
+        item["rank"] = min(int(item["rank"]), rank)
+        item["sources"].update(source.split(",") if source else ["metadata"])
+    for rank, (index, score, source) in enumerate(graph_pairs, start=1):
+        item = best.setdefault(index, {"score": 0.0, "rank": rank, "sources": set()})
+        item["score"] += graph_weight * (score / graph_max)
+        item["rank"] = min(int(item["rank"]), rank)
+        item["sources"].update(source.split(",") if source else ["graph"])
     ordered = sorted(best.items(), key=lambda item: (-float(item[1]["score"]), int(item[1]["rank"]), str(memories[item[0]]["id"])))
     out = []
     for rank, (index, values) in enumerate(ordered, start=1):
         candidate = dict(memories[index])
         candidate["base_score"] = float(values["score"])
         candidate["base_rank"] = rank
+        candidate["candidate_sources"] = sorted(str(source) for source in values.get("sources", set()))
         out.append(candidate)
     return out
 
@@ -396,17 +569,31 @@ def context_ids(ranked: list[tuple[str, float, str]], budget: int) -> list[str]:
     return out
 
 
-def metrics_for(query: dict[str, Any], ranked: list[tuple[str, float, str]], pool_ids: set[str], top_k: int, budget: int) -> dict[str, float]:
+def metrics_for(
+    query: dict[str, Any],
+    ranked: list[tuple[str, float, str]],
+    pool_ids: set[str],
+    top_k: int,
+    budget: int,
+    *,
+    source_pools: dict[str, set[str]] | None = None,
+) -> dict[str, float]:
     relevant = set(str(item) for item in query.get("relevant_ids") or [])
     top_ids = [candidate_id for candidate_id, _, _ in ranked[:top_k]]
+    top16_ids = [candidate_id for candidate_id, _, _ in ranked[:16]]
+    top32_ids = [candidate_id for candidate_id, _, _ in ranked[:32]]
     included = context_ids(ranked, budget)
     top_hits = len(relevant & set(top_ids))
+    top16_hits = len(relevant & set(top16_ids))
+    top32_hits = len(relevant & set(top32_ids))
     context_hits = len(relevant & set(included))
     hard_top = sum(1 for candidate_id in top_ids if candidate_id.startswith("hard::"))
     hard_context = sum(1 for candidate_id in included if candidate_id.startswith("hard::"))
-    return {
+    row = {
         "evidence_in_pool": len(relevant & pool_ids) / max(1, len(relevant)),
         "recall_at_k": top_hits / max(1, len(relevant)),
+        "recall_at_16": top16_hits / max(1, len(relevant)),
+        "recall_at_32": top32_hits / max(1, len(relevant)),
         "precision_at_k": top_hits / max(1, min(top_k, len(top_ids))),
         "context_recall": context_hits / max(1, len(relevant)),
         "context_precision": context_hits / max(1, len(included)),
@@ -414,7 +601,12 @@ def metrics_for(query: dict[str, Any], ranked: list[tuple[str, float, str]], poo
         "hard_negative_top_k_rate": hard_top / max(1, len(top_ids)),
         "hard_negative_context_rate": hard_context / max(1, len(included)),
         "no_relevant_context_rate": 1.0 if context_hits == 0 else 0.0,
+        "hit_any_relevant": 1.0 if top_hits > 0 else 0.0,
+        "all_relevant_found": 1.0 if top_hits == len(relevant) else 0.0,
     }
+    for source, ids in (source_pools or {}).items():
+        row[f"evidence_in_{source}"] = len(relevant & ids) / max(1, len(relevant))
+    return row
 
 
 def aggregate(rows: list[dict[str, float]]) -> dict[str, dict[str, float]]:
@@ -455,6 +647,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     vector = VectorSearch(memory_vectors, args.vector_index, args.hnsw_m)
     postings = build_token_index(memories, args.max_token_postings)
+    metadata_index = build_metadata_index(memories)
+    graph_index = build_graph_index(memories) if args.graph_fetch > 0 else {}
     calibrator = None
     if args.calibrator_checkpoint:
         from python.librarian.hippo_calibrator import load_calibrator
@@ -469,16 +663,49 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         query_vector = query_vectors[query_index]
         vector_pairs = vector.search(query_vector, args.vector_fetch)
         token_pairs = token_scores(str(query["text"]), postings, len(memories), args.token_fetch)
+        metadata_pairs = metadata_scores(
+            query,
+            metadata_index,
+            memories,
+            args.metadata_fetch,
+            args.metadata_per_bucket,
+        )
+        graph_seed_count = max(0, args.graph_seed_count)
+        seed_scores = [(index, score) for index, score in vector_pairs[:graph_seed_count]]
+        seed_scores.extend((index, score) for index, score in token_pairs[:graph_seed_count])
+        seed_scores.extend((index, score) for index, score, _ in metadata_pairs[:graph_seed_count])
+        graph_pairs = graph_scores(seed_scores, graph_index, memories, args.graph_fetch, args.graph_per_seed)
+        vector_ids = {str(memories[index]["id"]) for index, _ in vector_pairs}
+        token_ids = {str(memories[index]["id"]) for index, _ in token_pairs}
+        metadata_ids = {str(memories[index]["id"]) for index, _, _ in metadata_pairs}
+        graph_ids = {str(memories[index]["id"]) for index, _, _ in graph_pairs}
+        source_pools = {
+            "vector_fetch": vector_ids,
+            "token_fetch": token_ids,
+            "metadata_fetch": metadata_ids,
+            "graph_fetch": graph_ids,
+        }
         vector_ranked = ranked_from_indexes(memories, vector_pairs)
         vector_pool = {candidate_id for candidate_id, _, _ in vector_ranked[: args.candidate_pool]}
-        systems["vector"].append(metrics_for(query, vector_ranked, vector_pool, args.top_k, args.budget))
+        systems["vector"].append(metrics_for(query, vector_ranked, vector_pool, args.top_k, args.budget, source_pools=source_pools))
         signatures["vector"].append("|".join(candidate_id for candidate_id, _, _ in vector_ranked[: args.top_k]))
 
-        hybrid = hybrid_candidates(str(query["text"]), vector_pairs, token_pairs, memories, args.vector_weight, args.token_weight)
+        hybrid = hybrid_candidates(
+            str(query["text"]),
+            vector_pairs,
+            token_pairs,
+            metadata_pairs,
+            graph_pairs,
+            memories,
+            args.vector_weight,
+            args.token_weight,
+            args.metadata_weight,
+            args.graph_weight,
+        )
         hybrid = hybrid[: args.candidate_pool]
         hybrid_ranked = [(str(item["id"]), float(item.get("base_score") or 0.0), str(item.get("text") or "")) for item in hybrid]
         hybrid_pool = {candidate_id for candidate_id, _, _ in hybrid_ranked}
-        systems["hybrid"].append(metrics_for(query, hybrid_ranked, hybrid_pool, args.top_k, args.budget))
+        systems["hybrid"].append(metrics_for(query, hybrid_ranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
         signatures["hybrid"].append("|".join(candidate_id for candidate_id, _, _ in hybrid_ranked[: args.top_k]))
 
         if calibrator is not None:
@@ -491,7 +718,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "candidates": hybrid,
             }
             reranked = rerank_with_calibrator(calibrator, payload, max_candidates=args.candidate_pool)
-            systems["calibrated"].append(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget))
+            systems["calibrated"].append(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
             signatures["calibrated"].append("|".join(candidate_id for candidate_id, _, _ in reranked[: args.top_k]))
 
     result = {
@@ -504,6 +731,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "candidate_pool": args.candidate_pool,
         "vector_fetch": args.vector_fetch,
         "token_fetch": args.token_fetch,
+        "metadata_fetch": args.metadata_fetch,
+        "graph_fetch": args.graph_fetch,
         "budget": args.budget,
         "top_k": args.top_k,
         "calibrator_checkpoint": args.calibrator_checkpoint,
@@ -530,23 +759,29 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- queries: `{result['queries']}`",
         f"- vector_index: `{result['vector_index']}`",
         f"- candidate_pool: `{result['candidate_pool']}`",
+        f"- metadata_fetch: `{result.get('metadata_fetch', 0)}`",
+        f"- graph_fetch: `{result.get('graph_fetch', 0)}`",
         f"- embed_seconds: `{result['embed_seconds']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
-        "| system | evidence in pool | recall@8 | precision@8 | context recall | context precision | hard neg@8 | hard neg ctx | no context |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | pool | vector | token | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context precision |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, metrics in result["systems"].items():
         lines.append(
             f"| {name} | "
             f"{metrics.get('evidence_in_pool', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('evidence_in_vector_fetch', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('evidence_in_token_fetch', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('evidence_in_metadata_fetch', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('evidence_in_graph_fetch', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('recall_at_k', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('recall_at_16', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('recall_at_32', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('hit_any_relevant', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('hard_negative_top_k_rate', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('hard_negative_context_rate', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('no_relevant_context_rate', {}).get('avg', 0.0):.4f} |"
+            f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -561,10 +796,17 @@ def main() -> None:
     parser.add_argument("--hnsw-m", type=int, default=32)
     parser.add_argument("--vector-fetch", type=int, default=512)
     parser.add_argument("--token-fetch", type=int, default=512)
+    parser.add_argument("--metadata-fetch", type=int, default=0)
+    parser.add_argument("--metadata-per-bucket", type=int, default=512)
+    parser.add_argument("--graph-fetch", type=int, default=0)
+    parser.add_argument("--graph-seed-count", type=int, default=32)
+    parser.add_argument("--graph-per-seed", type=int, default=16)
     parser.add_argument("--candidate-pool", type=int, default=128)
     parser.add_argument("--max-token-postings", type=int, default=4096)
     parser.add_argument("--vector-weight", type=float, default=0.72)
     parser.add_argument("--token-weight", type=float, default=0.28)
+    parser.add_argument("--metadata-weight", type=float, default=0.85)
+    parser.add_argument("--graph-weight", type=float, default=0.45)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
     parser.add_argument("--calibrator-checkpoint", default="")
