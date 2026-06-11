@@ -75,6 +75,7 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
     outcome = state["last_outcome_value"]
     lower_text = text.lower()
     conflict_terms = ("decoy", "wrong", "conflict", "contradict", "superseded", "obsolete", "ignored")
+    candidate_sources = {str(source) for source in candidate.get("candidate_sources") or []}
     values = [
         clamp(float(score), -2.0, 2.0) / 2.0,
         1.0 / float(max(1, rank)),
@@ -100,6 +101,15 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
         1.0 if any(term in lower_text for term in conflict_terms) else 0.0,
         clamp(jaccard(query, str(candidate.get("summary") or "")), 0.0, 1.0),
         clamp(float(candidate.get("base_score_gap") or 0.0), -2.0, 2.0) / 2.0,
+        1.0 if "vector" in candidate_sources else 0.0,
+        1.0 if "token" in candidate_sources else 0.0,
+        1.0 if any(source.startswith("metadata:") for source in candidate_sources) else 0.0,
+        1.0 if any(source.startswith("graph:") for source in candidate_sources) else 0.0,
+        clamp(len(candidate_sources) / 6.0, 0.0, 1.0),
+        1.0 if candidate.get("query_user_match") else 0.0,
+        1.0 if candidate.get("query_project_match") else 0.0,
+        1.0 if candidate.get("query_brand_match") else 0.0,
+        1.0 if candidate.get("query_all_metadata_match") else 0.0,
     ]
     if feature_dim <= len(values):
         return values[:feature_dim]

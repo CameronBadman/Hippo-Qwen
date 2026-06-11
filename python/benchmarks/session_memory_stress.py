@@ -293,6 +293,12 @@ def dot(left: list[float], right: list[float]) -> float:
     return sum(a * b for a, b in zip(left, right))
 
 
+def vector_to_list(vector: Any) -> list[float]:
+    if hasattr(vector, "tolist"):
+        return [float(value) for value in vector.tolist()]
+    return [float(value) for value in vector]
+
+
 def build_token_index(memories: list[dict[str, Any]], max_postings: int) -> dict[str, list[int]]:
     postings: dict[str, list[int]] = {}
     for index, memory in enumerate(memories):
@@ -557,6 +563,67 @@ def hybrid_candidates(
     return out
 
 
+def annotate_query_matches(query: dict[str, Any], candidate: dict[str, Any]) -> None:
+    metadata = candidate.get("metadata") or {}
+    user_match = bool(query.get("user_id")) and str(metadata.get("user_id") or "") == str(query.get("user_id") or "")
+    project_match = bool(query.get("project_id")) and str(metadata.get("project") or "") == str(query.get("project_id") or "")
+    brand_match = bool(query.get("brand")) and str(metadata.get("brand") or "") == str(query.get("brand") or "")
+    candidate["query_user_match"] = user_match
+    candidate["query_project_match"] = project_match
+    candidate["query_brand_match"] = brand_match
+    candidate["query_all_metadata_match"] = user_match and project_match and brand_match
+
+
+def mark_candidate_labels(candidates: list[dict[str, Any]], relevant: set[str]) -> None:
+    if candidates:
+        best_score = max(float(candidate.get("base_score") or 0.0) for candidate in candidates)
+    else:
+        best_score = 0.0
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "")
+        role = str(candidate.get("synthetic_role") or "")
+        is_relevant = candidate_id in relevant
+        is_hard = candidate_id.startswith("hard::") or "decoy" in role
+        candidate["include_label"] = 1.0 if is_relevant else 0.0
+        candidate["label_weight"] = 1.0 if is_relevant else (4.0 if is_hard else 1.0)
+        candidate["include_weight"] = 1.0 if is_relevant else (8.0 if is_hard else 2.0)
+        candidate["base_score_gap"] = best_score - float(candidate.get("base_score") or 0.0)
+
+
+def calibration_row(
+    query: dict[str, Any],
+    query_vector: Any,
+    candidates: list[dict[str, Any]],
+    budget: int,
+    max_candidates: int,
+) -> dict[str, Any]:
+    relevant = {str(item) for item in query.get("relevant_ids") or []}
+    row_candidates = []
+    seen = set()
+    for candidate in candidates[:max_candidates]:
+        candidate_id = str(candidate.get("id") or "")
+        if not candidate_id or candidate_id in seen:
+            continue
+        row_candidates.append(dict(candidate))
+        seen.add(candidate_id)
+    for candidate in candidates:
+        candidate_id = str(candidate.get("id") or "")
+        if candidate_id in relevant and candidate_id not in seen:
+            row_candidates.append(dict(candidate))
+            seen.add(candidate_id)
+        if len(row_candidates) >= max_candidates:
+            break
+    return {
+        "query": str(query.get("text") or ""),
+        "qa_id": str(query.get("id") or ""),
+        "question_type": str(query.get("scenario") or ""),
+        "query_embedding": vector_to_list(query_vector),
+        "budget": int(budget),
+        "relevant_ids": sorted(relevant),
+        "candidates": row_candidates[:max_candidates],
+    }
+
+
 def context_ids(ranked: list[tuple[str, float, str]], budget: int) -> list[str]:
     used = 0
     out = []
@@ -643,6 +710,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     else:
         memory_vectors = np.asarray(backend.embed_many(memory_texts), dtype=np.float32)
         query_vectors = np.asarray(backend.embed_many([str(query["text"]) for query in queries]), dtype=np.float32)
+    for memory, vector_value in zip(memories, memory_vectors):
+        memory["embedding"] = vector_to_list(vector_value)
     embed_seconds = time.perf_counter() - embed_started
 
     vector = VectorSearch(memory_vectors, args.vector_index, args.hnsw_m)
@@ -658,6 +727,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     if calibrator is not None:
         systems["calibrated"] = []
     signatures: dict[str, list[str]] = {key: [] for key in systems}
+    calibration_rows: list[dict[str, Any]] = []
 
     for query_index, query in enumerate(queries):
         query_vector = query_vectors[query_index]
@@ -703,6 +773,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             args.graph_weight,
         )
         hybrid = hybrid[: args.candidate_pool]
+        relevant = {str(item) for item in query.get("relevant_ids") or []}
+        for candidate in hybrid:
+            annotate_query_matches(query, candidate)
+        mark_candidate_labels(hybrid, relevant)
+        if args.output_calibration_jsonl:
+            calibration_rows.append(calibration_row(query, query_vector, hybrid, args.budget, args.calibration_max_candidates))
         hybrid_ranked = [(str(item["id"]), float(item.get("base_score") or 0.0), str(item.get("text") or "")) for item in hybrid]
         hybrid_pool = {candidate_id for candidate_id, _, _ in hybrid_ranked}
         systems["hybrid"].append(metrics_for(query, hybrid_ranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
@@ -741,6 +817,14 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "systems": {name: aggregate(rows) for name, rows in systems.items()},
         "determinism_mismatches": {name: 0 for name in systems},
     }
+    if args.output_calibration_jsonl:
+        output = Path(args.output_calibration_jsonl)
+        output.parent.mkdir(parents=True, exist_ok=True)
+        with output.open("w", encoding="utf-8") as handle:
+            for row in calibration_rows:
+                handle.write(json.dumps(row, separators=(",", ":"), sort_keys=True) + "\n")
+        result["calibration_rows"] = len(calibration_rows)
+        result["output_calibration_jsonl"] = str(output)
     if args.output_json:
         output = Path(args.output_json)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -821,6 +905,8 @@ def main() -> None:
     parser.add_argument("--output-json", default="")
     parser.add_argument("--output-md", default="")
     parser.add_argument("--output-dataset-json", default="")
+    parser.add_argument("--output-calibration-jsonl", default="")
+    parser.add_argument("--calibration-max-candidates", type=int, default=128)
     args = parser.parse_args()
     print(json.dumps(run(args), indent=2, sort_keys=True))
 
