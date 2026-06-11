@@ -1368,3 +1368,97 @@ Next action:
   encoder 180-query eval.
 - Add a cached encoder embedding path; the current benchmark reloads the encoder
   per run, which is fine for correctness but noisy for latency.
+
+
+28. Session memory stress test at 10k and 50k
+
+Implemented and tested.
+
+Setup:
+- New benchmark:
+  `python/benchmarks/session_memory_stress.py`
+- Hippo-Qwen commit: `24bc4be`.
+- Hippo-encoder commit: `0e48287`.
+- Runtime: Colab A100.
+- Encoder checkpoint:
+  `/content/hippoencoder-model/hippoencoder-bge-small-all-nli-pair-500k-c025-epoch3`
+- The benchmark creates one shared synthetic memory store with many users,
+  projects, brands, sessions, preferences, corrections, tool choices, stale
+  memories, query-echo decoys, same-user wrong-project decoys, and background
+  session chatter.
+- Each query has three evidence memories: preference, correction, and tool.
+- Each query has twelve hard negatives.
+- Vector index: FAISS HNSW.
+- Embedding backend: Hippo encoder.
+- Queries: 120.
+- Candidate settings: vector fetch 1024, token fetch 1024, candidate pool 128.
+- Calibrator: freshly trained 768-d set calibrator at
+  `/content/session_memory_stress/set3_hippo.pt`.
+- Budget: 900 tokens.
+- Top-k: 8.
+
+Artifacts:
+- `/content/session_memory_stress/10000/summary.md`
+- `/content/session_memory_stress/10000/summary.json`
+- `/content/session_memory_stress/10000/dataset.json`
+- `/content/session_memory_stress/50000/summary.md`
+- `/content/session_memory_stress/50000/summary.json`
+- `/content/session_memory_stress/combined_summary.json`
+
+Results:
+
+| memories | system | evidence in pool | recall@8 | precision@8 | context recall | context precision | hard neg@8 | hard neg ctx | no relevant ctx |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 10k | vector | 0.1167 | 0.0083 | 0.0031 | 0.0694 | 0.0055 | 0.8771 | 0.6687 | 0.7917 |
+| 10k | hybrid | 0.2944 | 0.2389 | 0.0896 | 0.2583 | 0.0227 | 0.5698 | 0.4475 | 0.2833 |
+| 10k | calibrated | 0.2944 | 0.2306 | 0.0865 | 0.2417 | 0.0217 | 0.0260 | 0.1554 | 0.2833 |
+| 50k | vector | 0.1028 | 0.0083 | 0.0031 | 0.0667 | 0.0052 | 0.7542 | 0.5544 | 0.8000 |
+| 50k | hybrid | 0.2444 | 0.1944 | 0.0729 | 0.2083 | 0.0175 | 0.5000 | 0.3454 | 0.4083 |
+| 50k | calibrated | 0.2444 | 0.1722 | 0.0646 | 0.2028 | 0.0177 | 0.0490 | 0.1240 | 0.4167 |
+
+Timing:
+
+| memories | elapsed seconds | embedding seconds |
+| --- | ---: | ---: |
+| 10k | 16.006 | 2.502 |
+| 50k | 29.765 | 10.997 |
+
+Interpretation:
+- This is the first real scale-stress failure, and it is useful.
+- The current pipeline is not ready to claim high-quality retrieval at 10k-50k
+  noisy session memories under this benchmark.
+- The binding issue is candidate generation. With a pool of 128 from 1024
+  vector plus 1024 token candidates, only 0.29 of evidence reaches the pool at
+  10k and only 0.24 at 50k.
+- The calibrator cannot recover evidence that never reaches it.
+- The calibrator still does one important thing well: it suppresses hard
+  negatives aggressively. At 50k, hard-negative exposure in top-k drops from
+  0.5000 for hybrid to 0.0490 for calibrated. At 10k, it drops from 0.5698 to
+  0.0260.
+- Vector-only is not viable for this workload. It mostly returns query-echo
+  decoys and misses the evidence.
+- Context precision is extremely low because the benchmark counts only the
+  three exact evidence memories as useful inside a large packed context. This is
+  still a valid warning: the current packer is too loose for large noisy stores.
+
+Verdict:
+- Keep this benchmark. It exposes the failure mode a startup-scale memory layer
+  must solve.
+- Do not use these raw quality numbers as a marketing claim.
+- The honest claim is stronger: the system now has a deterministic 10k/50k
+  stress harness, and it identifies candidate generation plus packing as the
+  next engineering targets.
+
+Likely fixes to test next:
+- Add deterministic entity/session/project expansion before calibration.
+  This benchmark contains structured user, project, brand, and session metadata,
+  so the retrieval layer should not rely only on vector and token search.
+- Run a fetch/pool sweep: 1024/128, 2048/256, 4096/512, and 8192/512.
+- Add source attribution for each relevant memory: vector hit, token hit,
+  metadata/entity hit, graph-edge hit, or missed.
+- Train a calibrator on this session-stress distribution rather than only on
+  MemoryCraft-style rows.
+- Add a learned stop/include threshold so context returns fewer memories instead
+  of filling a large budget with weak neighbors.
+- Cache embeddings and vector indexes so repeated stress sweeps measure
+  retrieval choices rather than rebuild cost.
