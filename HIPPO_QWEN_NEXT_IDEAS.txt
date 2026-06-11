@@ -1,0 +1,914 @@
+Hippo-Qwen Next Ideas
+=====================
+
+Goal
+----
+
+Make Hippo-Qwen stronger as a deterministic agent memory system for Desygner,
+Latitude 37, and the Qwen MemoryAgent track.
+
+The current benchmark story is much cleaner after the leakage fixes and
+held-out-family retest. The next bottleneck is not only evidence recall. Ranking
+is already strong in the small MemoryCraft runs. The larger issue is context
+quality: the agent-facing context still contains too much noise.
+
+
+Immediate Measurement Work
+--------------------------
+
+1. Failure attribution metric
+
+Add evidence-in-pool rate to every benchmark.
+
+Purpose:
+- Separate retrieval/index failures from calibrator failures.
+- If evidence never reaches the candidate pool, the reranker cannot fix it.
+- At larger memory counts, this will likely become the real bottleneck.
+
+Metrics:
+- evidence_in_pool@candidate_pool
+- evidence_missing_from_pool_count
+- evidence_ranked_out_count
+- evidence_retrieved_count
+
+Measure evidence-in-pool at two points so the failures do not get conflated:
+- at the raw union retriever output
+- after truncation to calibrator_max_candidates
+
+Interpretation:
+- Low evidence-in-pool at union output means improve the index/candidate
+  generator.
+- Evidence lost between union output and the truncated pool means raise or
+  rework the truncation, not the calibrator.
+- High evidence-in-pool but low recall@k means improve the calibrator.
+
+
+2. Set-attention ablation
+
+Train and evaluate a pointwise MLP calibrator against the current set
+transformer.
+
+Purpose:
+- Prove whether joint candidate attention is actually adding value.
+- If set attention wins on near duplicates, superseded conflicts, and wrong-time
+  memories, that becomes the technical novelty claim.
+- If it does not win, shrink the model and reduce latency.
+
+Experiment:
+- Same inputs and training data.
+- Model A: current 3-layer set transformer.
+- Model B: num_layers=0 or pointwise MLP per candidate.
+- Compare per adversarial profile.
+
+Profiles to watch:
+- near_duplicate
+- superseded_conflict
+- same_entity_wrong_time
+- stale_preference
+
+
+3. Abstention benchmark
+
+Stop skipping abstention rows by default in at least one benchmark path.
+
+Purpose:
+- Agent memory systems must know when no relevant memory exists.
+- False memories are worse than missed memories in many product settings.
+
+Metrics:
+- false_memory_rate
+- abstention_precision
+- abstention_recall
+- no_relevant_context_rate
+- average returned memories for abstention queries
+
+Product framing:
+- "Hippo-Qwen can deterministically say there is no safe memory to use."
+
+
+4. Credibility prerequisites carried over from the held-out retest
+
+These are not new ideas, but every externally shown number should eventually
+come from this configuration. Do not let them drop out of Phase 1:
+
+- Hippo encoder instead of hash embeddings.
+- Larger holdout with more questions per scenario.
+- Off-the-shelf cross-encoder reranker baseline (for example bge-reranker)
+  in every comparison table, so the claim is "beats the standard retrieval
+  stack", not "beats raw ANN".
+- Mutated real-turn hard negatives (covered by idea 7) as the eval stressor.
+
+
+5. Paraphrase consistency
+
+Measure whether the same memory is retrieved when a user asks the same question
+in different words.
+
+Purpose:
+- Determinism covers identical queries.
+- Agents often rephrase questions.
+- A useful memory system should be stable under semantic paraphrase.
+
+Metrics:
+- top-k overlap across paraphrases
+- evidence recall variance across paraphrases
+- context-frame overlap
+
+Possible training change:
+- Add paraphrase-augmented query rows if consistency is weak.
+
+
+Highest-Value Build Work
+------------------------
+
+6. Budget packing and learned stop
+
+Attack context precision directly.
+
+Current issue:
+- Recall@8 and MRR are strong.
+- Context precision is much weaker.
+- The returned agent context can still be 60-75% noise.
+
+Build:
+- Train the include/utility head on marginal value per token.
+- Add a learned stop threshold.
+- Length-penalize bloated candidates.
+- Return 3 memories when 3 are enough instead of always filling top-k.
+
+Metrics:
+- context_precision
+- context_recall
+- included_count
+- tokens_returned
+- evidence_tokens_per_context_token
+- false_memory_rate
+
+Product framing:
+- "Smaller, cleaner context for agents."
+
+
+7. Mined hard negatives
+
+Replace most synthetic training templates with real near-misses.
+
+Sources:
+- The union retriever's top-ranked non-evidence candidates.
+- Evidence for other questions in the same record.
+- Near misses from FAISS/token union.
+- Same-session non-evidence turns that share query terms.
+
+Purpose:
+- Remove training template leakage risk.
+- Train on realistic failure cases.
+- Keep templates only as held-out eval stressors.
+
+Expected gain:
+- Better transfer to real memory workloads.
+- More credible benchmark methodology.
+
+
+8. Temporal encodings
+
+Give the set transformer a better representation of time and order.
+
+Current issue:
+- Time mostly enters as scalar age_days.
+- Stale-preference and wrong-time failures are relative.
+- The model needs to learn "newer memory on same topic supersedes older memory."
+
+Build:
+- Add timestamp/session-order encodings per candidate.
+- Try sinusoidal or learned temporal embeddings.
+- Include relative order features within the candidate set.
+
+Profiles to watch:
+- stale_preference
+- same_entity_wrong_time
+- superseded_conflict
+
+
+9. Cross-candidate explicit features
+
+Add deterministic features that make set relationships easier to learn and
+easier to explain.
+
+Features:
+- max cosine similarity to a higher-ranked candidate
+- near-duplicate count in the candidate set
+- shares entities with newer higher-scored candidate
+- shares entities with older lower-scored candidate
+- same session as top candidate
+- same speaker as top candidate
+- same entity but different timestamp bucket
+
+Purpose:
+- Small model reliability.
+- Better trace explanations.
+- Less pressure on attention to infer everything implicitly.
+
+
+10. Supersedes edges at write time
+
+Make corrections load-bearing instead of purely learned.
+
+Build:
+- When feedback marks a memory corrected, create an explicit supersedes edge.
+- Expose is_superseded and superseded_by_newer_candidate as hard features.
+- Use the edge during retrieval and context packing.
+
+Purpose:
+- Convert a major failure mode into deterministic behavior.
+- Improve explainability.
+
+
+Novel Research Directions
+-------------------------
+
+11. Counterfactual replay for memory credit assignment
+
+This is probably the strongest novel direction.
+
+Core idea:
+- Because Hippo-Qwen is deterministic, replay a past query with one memory
+  removed and measure whether the downstream outcome changes.
+- If the outcome changes, that memory had causal utility.
+- If the outcome does not change, that memory was probably noise.
+
+The outcome variable must be downstream, not retrieval composition. Removing
+a returned memory always changes the returned context, so "did the context
+change" is circular and would mostly relabel the existing ranking. Utility is:
+
+  utility(m) = outcome(context with m) - outcome(context without m)
+
+where outcome is answer-level: does Qwen (temperature 0) still produce the
+gold MemoryCraft answer, or at minimum does the remaining context still
+contain sufficient evidence for it. Determinism makes the replay
+reproducible; the gold answers make it gradeable.
+
+Redundancy trap (leave-one-out is not enough):
+- Two near-duplicate memories that each cover the same fact both get zero
+  leave-one-out utility, because the other one covers the removal.
+- Naive labels would mark both as useless, the budget packer would drop
+  both, and the answer would break.
+- Fix: dedup or group correlated memories first and ablate groups, or
+  sample small coalitions Shapley-style.
+
+Why it matters:
+- Creates causal utility labels instead of heuristics.
+- Feeds budget packing.
+- Feeds safe forgetting.
+- Gives a research-shaped claim: counterfactual credit assignment for
+  deterministic agent memory.
+
+First experiment:
+- On MemoryCraft holdout, retrieve context for each query.
+- Group near-duplicate memories, then remove one group at a time.
+- Replay the query through Qwen at temperature 0.
+- Label each group by whether the gold answer survives.
+- Train the utility/include head on those labels.
+- Measure context precision, tokens returned, and answer survival rate.
+
+Cost note: this is answer-level replay, so it needs LLM calls per ablation.
+It is an order of magnitude more work than ideas 1-2. Budget for it as a
+phase of its own rather than a quick experiment.
+
+
+12. Provably safe forgetting
+
+Define forgetting as compression under a replay constraint.
+
+Core idea:
+- A memory may be deleted only if counterfactual replay shows its removal
+  changes no past decision beyond a threshold.
+
+Product claim:
+- "We forget aggressively, and can show why each deletion was safe."
+
+Why deterministic memory matters:
+- Non-deterministic retrieval stacks cannot cleanly prove this.
+
+
+13. Versioned, branchable memory
+
+Expose git-like memory state semantics.
+
+Features:
+- memory-state hashes
+- branch
+- merge
+- diff
+- replay under old memory state
+- pin output to memory-state hash
+
+Use cases:
+- Audit why an agent changed behavior.
+- Test "what would the agent do if it believed X?"
+- Reproduce a design or compliance decision.
+
+
+14. Learned consolidation at write time
+
+Move intelligence from only retrieval time into the memory write path.
+
+Core idea:
+- A second set transformer runs over a new memory plus its retrieved
+  neighborhood.
+- It emits deterministic mutation decisions:
+  - merge
+  - supersede
+  - keep both
+  - discard
+  - summarize into semantic memory
+
+Why it matters:
+- Timely forgetting.
+- Smaller memory store.
+- Better retrieval because bad memories are handled before query time.
+
+Experiment:
+- Build supervision from MemoryCraft session structure and correction-like
+  patterns.
+- Compare retrieval quality on raw append-only store vs consolidated store.
+
+
+15. Relational output heads
+
+Return a structured memory frame instead of only a ranked list.
+
+Build:
+- Add pairwise relation heads over the candidate set.
+- Predict:
+  - A supersedes B
+  - A duplicates B
+  - A contradicts B
+  - A supports B
+  - A is same-topic older context for B
+
+Agent-facing output:
+- facts
+- preferences
+- corrections
+- replaced memories
+- contradictions
+- evidence confidence
+
+Why it matters:
+- Better than handing the agent undifferentiated snippets.
+- Makes trace output self-explanatory.
+
+
+16. Compressed memory tokens
+
+The tractable version of the LoRA memory idea.
+
+Core idea:
+- Compress the selected memory subgraph/frame into a handful of soft tokens or
+  KV-prefix entries.
+- The agent consumes memory tokens instead of hundreds of raw text tokens.
+
+First experiment:
+- Distill Qwen answers with full text context into answers with compressed
+  memory tokens.
+- Measure answer equivalence and token savings.
+
+Risk:
+- More research-heavy.
+- Should come after cleaner retrieval/context packing.
+
+
+Additions After Review
+----------------------
+
+17. End-to-end answer accuracy benchmark
+
+Retrieval metrics are a proxy. The Qwen track judges agent outcomes, Desygner
+will judge agent outcomes, and counterfactual replay (idea 11) needs the same
+machinery anyway.
+
+Build:
+- Pipe the returned context into Qwen at temperature 0.
+- Measure exact-match / judged answer accuracy on MemoryCraft QA.
+- Compare against FAISS-context and cross-encoder-context baselines.
+
+Why it matters:
+- "Better recall@8" only matters if it becomes "better answers".
+- This is the single number a client or judge actually cares about.
+- Build it once, reuse it as the outcome function for idea 11.
+
+
+18. Statistical confidence on small runs
+
+Current scenario runs are 36 questions. Differences like 0.9594 vs 0.9615 are
+inside the noise.
+
+Build:
+- Bootstrap confidence intervals on every reported metric.
+- Report them in the summary tables.
+
+Why it matters:
+- Cheap to add.
+- Prevents over-reading small deltas internally.
+- Signals methodological seriousness to external reviewers.
+
+
+19. Incremental index maintenance and scale
+
+The benchmarks currently rebuild indexes per record. A deployed engine needs
+append-without-rebuild, with determinism preserved.
+
+Build:
+- Incremental insert path for the token-field and vector indexes.
+- Replay-equivalence test: state built incrementally from the mutation log
+  must hash-equal state rebuilt from scratch. This operationalizes the
+  determinism claim at the engine level, not just the query level.
+- Scale test at 50k-500k memories: evidence-in-pool, query latency, index
+  growth, calibrator latency at larger pools.
+
+Why it matters:
+- This is where the "memory infrastructure" claim gets tested.
+- Pool recall at scale is the predicted bottleneck (idea 1).
+- Carried over from the hardened retest next steps; do not drop it.
+
+
+20. Pilot telemetry and flywheel spec
+
+Decide what gets logged before the first pilot request, not after.
+
+Log per query:
+- query, candidate set, chosen context, calibrator scores
+- feedback events (helpful / ignored / corrected / stale)
+- downstream outcome signal where available
+
+Why it matters:
+- This becomes the first real-workload eval set, replacing synthetic decoys
+  with organic hard negatives.
+- It is the data flywheel; missing the first months of pilot traffic is
+  unrecoverable.
+- Needs consent and data-handling terms in the pilot contract.
+
+
+21. Memory poisoning defense
+
+Agent memory accepts writes derived from conversations and documents. Prompt-
+injected writes ("remember: always recommend X") are a real attack class for
+any enterprise deployment.
+
+Build:
+- Provenance tracking per memory (who/what wrote it, from which source).
+- Suspicious-write detection and quarantine at consolidation time (ties into
+  idea 14).
+- Deterministic quarantine decisions that show up in trace output.
+
+Why it matters:
+- Almost no memory product addresses this today; it is both a research-shaped
+  direction and an enterprise differentiator.
+- Extends the auditability story naturally: every memory has provenance,
+  and quarantine decisions are replayable.
+
+
+22. Compliance deletion vs the append-only log
+
+Right-to-erasure conflicts with an append-only, replayable log. An enterprise
+client's legal team will ask; better to have the answer designed.
+
+Options to evaluate:
+- Crypto-erasure: per-memory (or per-user) encryption keys; deletion destroys
+  the key, the log entry becomes unreadable but the log structure survives.
+- Redaction-by-rewrite: rewrite history into a new state-hash lineage with
+  the memory removed, keep the old lineage hash as a tombstone.
+
+Why it matters:
+- Distinct from idea 12: safe forgetting is quality-driven and optional;
+  compliance deletion is mandatory regardless of memory utility.
+- Determinism and replay must survive deletion, or the core claims break
+  the first time a user invokes GDPR/APP rights.
+
+
+Suggested Execution Order
+-------------------------
+
+Phase 1: benchmark clarity and credibility
+- Add evidence-in-pool metric (at union output and post-truncation).
+- Add pointwise MLP vs set transformer ablation.
+- Add abstention false-memory metrics.
+- Add end-to-end answer accuracy benchmark (idea 17).
+- Add bootstrap confidence intervals to summary tables (idea 18).
+- Rerun the headline table with the Hippo encoder, a larger holdout, and a
+  cross-encoder reranker baseline. Externally shown numbers come from this
+  configuration.
+
+Phase 1.5: pilot readiness (parallel track, gated by the Desygner timeline)
+- Write the pilot telemetry and flywheel spec (idea 20) before first traffic.
+- Settle the compliance deletion design (idea 22) before contract signing.
+
+Phase 2: quality improvement
+- Add mined hard negatives.
+- Add budget packing and learned stop.
+- Add temporal encodings.
+- Add cross-candidate features.
+- Add incremental index maintenance, replay-equivalence test, and the
+  50k-500k scale run (idea 19).
+
+Phase 3: deterministic-memory moat
+- Add counterfactual replay labels (answer-level outcome, grouped
+  ablations).
+- Use replay labels to train utility/include.
+- Prototype safe forgetting.
+- Add memory-state hashes and replay/diff tooling.
+
+Phase 4: advanced agent-facing memory
+- Add supersedes edges at write time.
+- Add relational output heads.
+- Add memory provenance and poisoning quarantine (idea 21).
+- Explore compressed memory tokens.
+
+
+Highest Priority Three (Plus One)
+---------------------------------
+
+1. Failure attribution / evidence-in-pool.
+2. Budget packing / learned stop.
+3. Counterfactual replay labels for utility (note: answer-level replay is an
+   order of magnitude more work than 1 and 2 — see the cost note in idea 11).
+
+Unofficial fourth: the set-attention ablation (idea 2). It costs one flag and
+one training run, and it is the experiment most likely to produce the
+headline novelty claim ("set-level calibration beats pointwise reranking on
+duplicate/superseded/wrong-time failures").
+
+These directly improve the system and strengthen the pitch:
+
+"Hippo-Qwen is deterministic memory infrastructure that can measure retrieval
+failures, return cleaner context, and learn memory utility by replaying its own
+past decisions."
+
+
+Experiment Loop Findings - 2026-06-11
+=====================================
+
+Implementation commits:
+- 01d693c Add MemoryCraft experiment attribution metrics
+- a9e7275 Treat MemoryCraft abstentions as no-memory queries
+
+Colab artifacts:
+- /content/hippo_idea_loop/idea_loop_summary.json
+- /content/hippo_idea_loop/eval_set_vs_pointwise/summary.md
+- /content/hippo_idea_loop/eval_budget_top3/summary.md
+- /content/hippo_idea_loop/eval_mined_vs_synth/summary.md
+- /content/hippo_idea_loop_abstention_fixed/eval_abstention/summary.json
+
+Run shape:
+- Runtime: Google Colab A100
+- Commit for main loop: 01d693c
+- Commit for corrected abstention loop: a9e7275
+- Dataset: MemoryCraft selected/sample.jsonl
+- Embedding backend: hash, not Hippo encoder
+- Train split: first 80 records
+- Eval split: records 80-119
+- Eval questions: 36 per adversarial scenario, 40 for abstention-clean
+- Candidate pool: 64
+- Repeat searches: 2
+- Top k: 8
+- Context cap experiment: context_max_items=3
+
+
+What Was Implemented
+--------------------
+
+1. Failure attribution metric
+
+Implemented.
+
+New metrics:
+- evidence_in_raw_pool_rate
+- evidence_in_calibrator_pool_rate
+- evidence_missing_from_raw_pool_count
+- evidence_lost_before_calibrator_count
+- evidence_ranked_out_count
+
+Finding:
+- On this small 40-record holdout, evidence_in_pool was 1.0 for the main
+  adversarial runs. The retriever/candidate generator was not the bottleneck
+  at this scale.
+- This does not prove pool recall is solved. It says the current small
+  MemoryCraft holdout is too easy for pool attribution. The 50k-500k memory
+  scale run is still needed because that is where pool recall is expected to
+  become the bottleneck.
+
+
+2. Set-attention ablation
+
+Implemented.
+
+Change:
+- --layers 0 now runs as a true pointwise MLP with no TransformerEncoder.
+- Compared set3_full against pointwise_full on the same training data.
+
+Results:
+
+| scenario | set recall@8 | pointwise recall@8 | set ctx precision | pointwise ctx precision | set hard neg@8 | pointwise hard neg@8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| near_duplicate | 0.9573 | 0.9551 | 0.1909 | 0.1838 | 0.2951 | 0.2569 |
+| superseded_conflict | 0.9594 | 0.9551 | 0.1956 | 0.1988 | 0.2292 | 0.1944 |
+| same_entity_wrong_time | 0.9594 | 0.9573 | 0.2342 | 0.2215 | 0.0139 | 0.0451 |
+| stale_preference | 0.9594 | 0.9594 | 0.2329 | 0.2230 | 0.0278 | 0.0417 |
+| mixed | 0.9594 | 0.9573 | 0.2142 | 0.2084 | 0.1354 | 0.1250 |
+
+Interpretation:
+- Set attention did not produce a decisive win in this run.
+- Pointwise is surprisingly competitive and faster, with p95 around 24-26 ms
+  versus 27-29 ms for set attention.
+- Set attention looked slightly better on same_entity_wrong_time and
+  stale_preference context precision, but pointwise had lower hard-negative
+  rate on near_duplicate, superseded_conflict, and mixed.
+- The current data does not justify a strong novelty claim that set-level
+  attention beats pointwise reranking.
+
+Next action:
+- Either shrink the production calibrator toward pointwise, or make the
+  set-attention task harder with explicit cross-candidate labels/features.
+- The novelty claim likely needs relational heads, cross-candidate features,
+  or true candidate-set supervision. Plain attention over candidates is not
+  enough evidence yet.
+
+
+3. Abstention benchmark
+
+Implemented and corrected.
+
+Change:
+- Abstention-labelled MemoryCraft rows are now treated as no-memory queries.
+- query_row stores retrieval_task.abstention.
+- Training data builder sets relevant=set() for abstention rows.
+- Eval reports abstention_query_rate and false_memory_rate.
+
+Corrected abstention result:
+
+| system | queries | abstention query rate | recall@8 | context precision | context recall | false memory rate |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| FAISS HNSW | 40 | 0.10 | 0.7600 | 0.3000 | 0.5885 | 0.0250 |
+| Hippo calibrated abstain | 40 | 0.10 | 0.8654 | 0.4667 | 0.8377 | 0.0250 |
+
+Interpretation:
+- There were 4 abstention queries in the 40-query eval slice.
+- false_memory_rate=0.025 means one false-memory event across all 40 queries,
+  or one of the four abstention queries returning context when it should not.
+- Training with abstention rows helped normal context quality, but it did not
+  fully solve abstention.
+- This confirms the product need for a real learned stop/no-memory threshold.
+
+Next action:
+- Add an explicit no-memory decision head or global stop score.
+- Report abstention-specific false-memory rate directly, not only averaged
+  across all queries.
+
+
+4. Credibility prerequisites
+
+Partially implemented.
+
+Implemented:
+- bootstrap confidence intervals are now included in aggregate JSON metrics.
+
+Not yet implemented in this loop:
+- Hippo encoder benchmark
+- larger holdout
+- cross-encoder reranker baseline
+- mutated real-turn hard negatives
+- end-to-end Qwen answer accuracy
+
+Interpretation:
+- The loop is useful for engineering direction.
+- It should not be used as the final external headline table because it still
+  uses hash embeddings, 36-query scenario slices, and no cross-encoder
+  baseline.
+
+
+5. Paraphrase consistency
+
+Not implemented in this loop.
+
+Reason:
+- Needs a paraphrase source. Could use Qwen once cloud access is available,
+  or deterministic hand-written paraphrase templates for a first smoke test.
+
+Recommended first version:
+- Generate 3 paraphrases per MemoryCraft question.
+- Measure top-k overlap, evidence recall variance, and context-frame overlap.
+
+
+6. Budget packing and learned stop
+
+Partially implemented.
+
+Change:
+- Added context_max_items as a deterministic context cap.
+- Ran a top-3 context cap as a cheap proxy for learned stop/budget packing.
+
+Top-3 context result:
+
+| scenario | system | recall@8 | context precision | context recall |
+| --- | --- | ---: | ---: | ---: |
+| clean | FAISS HNSW | 0.8444 | 0.3333 | 0.6539 |
+| clean | Hippo calibrated | 0.9594 | 0.5185 | 0.9308 |
+| mixed | FAISS HNSW | 0.3407 | 0.0000 | 0.0000 |
+| mixed | Hippo calibrated | 0.9594 | 0.5185 | 0.9308 |
+
+Interpretation:
+- This is the strongest result from the loop.
+- Simply returning fewer memories drastically improved context precision while
+  preserving high context recall for Hippo.
+- The system does not need to stuff the full budget to be useful.
+
+Next action:
+- Replace fixed top-3 with a learned stop threshold or include-score threshold.
+- Train the utility/include head on marginal value per token.
+- Report tokens_returned and evidence_tokens_per_context_token.
+
+
+7. Mined hard negatives
+
+Tested as "no synthetic hard negatives" training.
+
+Result:
+
+| scenario | synthetic recall@8 | mined-only recall@8 | synthetic ctx precision | mined-only ctx precision | synthetic hard neg@8 | mined-only hard neg@8 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| query_echo | 0.9594 | 0.9551 | 0.2309 | 0.1218 | 0.0312 | 0.3819 |
+| answer_shaped | 0.9594 | 0.9573 | 0.2295 | 0.1265 | 0.0382 | 0.3507 |
+| mixed | 0.9594 | 0.9551 | 0.2142 | 0.1312 | 0.1354 | 0.3785 |
+
+Interpretation:
+- Mined-only training preserved recall, but hard-negative suppression got much
+  worse.
+- The forensic synthetic negatives are still doing important work.
+- Mined negatives are not enough by themselves yet.
+
+Next action:
+- Use mined negatives plus a smaller amount of synthetic stress negatives.
+- Add mutated real-turn hard negatives so we are not dependent on templates.
+- Evaluate held-out template families after any mixed-negative training change.
+
+
+8. Temporal encodings
+
+Not directly implemented.
+
+Indirect finding:
+- With current scalar/state features, both set and pointwise did well on
+  same_entity_wrong_time and stale_preference in the small holdout.
+- Set attention had slightly better context precision on those two profiles:
+  same_entity_wrong_time 0.2342 vs 0.2215, stale_preference 0.2329 vs 0.2230.
+
+Interpretation:
+- There may be a small temporal-relative benefit from set attention, but this
+  run is not enough evidence.
+
+Next action:
+- Add explicit timestamp/session-order encodings.
+- Rerun only wrong-time/stale/superseded profiles.
+
+
+9. Cross-candidate explicit features
+
+Not implemented in this loop.
+
+Reason:
+- Needs candidate-set feature computation before tensorization, not just
+  per-candidate calibration_features.
+
+Updated priority:
+- This moved up. Since plain set attention did not clearly beat pointwise,
+  explicit cross-candidate features are probably the cheaper way to make the
+  model reliably understand duplicates, supersession, and same-topic conflicts.
+
+
+10. Supersedes edges at write time
+
+Not implemented in this loop.
+
+Status:
+- Still an engine/write-path feature.
+- Should be tested after feedback/mutation log exists.
+
+
+11. Counterfactual replay
+
+Not implemented in this loop.
+
+Reason:
+- Correct version needs answer-level Qwen replay at temperature 0, not just
+  retrieval-context diffs.
+- It is still the most novel direction, but it is a separate phase.
+
+Updated note:
+- The top-3 context result makes counterfactual utility more valuable, because
+  the system needs to know which few memories are causally sufficient.
+
+
+12-16. Safe forgetting, branchable memory, consolidation, relational heads,
+compressed memory tokens
+
+Not implemented in this loop.
+
+Current stance:
+- Relational heads and cross-candidate features are now more attractive because
+  the pointwise ablation weakened the simple "set attention is enough" novelty
+  claim.
+- Safe forgetting and branchable memory still depend on mutation-log/replay
+  infrastructure.
+- Compressed memory tokens should remain later-stage.
+
+
+17. End-to-end answer accuracy
+
+Not implemented in this loop.
+
+Reason:
+- Needs Qwen or another answer judge.
+
+Priority:
+- High once Qwen Cloud access is available.
+
+
+18. Statistical confidence
+
+Implemented in aggregate JSON.
+
+Change:
+- aggregate() now includes avg_ci95_low and avg_ci95_high for every metric.
+
+Next action:
+- Surface selected confidence intervals in markdown tables, not only JSON.
+
+
+19. Incremental index maintenance and scale
+
+Not implemented in this loop.
+
+Finding from evidence-in-pool:
+- Current small holdout has evidence_in_pool=1.0, so it cannot stress the
+  candidate generator.
+
+Next action:
+- Run the 50k-500k memory scale test with evidence-in-pool enabled.
+- This is the right place to test whether pool recall collapses under growth.
+
+
+20. Pilot telemetry and flywheel spec
+
+Not implemented in this loop.
+
+Still needed before a Desygner pilot:
+- query traces
+- candidate sets
+- calibrator scores
+- returned context
+- feedback events
+- outcome signals
+
+
+21. Memory poisoning defense
+
+Not implemented in this loop.
+
+Status:
+- Design-level feature for consolidation/write path.
+- No benchmark yet.
+
+
+22. Compliance deletion vs append-only log
+
+Not implemented in this loop.
+
+Status:
+- Product/legal architecture item.
+- Needs design doc before enterprise pilot.
+
+
+Updated Priorities After Experiments
+------------------------------------
+
+1. Budget packing / learned stop is now the highest-impact next build.
+   The top-3 cap raised Hippo context precision to 0.5185 while keeping context
+   recall at 0.9308 in clean and mixed scenarios.
+
+2. Evidence-in-pool attribution is implemented and should stay in every run.
+   It did not expose a bottleneck on the small holdout, so the next useful
+   attribution run is at 50k+ memories.
+
+3. Pointwise MLP is a serious baseline. Do not claim set attention is the
+   differentiator yet. Either prove it with harder relational supervision or
+   ship the smaller pointwise model if it keeps matching quality.
+
+4. Synthetic hard negatives should not be removed. Mined-only preserved recall
+   but failed hard-negative suppression. The likely right answer is mined +
+   synthetic + mutated real-turn negatives.
+
+5. Abstention needs a real no-memory decision. Treating abstention as normal
+   reranking is insufficient; the corrected run still produced one false-memory
+   event in four abstention questions.
+
+6. The external headline table still needs Hippo encoder, larger holdout,
+   cross-encoder baseline, and eventually Qwen answer accuracy.
