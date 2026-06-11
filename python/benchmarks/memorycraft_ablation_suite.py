@@ -344,13 +344,14 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         "",
         "## Leaderboard",
         "",
-        "| rank | scenario | system | calibrator | pool | p95 ms | recall@8 | precision@8 | ctx precision | evidence in pool | false memory | hard neg@8 | mrr | det mismatches | score |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| rank | scenario | system | calibrator | pool | cascade prefilter | cascade survivors | p95 ms | recall@8 | precision@8 | ctx precision | evidence in pool | false memory | hard neg@8 | mrr | det mismatches | score |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for rank, row in enumerate(sorted_rows, start=1):
         lines.append(
             f"| {rank} | {row['scenario']} | {row['system']} | {row['calibrator']} | "
-            f"{row['candidate_pool']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
+            f"{row['candidate_pool']} | {row['cascade_prefilter_candidates']:.0f} | "
+            f"{row['cascade_survivor_candidates']:.0f} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_precision']:.4f} | "
             f"{row['evidence_in_pool']:.4f} | {row['false_memory_rate']:.4f} | "
             f"{row['hard_negative_top_k_rate']:.4f} | {row['mrr']:.4f} | "
@@ -361,13 +362,14 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
             "",
             "## Scenario Matrix",
             "",
-            "| scenario | system | calibrator | pool | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | evidence in pool | false memory | hard neg ctx | mrr |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| scenario | system | calibrator | pool | cascade prefilter | cascade survivors | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | evidence in pool | false memory | hard neg ctx | mrr |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         lines.append(
             f"| {row['scenario']} | {row['system']} | {row['calibrator']} | {row['candidate_pool']} | "
+            f"{row['cascade_prefilter_candidates']:.0f} | {row['cascade_survivor_candidates']:.0f} | "
             f"{row['queries']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_recall']:.4f} | "
             f"{row['context_precision']:.4f} | {row['evidence_in_pool']:.4f} | "

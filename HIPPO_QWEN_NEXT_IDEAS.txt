@@ -930,6 +930,80 @@ Status:
 - Needs design doc before enterprise pilot.
 
 
+23. Cascaded calibration
+
+Implemented and smoke-tested.
+
+Architecture:
+- Stage 0: retrieve a larger FAISS+token union candidate pool.
+- Stage 1: cheap pointwise calibrator scores the large pool.
+- Stage 2: set transformer reranks only the pointwise survivors.
+- The set-stage survivor IDs are now used for evidence-in-calibrator-pool
+  attribution, so the metric measures what actually reaches relational
+  calibration.
+
+Code changes:
+- Added `hippo_cascade_union` to MemoryCraft retrieval.
+- Added `--cascade-prefilter-checkpoint`,
+  `--cascade-prefilter-candidates`, and `--cascade-survivor-candidates`.
+- `rerank_with_calibrator` can now score a runtime candidate limit larger than
+  the checkpoint's saved `max_candidates`, because the model has no learned
+  candidate-count parameter.
+- The ablation suite can now compare `hippo_calibrated_union` and
+  `hippo_cascade_union` in the same run.
+
+Smoke test:
+- Colab fixture run with temporary untrained checkpoints passed.
+- Stage 1 scored 32 candidates, stage 2 kept 8 survivors.
+- Determinism mismatches: 0.
+- p95 latency: 10.08 ms on the tiny fixture.
+
+Trained test:
+- Runtime: Colab with Torch CUDA.
+- Extra dependency installed in Colab: faiss-cpu.
+- Training data: first 80 MemoryCraft records, union candidate source, 144
+  training rows, hash embeddings, forensic synthetic hard negatives.
+- Models: pointwise `--layers 0`, set transformer `--layers 3`, 4 epochs each.
+- Eval: records 80-119, clean and mixed profiles, 180 queries per profile.
+- Single-stage baseline: set calibrator over 64 union candidates.
+- Cascade: pointwise over 256 candidates, set transformer over 64 survivors.
+
+Results:
+
+| scenario | system | p95 ms | cal p95 ms | recall@8 | context recall | context precision | evidence in pool | hard neg@8 | mrr |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| clean | hybrid union | 41.27 | 0.00 | 0.4673 | 0.4560 | 0.1315 | 0.7337 | 0.0000 | 0.3703 |
+| clean | set64 | 60.77 | 19.37 | 0.6164 | 0.6381 | 0.1705 | 0.6804 | 0.0000 | 0.6240 |
+| clean | cascade256->64 | 89.33 | 48.52 | 0.6390 | 0.6611 | 0.1731 | 0.7141 | 0.0000 | 0.6360 |
+| mixed | hybrid union | 43.22 | 0.00 | 0.1940 | 0.4179 | 0.0587 | 0.7248 | 0.8389 | 0.0762 |
+| mixed | set64 | 61.50 | 19.31 | 0.6099 | 0.6346 | 0.1505 | 0.6764 | 0.1625 | 0.6248 |
+| mixed | cascade256->64 | 91.67 | 49.70 | 0.6332 | 0.6593 | 0.1539 | 0.7099 | 0.1583 | 0.6408 |
+
+Interpretation:
+- The cascade did what it was supposed to do: it recovered more evidence into
+  the set-stage pool and improved recall/context recall over a fixed 64
+  single-stage set calibrator.
+- The gain was modest but consistent in this run: about +2.3 recall points and
+  +2.3 context-recall points on clean, +2.3 recall points and +2.5
+  context-recall points on mixed.
+- Hard-negative exposure on mixed improved slightly: 0.1625 -> 0.1583.
+- Latency increased from about 61 ms to 92 ms p95 because stage 1 and stage 2
+  both run as model passes. This is still below the 200 ms target, but the
+  pointwise stage should be batched/compiled before calling it production-ready.
+- The result supports cascaded calibration as a scale/recall strategy, not as a
+  magic quality jump. It is useful if larger pools become necessary at 50k+
+  memories.
+
+Next action:
+- Rerun cascade at 1024->64 and 1024->128 on a larger memory-count stress test.
+- Add stage-specific attribution: raw pool recall, pointwise survivor recall,
+  set top-k recall.
+- Optimize pointwise stage with larger batch tensorization, `torch.compile`, or
+  cached candidate tensors.
+- Train the pointwise prefilter specifically for high-recall survivor retention
+  instead of top-k ranking.
+
+
 Updated Priorities After Experiments
 ------------------------------------
 
@@ -957,3 +1031,7 @@ Updated Priorities After Experiments
 
 6. The external headline table still needs Hippo encoder, larger holdout,
    cross-encoder baseline, and eventually Qwen answer accuracy.
+
+7. Cascaded calibration is worth keeping in the architecture. The first trained
+   test improved recall while staying below 200 ms p95, but it needs a larger
+   50k+ memory test and a prefilter trained for survivor recall.
