@@ -297,10 +297,11 @@ def build_rows(records: list[dict[str, Any]], backend: Any, args: argparse.Names
             token_index = build_token_field_index(embedded_base, args)
         qa_count = 0
         for qa in record.get("qa") or []:
-            if bool(qa.get("abstention")) and not args.include_abstention:
+            abstention = bool(qa.get("abstention"))
+            if abstention and not args.include_abstention:
                 continue
             relevant = normalize_evidence(record, qa, mode)
-            if not relevant:
+            if not relevant and not (args.include_abstention and abstention):
                 continue
             row = query_row(embedded_base, qa, relevant, args.budget)
             row = ensure_backend_embeddings(row, backend)

@@ -31,15 +31,17 @@ class HippoCalibrationTransformer(nn.Module):
             nn.LayerNorm(config.d_model),
             nn.GELU(),
         )
-        layer = nn.TransformerEncoderLayer(
-            d_model=config.d_model,
-            nhead=config.num_heads,
-            dim_feedforward=config.d_model * 4,
-            dropout=config.dropout,
-            batch_first=True,
-            activation="gelu",
-        )
-        self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
+        self.encoder: nn.Module | None = None
+        if config.num_layers > 0:
+            layer = nn.TransformerEncoderLayer(
+                d_model=config.d_model,
+                nhead=config.num_heads,
+                dim_feedforward=config.d_model * 4,
+                dropout=config.dropout,
+                batch_first=True,
+                activation="gelu",
+            )
+            self.encoder = nn.TransformerEncoder(layer, num_layers=config.num_layers)
         self.relevance_head = nn.Linear(config.d_model, 1)
         self.include_head = nn.Linear(config.d_model, 1)
         self.utility_head = nn.Linear(config.d_model, 1)
@@ -55,7 +57,8 @@ class HippoCalibrationTransformer(nn.Module):
         diff = candidates - query_expanded
         product = candidates * query_expanded
         hidden = self.input(torch.cat([query_expanded, candidates, diff, product, features], dim=-1))
-        hidden = self.encoder(hidden, src_key_padding_mask=~mask.bool())
+        if self.encoder is not None:
+            hidden = self.encoder(hidden, src_key_padding_mask=~mask.bool())
         return {
             "relevance_logits": self.relevance_head(hidden).squeeze(-1),
             "include_logits": self.include_head(hidden).squeeze(-1),

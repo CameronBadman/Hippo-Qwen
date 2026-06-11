@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import random
 import sys
 import time
 from pathlib import Path
@@ -33,6 +34,19 @@ def quantile(values: list[float], q: float) -> float:
     ordered = sorted(values)
     index = min(len(ordered) - 1, max(0, int(math.ceil(q * len(ordered)) - 1)))
     return float(ordered[index])
+
+
+def bootstrap_mean_ci(values: list[float], *, iterations: int = 300, seed: int = 934711) -> tuple[float, float]:
+    if not values:
+        return 0.0, 0.0
+    if len(values) == 1:
+        return float(values[0]), float(values[0])
+    rng = random.Random(seed + len(values) * 1009)
+    means = []
+    count = len(values)
+    for _ in range(max(1, int(iterations))):
+        means.append(sum(values[rng.randrange(count)] for _ in range(count)) / count)
+    return quantile(means, 0.025), quantile(means, 0.975)
 
 
 def hargs(args: argparse.Namespace) -> SimpleNamespace:
@@ -350,16 +364,20 @@ def evaluate_growth(
 
 def aggregate(rows: list[dict[str, float]]) -> dict[str, dict[str, float]]:
     keys = sorted({key for row in rows for key in row})
-    return {
-        key: {
-            "avg": average([row[key] for row in rows if key in row]),
-            "p50": quantile([row[key] for row in rows if key in row], 0.50),
-            "p95": quantile([row[key] for row in rows if key in row], 0.95),
-            "min": min([row[key] for row in rows if key in row], default=0.0),
-            "max": max([row[key] for row in rows if key in row], default=0.0),
+    out = {}
+    for key in keys:
+        values = [row[key] for row in rows if key in row]
+        ci_low, ci_high = bootstrap_mean_ci(values)
+        out[key] = {
+            "avg": average(values),
+            "p50": quantile(values, 0.50),
+            "p95": quantile(values, 0.95),
+            "min": min(values, default=0.0),
+            "max": max(values, default=0.0),
+            "avg_ci95_low": ci_low,
+            "avg_ci95_high": ci_high,
         }
-        for key in keys
-    }
+    return out
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:

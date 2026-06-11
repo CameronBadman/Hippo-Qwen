@@ -550,10 +550,55 @@ def query_row(base: dict[str, Any], qa: dict[str, Any], relevant: set[str], budg
     return row
 
 
-def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: int) -> dict[str, float]:
+def budgeted_context_ids(ranked: Ranked, budget: int, max_items: int = 0) -> list[str]:
+    included = []
+    used = 0
+    for candidate_id, _, text in ranked:
+        if max_items > 0 and len(included) >= max_items:
+            break
+        cost = max(1, len(tokens(text)))
+        if used + cost > budget:
+            break
+        included.append(candidate_id)
+        used += cost
+    return included
+
+
+def evidence_pool_metrics(row: dict[str, Any], ranked: Ranked, stats: dict[str, float], top_k: int) -> dict[str, float]:
+    relevant = {str(item) for item in (row.get("retrieval_task") or {}).get("relevant_ids") or []}
+    top_ids = [item[0] for item in ranked[:top_k]]
+    raw_ids = {str(item) for item in stats.get("_raw_candidate_ids", set())}
+    if not raw_ids:
+        raw_ids = {str(item[0]) for item in ranked}
+    calibrator_ids = {str(item) for item in stats.get("_calibrator_candidate_ids", set())}
+    if not calibrator_ids:
+        calibrator_ids = {str(item[0]) for item in ranked}
+    if not relevant:
+        return {
+            "evidence_in_raw_pool_rate": 0.0,
+            "evidence_in_calibrator_pool_rate": 0.0,
+            "evidence_missing_from_raw_pool_count": 0.0,
+            "evidence_lost_before_calibrator_count": 0.0,
+            "evidence_ranked_out_count": 0.0,
+        }
+    raw_hits = len(relevant & raw_ids)
+    calibrator_hits = len(relevant & calibrator_ids)
+    top_hits = len(relevant & set(top_ids))
+    return {
+        "evidence_in_raw_pool_rate": raw_hits / len(relevant),
+        "evidence_in_calibrator_pool_rate": calibrator_hits / len(relevant),
+        "evidence_missing_from_raw_pool_count": float(len(relevant) - raw_hits),
+        "evidence_lost_before_calibrator_count": float(max(0, raw_hits - calibrator_hits)),
+        "evidence_ranked_out_count": float(max(0, calibrator_hits - top_hits)),
+    }
+
+
+def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: int, context_max_items: int = 0) -> dict[str, float]:
     relevant = {str(item) for item in (row.get("retrieval_task") or {}).get("relevant_ids") or []}
     top_ids = [item[0] for item in ranked[:top_k]]
     hard_top_k = sum(1 for candidate_id in top_ids if is_hard_negative_id(candidate_id))
+    included = budgeted_context_ids(ranked, budget, context_max_items)
+    hard_context = sum(1 for candidate_id in included if is_hard_negative_id(candidate_id))
     if not relevant:
         return {
             "recall_at_k": 0.0,
@@ -561,13 +606,18 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
             "mrr": 0.0,
             "context_precision": 0.0,
             "context_recall": 0.0,
-            "context_noise": 0.0,
-            "included_count": 0.0,
+            "context_noise": float(len(included)),
+            "included_count": float(len(included)),
             "relevant_count": 0.0,
             "hard_negative_top_k_count": float(hard_top_k),
             "hard_negative_top_k_rate": hard_top_k / max(1, len(top_ids)),
-            "hard_negative_context_count": 0.0,
-            "hard_negative_context_rate": 0.0,
+            "hard_negative_context_count": float(hard_context),
+            "hard_negative_context_rate": hard_context / max(1, len(included)),
+            "abstention_query": 1.0,
+            "false_memory_rate": 1.0 if included else 0.0,
+            "no_relevant_context_rate": 1.0 if not included else 0.0,
+            "abstention_precision": 1.0 if not included else 0.0,
+            "abstention_recall": 1.0 if not included else 0.0,
         }
     hits_at_k = len(relevant & set(top_ids))
     mrr = 0.0
@@ -575,17 +625,8 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
         if candidate_id in relevant:
             mrr = 1.0 / position
             break
-    included = []
-    used = 0
-    for candidate_id, _, text in ranked:
-        cost = max(1, len(tokens(text)))
-        if used + cost > budget:
-            break
-        included.append(candidate_id)
-        used += cost
     included_set = set(included)
     context_hits = len(relevant & included_set)
-    hard_context = sum(1 for candidate_id in included if is_hard_negative_id(candidate_id))
     return {
         "recall_at_k": hits_at_k / len(relevant),
         "precision_at_k": hits_at_k / max(1, min(top_k, len(ranked))),
@@ -599,6 +640,11 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
         "hard_negative_top_k_rate": hard_top_k / max(1, len(top_ids)),
         "hard_negative_context_count": float(hard_context),
         "hard_negative_context_rate": hard_context / max(1, len(included)),
+        "abstention_query": 0.0,
+        "false_memory_rate": 0.0,
+        "no_relevant_context_rate": 0.0,
+        "abstention_precision": 0.0,
+        "abstention_recall": 0.0,
     }
 
 
@@ -620,7 +666,8 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "token_candidate_count": float(stats.get("token_candidate_count") or 0.0),
         "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
     }
-    out.update(evidence_metrics(row, ranked, args.top_k, args.budget))
+    out.update(evidence_metrics(row, ranked, args.top_k, args.budget, int(getattr(args, "context_max_items", 0) or 0)))
+    out.update(evidence_pool_metrics(row, ranked, stats, args.top_k))
     return out
 
 
@@ -691,6 +738,8 @@ def calibrated_search(
 
     started = time.perf_counter()
     raw_ranked, stats, protected = search_rope_delta_grid(row, backend, meta, args)
+    stats["_raw_candidate_ids"] = {item[0] for item in raw_ranked}
+    stats["_calibrator_candidate_ids"] = {item[0] for item in raw_ranked[: int(args.calibrator_max_candidates)]}
     ranked = rerank_with_calibrator(
         calibrator,
         calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
@@ -721,6 +770,7 @@ def calibrated_union_search(
 
     started = time.perf_counter()
     raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    stats["_calibrator_candidate_ids"] = {item[0] for item in raw_ranked[: int(args.calibrator_max_candidates)]}
     ranked = rerank_with_calibrator(
         calibrator,
         calibrator_payload(row, raw_ranked, id_to_candidate, backend, args),
@@ -753,10 +803,11 @@ def run_record(
     qa_items = []
     qa_count = 0
     for qa in record.get("qa") or []:
-        if bool(qa.get("abstention")) and not args.include_abstention:
+        abstention = bool(qa.get("abstention"))
+        if abstention and not args.include_abstention:
             continue
         relevant = normalize_evidence(record, qa, mode)
-        if not relevant:
+        if not relevant and not (args.include_abstention and abstention):
             continue
         qa_items.append((qa, relevant))
         qa_count += 1
@@ -998,6 +1049,7 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- dim_count: `{result['dim_count']}`",
         f"- top_k: `{result['top_k']}`",
         f"- budget: `{result['budget']}`",
+        f"- context_max_items: `{result['context_max_items']}`",
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
         f"- adversarial_style: `{result['adversarial_style']}`",
@@ -1005,8 +1057,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- adversarial_exclude_families: `{result['adversarial_exclude_families']}`",
         f"- calibrator_feature_ablation: `{result['calibrator_feature_ablation']}`",
         "",
-        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | hard neg@k | mrr | deterministic |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | records | avg memories | index MB | build ms | p95 ms | recall@k | precision@k | context recall | context precision | evidence in pool | false memory | hard neg@k | mrr | deterministic |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, rollup in result["rollup"].items():
         metrics = rollup["metrics"]
@@ -1022,6 +1074,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('evidence_in_calibrator_pool_rate', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('false_memory_rate', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('hard_negative_top_k_rate', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('mrr', {}).get('avg', 0.0):.4f} | "
             f"{deterministic:.4f} |"
@@ -1072,6 +1126,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "max_cell_scan": args.max_cell_scan,
         "top_k": args.top_k,
         "budget": args.budget,
+        "context_max_items": int(args.context_max_items),
         "hybrid_candidate_fetch": int(args.hybrid_candidate_fetch),
         "hybrid_token_candidate_fetch": int(args.hybrid_token_candidate_fetch),
         "hybrid_union_vector_weight": float(args.hybrid_union_vector_weight),
@@ -1120,6 +1175,7 @@ def main() -> None:
     parser.add_argument("--work-dir", default="artifacts/memorycraft_retrieval")
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
+    parser.add_argument("--context-max-items", type=int, default=0)
     parser.add_argument("--layers", type=int, default=128)
     parser.add_argument("--layer-schedule", choices=["auto", "consecutive", "spread"], default="spread")
     parser.add_argument("--dim-count", type=int, default=1024)

@@ -227,6 +227,7 @@ def hybrid_union_token_search(
     stats["latency_ms"] = (time.perf_counter() - started) * 1000.0
     stats.update(union_stats)
     stats["raw_final_candidate_count"] = float(len(candidate_scores))
+    stats["_raw_candidate_ids"] = {token_index.nodes[node_index].node_id for node_index in candidate_scores}
     return ranked, stats, candidate_ids
 
 

@@ -128,6 +128,8 @@ def summarize_result(
                 "precision_at_8": float((metrics.get("precision_at_k") or {}).get("avg", 0.0)),
                 "context_recall": float((metrics.get("context_recall") or {}).get("avg", 0.0)),
                 "context_precision": float((metrics.get("context_precision") or {}).get("avg", 0.0)),
+                "evidence_in_pool": float((metrics.get("evidence_in_calibrator_pool_rate") or {}).get("avg", 0.0)),
+                "false_memory_rate": float((metrics.get("false_memory_rate") or {}).get("avg", 0.0)),
                 "hard_negative_top_k_rate": float((metrics.get("hard_negative_top_k_rate") or {}).get("avg", 0.0)),
                 "hard_negative_context_rate": float((metrics.get("hard_negative_context_rate") or {}).get("avg", 0.0)),
                 "mrr": float((metrics.get("mrr") or {}).get("avg", 0.0)),
@@ -183,6 +185,7 @@ def memorycraft_args(
         work_dir=str(output_dir / "work" / suite_name),
         top_k=args.top_k,
         budget=args.budget,
+        context_max_items=args.context_max_items,
         layers=args.layers,
         layer_schedule=args.layer_schedule,
         dim_count=args.dim_count,
@@ -321,6 +324,7 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         f"- embedding backend: `{args.embedding_backend}`",
         f"- top_k: `{args.top_k}`",
         f"- budget: `{args.budget}`",
+        f"- context max items: `{args.context_max_items}`",
         f"- latency target: `{args.latency_target_ms:.1f} ms`",
         f"- repeat searches: `{args.repeat_searches}`",
         f"- adversarial style: `{args.adversarial_style}`",
@@ -330,14 +334,15 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         "",
         "## Leaderboard",
         "",
-        "| rank | scenario | system | calibrator | pool | p95 ms | recall@8 | precision@8 | ctx precision | hard neg@8 | mrr | det mismatches | score |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| rank | scenario | system | calibrator | pool | p95 ms | recall@8 | precision@8 | ctx precision | evidence in pool | false memory | hard neg@8 | mrr | det mismatches | score |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for rank, row in enumerate(sorted_rows, start=1):
         lines.append(
             f"| {rank} | {row['scenario']} | {row['system']} | {row['calibrator']} | "
             f"{row['candidate_pool']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_precision']:.4f} | "
+            f"{row['evidence_in_pool']:.4f} | {row['false_memory_rate']:.4f} | "
             f"{row['hard_negative_top_k_rate']:.4f} | {row['mrr']:.4f} | "
             f"{row['determinism_mismatches']} | {row['quality_score']:.4f} |"
         )
@@ -346,8 +351,8 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
             "",
             "## Scenario Matrix",
             "",
-            "| scenario | system | calibrator | pool | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | hard neg ctx | mrr |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| scenario | system | calibrator | pool | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | evidence in pool | false memory | hard neg ctx | mrr |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
@@ -355,7 +360,8 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
             f"| {row['scenario']} | {row['system']} | {row['calibrator']} | {row['candidate_pool']} | "
             f"{row['queries']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_recall']:.4f} | "
-            f"{row['context_precision']:.4f} | {row['hard_negative_context_rate']:.4f} | {row['mrr']:.4f} |"
+            f"{row['context_precision']:.4f} | {row['evidence_in_pool']:.4f} | "
+            f"{row['false_memory_rate']:.4f} | {row['hard_negative_context_rate']:.4f} | {row['mrr']:.4f} |"
         )
     output_dir.joinpath("summary.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
@@ -504,6 +510,7 @@ def main() -> None:
     parser.add_argument("--repeat-searches", type=int, default=2)
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
+    parser.add_argument("--context-max-items", type=int, default=0)
     parser.add_argument("--latency-target-ms", type=float, default=200.0)
     parser.add_argument("--layers", type=int, default=128)
     parser.add_argument("--layer-schedule", choices=["auto", "consecutive", "spread"], default="spread")
