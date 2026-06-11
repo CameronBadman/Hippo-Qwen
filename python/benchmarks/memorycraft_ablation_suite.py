@@ -126,6 +126,7 @@ def summarize_result(
                 "calibrator_p95_ms": float((metrics.get("calibrator_latency_ms") or {}).get("p95", 0.0)),
                 "cascade_prefilter_candidates": float((metrics.get("cascade_prefilter_candidate_count") or {}).get("avg", 0.0)),
                 "cascade_survivor_candidates": float((metrics.get("cascade_survivor_count") or {}).get("avg", 0.0)),
+                "typed_edge_injections": float((metrics.get("typed_edge_injections") or {}).get("avg", 0.0)),
                 "recall_at_8": float((metrics.get("recall_at_k") or {}).get("avg", 0.0)),
                 "precision_at_8": float((metrics.get("precision_at_k") or {}).get("avg", 0.0)),
                 "context_recall": float((metrics.get("context_recall") or {}).get("avg", 0.0)),
@@ -219,6 +220,11 @@ def memorycraft_args(
         cascade_prefilter_include_weight=args.cascade_prefilter_include_weight,
         cascade_prefilter_base_weight=args.cascade_prefilter_base_weight,
         cascade_prefilter_utility_weight=args.cascade_prefilter_utility_weight,
+        typed_edge_expansion=args.typed_edge_expansion,
+        typed_edge_types=args.typed_edge_types,
+        typed_edge_seed_count=args.typed_edge_seed_count,
+        typed_edge_max_injections=args.typed_edge_max_injections,
+        typed_edge_seed_score_weight=args.typed_edge_seed_score_weight,
         calibrator_feature_ablation=args.calibrator_feature_ablation,
         rerank_relevance_weight=args.rerank_relevance_weight,
         rerank_include_weight=args.rerank_include_weight,
@@ -344,14 +350,15 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
         "",
         "## Leaderboard",
         "",
-        "| rank | scenario | system | calibrator | pool | cascade prefilter | cascade survivors | p95 ms | recall@8 | precision@8 | ctx precision | evidence in pool | false memory | hard neg@8 | mrr | det mismatches | score |",
-        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| rank | scenario | system | calibrator | pool | cascade prefilter | cascade survivors | edge inject | p95 ms | recall@8 | precision@8 | ctx precision | evidence in pool | false memory | hard neg@8 | mrr | det mismatches | score |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for rank, row in enumerate(sorted_rows, start=1):
         lines.append(
             f"| {rank} | {row['scenario']} | {row['system']} | {row['calibrator']} | "
             f"{row['candidate_pool']} | {row['cascade_prefilter_candidates']:.0f} | "
-            f"{row['cascade_survivor_candidates']:.0f} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
+            f"{row['cascade_survivor_candidates']:.0f} | {row['typed_edge_injections']:.1f} | "
+            f"{row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_precision']:.4f} | "
             f"{row['evidence_in_pool']:.4f} | {row['false_memory_rate']:.4f} | "
             f"{row['hard_negative_top_k_rate']:.4f} | {row['mrr']:.4f} | "
@@ -362,15 +369,15 @@ def write_outputs(args: argparse.Namespace, output_dir: Path, rows: list[dict[st
             "",
             "## Scenario Matrix",
             "",
-            "| scenario | system | calibrator | pool | cascade prefilter | cascade survivors | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | evidence in pool | false memory | hard neg ctx | mrr |",
-            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+            "| scenario | system | calibrator | pool | cascade prefilter | cascade survivors | edge inject | queries | p95 ms | recall@8 | precision@8 | context recall | context precision | evidence in pool | false memory | hard neg ctx | mrr |",
+            "| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
         ]
     )
     for row in rows:
         lines.append(
             f"| {row['scenario']} | {row['system']} | {row['calibrator']} | {row['candidate_pool']} | "
             f"{row['cascade_prefilter_candidates']:.0f} | {row['cascade_survivor_candidates']:.0f} | "
-            f"{row['queries']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
+            f"{row['typed_edge_injections']:.1f} | {row['queries']} | {row['p95_ms']:.2f} | {row['recall_at_8']:.4f} | "
             f"{row['precision_at_8']:.4f} | {row['context_recall']:.4f} | "
             f"{row['context_precision']:.4f} | {row['evidence_in_pool']:.4f} | "
             f"{row['false_memory_rate']:.4f} | {row['hard_negative_context_rate']:.4f} | {row['mrr']:.4f} |"
@@ -553,6 +560,11 @@ def main() -> None:
     parser.add_argument("--cascade-prefilter-include-weight", type=float, default=None)
     parser.add_argument("--cascade-prefilter-base-weight", type=float, default=None)
     parser.add_argument("--cascade-prefilter-utility-weight", type=float, default=None)
+    parser.add_argument("--typed-edge-expansion", action="store_true")
+    parser.add_argument("--typed-edge-types", default="correction,temporal_next,same_context")
+    parser.add_argument("--typed-edge-seed-count", type=int, default=32)
+    parser.add_argument("--typed-edge-max-injections", type=int, default=128)
+    parser.add_argument("--typed-edge-seed-score-weight", type=float, default=0.82)
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)

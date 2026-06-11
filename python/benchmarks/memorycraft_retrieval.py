@@ -12,7 +12,13 @@ if __package__ is None or __package__ == "":
 
 from python.benchmarks.hard_memory_regression import aggregate
 from python.benchmarks.hierarchical_file_ann import Ranked, ranked_signature
-from python.benchmarks.hippocampus_retrieval import build_embedding_backend, ensure_backend_embeddings
+from python.benchmarks.hippocampus_retrieval import (
+    activation_overlap,
+    build_embedding_backend,
+    edge_activation,
+    edge_type_boost,
+    ensure_backend_embeddings,
+)
 from python.benchmarks.agent_memory_graph import build_agent_memory_graph, search_agent_memory_graph
 from python.benchmarks.rope_delta_grid import build_rope_delta_grid, query_embedding_for, search_rope_delta_grid
 from python.benchmarks.vector_db_compare import (
@@ -478,26 +484,64 @@ def add_adversarial_candidates(
 def build_edges(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
     edges = []
     by_speaker: dict[str, str] = {}
+    by_session: dict[str, str] = {}
+    correction_terms = ("correct", "correction", "actually", "instead", "updated", "replaced", "superseded")
     for index, card in enumerate(cards):
         current_id = str(card["id"])
         current_text = str(card.get("text") or "")
+        current_metadata = card.get("metadata") or {}
+        current_session = str(current_metadata.get("session_id") or "")
         if index > 0:
             previous = cards[index - 1]
             edges.append(
                 {
                     "source": str(previous["id"]),
                     "target": current_id,
-                    "type": "chronological",
+                    "type": "temporal_next",
                     "weight": 0.42,
                     "confidence": 0.85,
                     "activation_mask": activation_mask_for_text(current_text),
                 }
             )
+            previous_metadata = previous.get("metadata") or {}
+            if current_session and current_session == str(previous_metadata.get("session_id") or ""):
+                previous_text = str(previous.get("text") or "")
+                edges.append(
+                    {
+                        "source": str(previous["id"]),
+                        "target": current_id,
+                        "type": "same_context",
+                        "weight": 0.34,
+                        "confidence": 0.78,
+                        "activation_mask": activation_mask_for_text(current_text),
+                    }
+                )
+                edges.append(
+                    {
+                        "source": current_id,
+                        "target": str(previous["id"]),
+                        "type": "same_context",
+                        "weight": 0.30,
+                        "confidence": 0.74,
+                        "activation_mask": activation_mask_for_text(previous_text),
+                    }
+                )
+            if any(term in current_text.lower() for term in correction_terms):
+                edges.append(
+                    {
+                        "source": str(previous["id"]),
+                        "target": current_id,
+                        "type": "correction",
+                        "weight": 0.62,
+                        "confidence": 0.72,
+                        "activation_mask": activation_mask_for_text(current_text),
+                    }
+                )
             edges.append(
                 {
                     "source": current_id,
                     "target": str(previous["id"]),
-                    "type": "chronological",
+                    "type": "same_context",
                     "weight": 0.24,
                     "confidence": 0.75,
                     "activation_mask": activation_mask_for_text(str(previous.get("text") or "")),
@@ -509,7 +553,7 @@ def build_edges(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 {
                     "source": by_speaker[speaker],
                     "target": current_id,
-                    "type": "same_speaker",
+                    "type": "same_context",
                     "weight": 0.30,
                     "confidence": 0.65,
                     "activation_mask": activation_mask_for_text(current_text),
@@ -517,6 +561,19 @@ def build_edges(cards: list[dict[str, Any]]) -> list[dict[str, Any]]:
             )
         if speaker:
             by_speaker[speaker] = current_id
+        if current_session and current_session in by_session:
+            edges.append(
+                {
+                    "source": by_session[current_session],
+                    "target": current_id,
+                    "type": "same_context",
+                    "weight": 0.36,
+                    "confidence": 0.80,
+                    "activation_mask": activation_mask_for_text(current_text),
+                }
+            )
+        if current_session:
+            by_session[current_session] = current_id
     return edges
 
 
@@ -671,6 +728,9 @@ def evaluate_search(row: dict[str, Any], ranked: Ranked, stats: dict[str, float]
         "union_candidate_count": float(stats.get("union_candidate_count") or 0.0),
         "cascade_prefilter_candidate_count": float(stats.get("cascade_prefilter_candidate_count") or 0.0),
         "cascade_survivor_count": float(stats.get("cascade_survivor_count") or 0.0),
+        "typed_edge_reads": float(stats.get("typed_edge_reads") or 0.0),
+        "typed_edge_injections": float(stats.get("typed_edge_injections") or 0.0),
+        "typed_edge_seed_count": float(stats.get("typed_edge_seed_count") or 0.0),
     }
     out.update(evidence_metrics(row, ranked, args.top_k, args.budget, int(getattr(args, "context_max_items", 0) or 0)))
     out.update(evidence_pool_metrics(row, ranked, stats, args.top_k))
@@ -702,6 +762,76 @@ def run_queries(
 
 def index_size(meta: dict[str, Any]) -> int:
     return int(meta.get("grid_bytes", 0)) + int(meta.get("payload_bytes", 0)) + int(meta.get("records_bytes", 0)) + int(meta.get("edges_bytes", 0))
+
+
+def parse_edge_types(raw: str) -> set[str]:
+    return {item.strip() for item in str(raw or "").split(",") if item.strip()}
+
+
+def typed_edge_adjacency(row: dict[str, Any], allowed_types: set[str]) -> dict[str, list[dict[str, Any]]]:
+    candidate_ids = {str(candidate.get("id") or "") for candidate in row.get("candidates", [])}
+    outgoing: dict[str, list[dict[str, Any]]] = {}
+    for edge in (row.get("memory_graph") or {}).get("edges") or []:
+        source = str(edge.get("source") or "")
+        target = str(edge.get("target") or "")
+        edge_type = str(edge.get("type") or "")
+        if source not in candidate_ids or target not in candidate_ids:
+            continue
+        if allowed_types and edge_type not in allowed_types:
+            continue
+        outgoing.setdefault(source, []).append(dict(edge))
+    for edges in outgoing.values():
+        edges.sort(key=lambda item: (str(item.get("target") or ""), str(item.get("type") or "")))
+    return outgoing
+
+
+def expand_ranked_with_typed_edges(
+    row: dict[str, Any],
+    ranked: Ranked,
+    id_to_candidate: dict[str, dict[str, Any]],
+    args: argparse.Namespace,
+) -> tuple[Ranked, dict[str, float]]:
+    if not bool(getattr(args, "typed_edge_expansion", False)):
+        return ranked, {"typed_edge_reads": 0.0, "typed_edge_injections": 0.0, "typed_edge_seed_count": 0.0}
+    allowed_types = parse_edge_types(getattr(args, "typed_edge_types", "correction,temporal_next,same_context"))
+    seed_count = max(0, int(getattr(args, "typed_edge_seed_count", 32)))
+    max_injections = max(0, int(getattr(args, "typed_edge_max_injections", 128)))
+    if seed_count <= 0 or max_injections <= 0 or not ranked:
+        return ranked, {"typed_edge_reads": 0.0, "typed_edge_injections": 0.0, "typed_edge_seed_count": 0.0}
+    adjacency = typed_edge_adjacency(row, allowed_types)
+    if not adjacency:
+        return ranked, {"typed_edge_reads": 0.0, "typed_edge_injections": 0.0, "typed_edge_seed_count": 0.0}
+    query_mask = activation_mask_for_text(str((row.get("retrieval_task") or {}).get("query") or ""))
+    best: dict[str, tuple[float, str]] = {str(candidate_id): (float(score), str(text)) for candidate_id, score, text in ranked}
+    edge_reads = 0
+    injected: dict[str, float] = {}
+    for seed_id, seed_score, _ in ranked[:seed_count]:
+        source_id = str(seed_id)
+        for edge in adjacency.get(source_id, []):
+            edge_reads += 1
+            target_id = str(edge.get("target") or "")
+            if target_id in best or target_id not in id_to_candidate:
+                continue
+            activation = activation_overlap(query_mask, edge_activation(edge))
+            edge_score = (
+                float(seed_score) * float(getattr(args, "typed_edge_seed_score_weight", 0.82))
+                + float(edge.get("weight") or 0.0) * edge_type_boost(str(edge.get("type") or "")) * (0.60 + 0.40 * activation)
+                + 0.04 * float(id_to_candidate[target_id].get("importance") or 0.5)
+                + 0.02 * float(edge.get("confidence") or 0.5)
+            )
+            prior = injected.get(target_id)
+            if prior is None or edge_score > prior:
+                injected[target_id] = float(edge_score)
+    for target_id, score in sorted(injected.items(), key=lambda item: (-item[1], item[0]))[:max_injections]:
+        candidate = id_to_candidate[target_id]
+        best[target_id] = (score, str(candidate.get("text") or ""))
+    expanded = [(candidate_id, score, text) for candidate_id, (score, text) in best.items()]
+    expanded.sort(key=lambda item: (-item[1], item[0]))
+    return expanded, {
+        "typed_edge_reads": float(edge_reads),
+        "typed_edge_injections": float(min(len(injected), max_injections)),
+        "typed_edge_seed_count": float(min(seed_count, len(ranked))),
+    }
 
 
 def calibrator_payload(
@@ -779,6 +909,10 @@ def calibrated_union_search(
 
     started = time.perf_counter()
     raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    raw_ranked, edge_stats = expand_ranked_with_typed_edges(row, raw_ranked, id_to_candidate, args)
+    stats.update(edge_stats)
+    stats["_raw_candidate_ids"] = {item[0] for item in raw_ranked}
+    stats["raw_final_candidate_count"] = float(len(raw_ranked))
     stats["_calibrator_candidate_ids"] = {item[0] for item in raw_ranked[: int(args.calibrator_max_candidates)]}
     ranked = rerank_with_calibrator(
         calibrator,
@@ -812,6 +946,10 @@ def cascaded_calibrated_union_search(
 
     started = time.perf_counter()
     raw_ranked, stats, candidate_ids = hybrid_union_token_search(row, backend, faiss_built, token_index, args)
+    raw_ranked, edge_stats = expand_ranked_with_typed_edges(row, raw_ranked, id_to_candidate, args)
+    stats.update(edge_stats)
+    stats["_raw_candidate_ids"] = {item[0] for item in raw_ranked}
+    stats["raw_final_candidate_count"] = float(len(raw_ranked))
     prefilter_count = max(int(args.cascade_prefilter_candidates), int(args.cascade_survivor_candidates))
     survivor_count = int(args.cascade_survivor_candidates)
     stage1_ranked = rerank_with_calibrator(
@@ -1145,6 +1283,10 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- context_max_items: `{result['context_max_items']}`",
         f"- cascade_prefilter_candidates: `{result['cascade_prefilter_candidates']}`",
         f"- cascade_survivor_candidates: `{result['cascade_survivor_candidates']}`",
+        f"- typed_edge_expansion: `{result['typed_edge_expansion']}`",
+        f"- typed_edge_types: `{result['typed_edge_types']}`",
+        f"- typed_edge_seed_count: `{result['typed_edge_seed_count']}`",
+        f"- typed_edge_max_injections: `{result['typed_edge_max_injections']}`",
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
         f"- adversarial_style: `{result['adversarial_style']}`",
@@ -1222,6 +1364,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "cascade_prefilter_checkpoint": args.cascade_prefilter_checkpoint,
         "cascade_prefilter_candidates": int(args.cascade_prefilter_candidates),
         "cascade_survivor_candidates": int(args.cascade_survivor_candidates),
+        "typed_edge_expansion": bool(args.typed_edge_expansion),
+        "typed_edge_types": str(args.typed_edge_types),
+        "typed_edge_seed_count": int(args.typed_edge_seed_count),
+        "typed_edge_max_injections": int(args.typed_edge_max_injections),
         "dim_count": args.dim_count,
         "layers": args.layers,
         "layer_schedule": args.layer_schedule,
@@ -1310,6 +1456,11 @@ def main() -> None:
     parser.add_argument("--cascade-prefilter-include-weight", type=float, default=None)
     parser.add_argument("--cascade-prefilter-base-weight", type=float, default=None)
     parser.add_argument("--cascade-prefilter-utility-weight", type=float, default=None)
+    parser.add_argument("--typed-edge-expansion", action="store_true")
+    parser.add_argument("--typed-edge-types", default="correction,temporal_next,same_context")
+    parser.add_argument("--typed-edge-seed-count", type=int, default=32)
+    parser.add_argument("--typed-edge-max-injections", type=int, default=128)
+    parser.add_argument("--typed-edge-seed-score-weight", type=float, default=0.82)
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)
