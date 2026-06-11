@@ -130,6 +130,7 @@ def summarize_result(
                 "context_precision": float((metrics.get("context_precision") or {}).get("avg", 0.0)),
                 "evidence_in_pool": float((metrics.get("evidence_in_calibrator_pool_rate") or {}).get("avg", 0.0)),
                 "false_memory_rate": float((metrics.get("false_memory_rate") or {}).get("avg", 0.0)),
+                "abstention_query_rate": float((metrics.get("abstention_query") or {}).get("avg", 0.0)),
                 "hard_negative_top_k_rate": float((metrics.get("hard_negative_top_k_rate") or {}).get("avg", 0.0)),
                 "hard_negative_context_rate": float((metrics.get("hard_negative_context_rate") or {}).get("avg", 0.0)),
                 "mrr": float((metrics.get("mrr") or {}).get("avg", 0.0)),

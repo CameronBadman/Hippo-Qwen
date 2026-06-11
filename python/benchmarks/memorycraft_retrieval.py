@@ -544,6 +544,7 @@ def query_row(base: dict[str, Any], qa: dict[str, Any], relevant: set[str], budg
         "answer": str(qa.get("answer") or ""),
         "qa_id": str(qa.get("qa_id") or ""),
         "question_type": str(qa.get("question_type") or ""),
+        "abstention": bool(qa.get("abstention")),
         "relevant_ids": sorted(relevant),
         "budget": int(budget),
     }
@@ -594,7 +595,9 @@ def evidence_pool_metrics(row: dict[str, Any], ranked: Ranked, stats: dict[str, 
 
 
 def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: int, context_max_items: int = 0) -> dict[str, float]:
-    relevant = {str(item) for item in (row.get("retrieval_task") or {}).get("relevant_ids") or []}
+    task = row.get("retrieval_task") or {}
+    is_abstention = bool(task.get("abstention"))
+    relevant = set() if is_abstention else {str(item) for item in task.get("relevant_ids") or []}
     top_ids = [item[0] for item in ranked[:top_k]]
     hard_top_k = sum(1 for candidate_id in top_ids if is_hard_negative_id(candidate_id))
     included = budgeted_context_ids(ranked, budget, context_max_items)
@@ -806,7 +809,7 @@ def run_record(
         abstention = bool(qa.get("abstention"))
         if abstention and not args.include_abstention:
             continue
-        relevant = normalize_evidence(record, qa, mode)
+        relevant = set() if abstention else normalize_evidence(record, qa, mode)
         if not relevant and not (args.include_abstention and abstention):
             continue
         qa_items.append((qa, relevant))

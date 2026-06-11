@@ -300,7 +300,7 @@ def build_rows(records: list[dict[str, Any]], backend: Any, args: argparse.Names
             abstention = bool(qa.get("abstention"))
             if abstention and not args.include_abstention:
                 continue
-            relevant = normalize_evidence(record, qa, mode)
+            relevant = set() if abstention else normalize_evidence(record, qa, mode)
             if not relevant and not (args.include_abstention and abstention):
                 continue
             row = query_row(embedded_base, qa, relevant, args.budget)
