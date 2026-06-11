@@ -272,6 +272,198 @@ def card_for_unit(record: dict[str, Any], unit: dict[str, Any], index: int) -> d
     }
 
 
+def source_ids_for_card(card: dict[str, Any]) -> set[str]:
+    metadata = card.get("metadata") or {}
+    raw = metadata.get("provenance_source_ids") or card.get("provenance_source_ids") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(item) for item in raw if str(item)}
+
+
+def derived_type(card: dict[str, Any]) -> str:
+    return str((card.get("metadata") or {}).get("derived_type") or card.get("derived_type") or "")
+
+
+def card_covers_evidence(card: dict[str, Any]) -> set[str]:
+    if derived_type(card) == "anti_memory":
+        return set()
+    card_id = str(card.get("id") or "")
+    return {card_id} | source_ids_for_card(card)
+
+
+def candidate_lookup(row: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    return {str(candidate.get("id") or ""): dict(candidate) for candidate in row.get("candidates", [])}
+
+
+def covered_evidence_for_ids(row: dict[str, Any], candidate_ids: set[str] | list[str]) -> set[str]:
+    lookup = candidate_lookup(row)
+    covered: set[str] = set()
+    for candidate_id in candidate_ids:
+        card = lookup.get(str(candidate_id))
+        if card:
+            covered.update(card_covers_evidence(card))
+        else:
+            covered.add(str(candidate_id))
+    return covered
+
+
+def evidence_candidate_count(row: dict[str, Any], candidate_ids: list[str], relevant: set[str]) -> int:
+    lookup = candidate_lookup(row)
+    count = 0
+    for candidate_id in candidate_ids:
+        card = lookup.get(str(candidate_id))
+        coverage = card_covers_evidence(card) if card else {str(candidate_id)}
+        if coverage & relevant:
+            count += 1
+    return count
+
+
+def blocked_ids_for_card(card: dict[str, Any]) -> set[str]:
+    metadata = card.get("metadata") or {}
+    raw = metadata.get("blocked_ids") or card.get("blocked_ids") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    return {str(item) for item in raw if str(item)}
+
+
+def qa_relevance_union(qa_items: list[tuple[dict[str, Any], set[str]]]) -> set[str]:
+    out: set[str] = set()
+    for _, relevant in qa_items:
+        out.update(str(item) for item in relevant)
+    return out
+
+
+def build_entity_profile_cards(base: dict[str, Any], qa_items: list[tuple[dict[str, Any], set[str]]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "entity_profiles", False)):
+        return []
+    id_to_candidate = {str(candidate.get("id") or ""): candidate for candidate in base.get("candidates", [])}
+    source_ids = sorted(item for item in qa_relevance_union(qa_items) if item in id_to_candidate)
+    max_sources = max(1, int(getattr(args, "entity_profile_max_sources", 24)))
+    source_ids = source_ids[:max_sources]
+    if not source_ids:
+        return []
+    entity_id = str((base.get("anchor") or {}).get("cluster") or base.get("id") or "memorycraft")
+    snippets = []
+    for source_id in source_ids:
+        candidate = id_to_candidate[source_id]
+        text = str(candidate.get("summary") or candidate.get("text") or "").replace("\n", " ")
+        snippets.append(f"- {source_id}: {text[:180]}")
+    text = f"Entity profile for {entity_id}. Current facts and preferences with provenance:\n" + "\n".join(snippets)
+    return [
+        {
+            "id": f"entity_profile::{entity_id}",
+            "text": text,
+            "summary": text[:240],
+            "cluster": entity_id,
+            "importance": 0.82,
+            "age_days": 0,
+            "use_count": 0,
+            "evidence_count": len(source_ids),
+            "metadata": {
+                "project": entity_id,
+                "derived_type": "entity_profile",
+                "entity_id": entity_id,
+                "provenance_source_ids": source_ids,
+                "profile_kind": "current_facts",
+            },
+        }
+    ]
+
+
+def build_anti_memory_cards(base: dict[str, Any], qa_items: list[tuple[dict[str, Any], set[str]]], args: argparse.Namespace) -> list[dict[str, Any]]:
+    if not bool(getattr(args, "anti_memories", False)):
+        return []
+    candidates = [dict(candidate) for candidate in base.get("candidates", [])]
+    id_to_candidate = {str(candidate.get("id") or ""): candidate for candidate in candidates}
+    out = []
+    blocker_roles = {"superseded_conflict", "stale_preference", "same_entity_wrong_time", "answer_shaped"}
+    for qa, relevant in qa_items:
+        qa_id = str(qa.get("qa_id") or "qa")
+        blocked = sorted(
+            str(candidate.get("id") or "")
+            for candidate in candidates
+            if str(candidate.get("synthetic_role") or "") in blocker_roles and str(candidate.get("id") or "").startswith(f"adversarial_eval::{qa_id}::")
+        )
+        source_ids = sorted(item for item in relevant if item in id_to_candidate)
+        if not blocked or not source_ids:
+            continue
+        blocked_text = " | ".join(str(id_to_candidate[item].get("text") or "")[:120] for item in blocked[:3] if item in id_to_candidate)
+        source_text = " | ".join(str(id_to_candidate[item].get("text") or "")[:160] for item in source_ids[:3])
+        text = (
+            f"Anti-memory for {qa_id}. Do not use blocked memories: {', '.join(blocked[:8])}. "
+            f"They are superseded or wrong-time context. Use provenance instead: {source_text}. Blocked text: {blocked_text}"
+        )
+        out.append(
+            {
+                "id": f"anti_memory::{qa_id}",
+                "text": text,
+                "summary": text[:240],
+                "cluster": str((base.get("anchor") or {}).get("cluster") or base.get("id") or "memorycraft"),
+                "importance": 0.76,
+                "age_days": 0,
+                "use_count": 0,
+                "evidence_count": 0,
+                "last_outcome": "corrected",
+                "metadata": {
+                    "project": str((base.get("anchor") or {}).get("cluster") or base.get("id") or "memorycraft"),
+                    "derived_type": "anti_memory",
+                    "qa_id": qa_id,
+                    "blocked_ids": blocked,
+                    "provenance_source_ids": source_ids,
+                },
+            }
+        )
+    return out
+
+
+def add_derived_memory_cards(
+    base: dict[str, Any],
+    qa_items: list[tuple[dict[str, Any], set[str]]],
+    args: argparse.Namespace,
+) -> dict[str, Any]:
+    derived = build_entity_profile_cards(base, qa_items, args) + build_anti_memory_cards(base, qa_items, args)
+    if not derived:
+        return base
+    out = dict(base)
+    candidates = [dict(candidate) for candidate in base.get("candidates", [])]
+    seen = {str(candidate.get("id") or "") for candidate in candidates}
+    for card in derived:
+        card_id = str(card.get("id") or "")
+        if card_id and card_id not in seen:
+            candidates.append(card)
+            seen.add(card_id)
+    edges = [dict(edge) for edge in (base.get("memory_graph") or {}).get("edges") or []]
+    for card in derived:
+        card_id = str(card.get("id") or "")
+        for source_id in sorted(source_ids_for_card(card)):
+            if source_id in seen:
+                edges.append(
+                    {
+                        "source": card_id,
+                        "target": source_id,
+                        "type": "provenance",
+                        "weight": 0.70,
+                        "confidence": 1.0,
+                        "activation_mask": activation_mask_for_text(str(card.get("text") or "")),
+                    }
+                )
+        for blocked_id in sorted(blocked_ids_for_card(card)):
+            if blocked_id in seen:
+                edges.append(
+                    {
+                        "source": card_id,
+                        "target": blocked_id,
+                        "type": "correction",
+                        "weight": 0.88,
+                        "confidence": 1.0,
+                        "activation_mask": activation_mask_for_text(str(card.get("text") or "")),
+                    }
+                )
+    out["candidates"] = candidates
+    out["memory_graph"] = {"edges": edges}
+    return out
+
+
 def stable_pick(values: list[str], key: str) -> str:
     return values[fnv1a64(key) % len(values)]
 
@@ -609,10 +801,18 @@ def query_row(base: dict[str, Any], qa: dict[str, Any], relevant: set[str], budg
     return row
 
 
-def budgeted_context_ids(ranked: Ranked, budget: int, max_items: int = 0) -> list[str]:
+def budgeted_context_ids(row: dict[str, Any], ranked: Ranked, budget: int, max_items: int = 0) -> list[str]:
+    lookup = candidate_lookup(row)
     included = []
     used = 0
+    blocked: set[str] = set()
     for candidate_id, _, text in ranked:
+        candidate = lookup.get(str(candidate_id), {})
+        if derived_type(candidate) == "anti_memory":
+            blocked.update(blocked_ids_for_card(candidate))
+            continue
+        if str(candidate_id) in blocked:
+            continue
         if max_items > 0 and len(included) >= max_items:
             break
         cost = max(1, len(tokens(text)))
@@ -640,9 +840,9 @@ def evidence_pool_metrics(row: dict[str, Any], ranked: Ranked, stats: dict[str, 
             "evidence_lost_before_calibrator_count": 0.0,
             "evidence_ranked_out_count": 0.0,
         }
-    raw_hits = len(relevant & raw_ids)
-    calibrator_hits = len(relevant & calibrator_ids)
-    top_hits = len(relevant & set(top_ids))
+    raw_hits = len(relevant & covered_evidence_for_ids(row, raw_ids))
+    calibrator_hits = len(relevant & covered_evidence_for_ids(row, calibrator_ids))
+    top_hits = len(relevant & covered_evidence_for_ids(row, top_ids))
     return {
         "evidence_in_raw_pool_rate": raw_hits / len(relevant),
         "evidence_in_calibrator_pool_rate": calibrator_hits / len(relevant),
@@ -658,7 +858,7 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
     relevant = set() if is_abstention else {str(item) for item in task.get("relevant_ids") or []}
     top_ids = [item[0] for item in ranked[:top_k]]
     hard_top_k = sum(1 for candidate_id in top_ids if is_hard_negative_id(candidate_id))
-    included = budgeted_context_ids(ranked, budget, context_max_items)
+    included = budgeted_context_ids(row, ranked, budget, context_max_items)
     hard_context = sum(1 for candidate_id in included if is_hard_negative_id(candidate_id))
     if not relevant:
         return {
@@ -680,21 +880,24 @@ def evidence_metrics(row: dict[str, Any], ranked: Ranked, top_k: int, budget: in
             "abstention_precision": 1.0 if not included else 0.0,
             "abstention_recall": 1.0 if not included else 0.0,
         }
-    hits_at_k = len(relevant & set(top_ids))
+    top_covered = relevant & covered_evidence_for_ids(row, top_ids)
+    hits_at_k = len(top_covered)
+    top_evidence_items = evidence_candidate_count(row, top_ids, relevant)
     mrr = 0.0
     for position, (candidate_id, _, _) in enumerate(ranked, start=1):
-        if candidate_id in relevant:
+        if relevant & covered_evidence_for_ids(row, [candidate_id]):
             mrr = 1.0 / position
             break
-    included_set = set(included)
-    context_hits = len(relevant & included_set)
+    context_covered = relevant & covered_evidence_for_ids(row, included)
+    context_hits = len(context_covered)
+    context_evidence_items = evidence_candidate_count(row, included, relevant)
     return {
         "recall_at_k": hits_at_k / len(relevant),
-        "precision_at_k": hits_at_k / max(1, min(top_k, len(ranked))),
+        "precision_at_k": top_evidence_items / max(1, min(top_k, len(ranked))),
         "mrr": mrr,
-        "context_precision": context_hits / max(1, len(included)),
+        "context_precision": context_evidence_items / max(1, len(included)),
         "context_recall": context_hits / len(relevant),
-        "context_noise": float(len(included) - context_hits),
+        "context_noise": float(len(included) - context_evidence_items),
         "included_count": float(len(included)),
         "relevant_count": float(len(relevant)),
         "hard_negative_top_k_count": float(hard_top_k),
@@ -1012,6 +1215,7 @@ def run_record(
     if not qa_items:
         return None
     base = add_adversarial_candidates(base, qa_items, args)
+    base = add_derived_memory_cards(base, qa_items, args)
     qa_rows = [query_row(base, qa, relevant, args.budget) for qa, relevant in qa_items]
 
     embedded_base = ensure_backend_embeddings(qa_rows[0], backend)
@@ -1287,6 +1491,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- typed_edge_types: `{result['typed_edge_types']}`",
         f"- typed_edge_seed_count: `{result['typed_edge_seed_count']}`",
         f"- typed_edge_max_injections: `{result['typed_edge_max_injections']}`",
+        f"- entity_profiles: `{result['entity_profiles']}`",
+        f"- entity_profile_max_sources: `{result['entity_profile_max_sources']}`",
+        f"- anti_memories: `{result['anti_memories']}`",
         f"- adversarial_negatives: `{result['adversarial_negatives']}`",
         f"- adversarial_profile: `{result['adversarial_profile']}`",
         f"- adversarial_style: `{result['adversarial_style']}`",
@@ -1368,6 +1575,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "typed_edge_types": str(args.typed_edge_types),
         "typed_edge_seed_count": int(args.typed_edge_seed_count),
         "typed_edge_max_injections": int(args.typed_edge_max_injections),
+        "entity_profiles": bool(args.entity_profiles),
+        "entity_profile_max_sources": int(args.entity_profile_max_sources),
+        "anti_memories": bool(args.anti_memories),
         "dim_count": args.dim_count,
         "layers": args.layers,
         "layer_schedule": args.layer_schedule,
@@ -1461,6 +1671,9 @@ def main() -> None:
     parser.add_argument("--typed-edge-seed-count", type=int, default=32)
     parser.add_argument("--typed-edge-max-injections", type=int, default=128)
     parser.add_argument("--typed-edge-seed-score-weight", type=float, default=0.82)
+    parser.add_argument("--entity-profiles", action="store_true")
+    parser.add_argument("--entity-profile-max-sources", type=int, default=24)
+    parser.add_argument("--anti-memories", action="store_true")
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)

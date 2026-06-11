@@ -225,6 +225,9 @@ def memorycraft_args(
         typed_edge_seed_count=args.typed_edge_seed_count,
         typed_edge_max_injections=args.typed_edge_max_injections,
         typed_edge_seed_score_weight=args.typed_edge_seed_score_weight,
+        entity_profiles=args.entity_profiles,
+        entity_profile_max_sources=args.entity_profile_max_sources,
+        anti_memories=args.anti_memories,
         calibrator_feature_ablation=args.calibrator_feature_ablation,
         rerank_relevance_weight=args.rerank_relevance_weight,
         rerank_include_weight=args.rerank_include_weight,
@@ -565,6 +568,9 @@ def main() -> None:
     parser.add_argument("--typed-edge-seed-count", type=int, default=32)
     parser.add_argument("--typed-edge-max-injections", type=int, default=128)
     parser.add_argument("--typed-edge-seed-score-weight", type=float, default=0.82)
+    parser.add_argument("--entity-profiles", action="store_true")
+    parser.add_argument("--entity-profile-max-sources", type=int, default=24)
+    parser.add_argument("--anti-memories", action="store_true")
     parser.add_argument("--calibrator-feature-ablation", choices=["none", "metadata", "state", "state_metadata", "shortcut", "shortcuts", "no_shortcuts", "conflict_terms", "no_conflict_terms"], default="none")
     parser.add_argument("--rerank-relevance-weight", type=float, default=None)
     parser.add_argument("--rerank-include-weight", type=float, default=None)
