@@ -1115,3 +1115,110 @@ Updated Priorities After Experiments
    first A/B improved context recall and hard-negative exposure with small
    latency cost, but it needs better write-time edges before it can materially
    lift recall.
+
+9. Entity profiles should move into the write path. The benchmark version used
+   labels to test the representation, but the result is strong enough to build
+   deterministic log-derived profiles next.
+
+10. Anti-memories should become the correction primitive. They are not a recall
+    lever by themselves, but they clearly reduce hard-negative context exposure
+    and make stale/corrected memory behavior explainable.
+
+
+25. Entity profiles and anti-memories
+
+Implemented and tested.
+
+Architecture:
+- Entity profile cards are deterministic derived memories that summarize the
+  current evidence for an entity and carry provenance links back to source
+  memories.
+- Anti-memory cards are deterministic inhibitory memories. They do not count as
+  evidence themselves; when packed into context they block contradicted or
+  wrong-time candidate ids from being included.
+- Metrics now understand provenance: a profile can cover source evidence ids,
+  while an anti-memory only affects blocking.
+- The packer now handles blockers before filling the token budget.
+
+Code changes:
+- Added `--entity-profiles` and `--entity-profile-max-sources`.
+- Added `--anti-memories`.
+- Added provenance-aware evidence coverage for recall/MRR/context metrics.
+- Added blocker-aware budget packing for anti-memories.
+- Added benchmark-suite passthrough flags.
+
+Important caveat:
+- This is a benchmark representation experiment, not a production write-path
+  implementation yet.
+- Entity profiles in this harness are built from labelled relevant ids so we can
+  test the representation quickly. A real system must build them from write-time
+  consolidation, feedback, and deterministic log replay.
+- Anti-memories in this harness target known synthetic adversarial ids. A real
+  system should create them from correction/supersedes feedback and use the same
+  blocker mechanism.
+
+A/B test:
+- Runtime: Colab.
+- Model: previous set3 calibrator from the cascade loop.
+- Eval split: MemoryCraft records 80-119.
+- Profiles: `superseded_conflict,stale_preference,mixed`.
+- Queries: 180 per profile.
+- Candidate pool: 64.
+- Union fetch: 256 vector + 256 token.
+- Budget: 900 tokens.
+
+Results:
+
+| scenario | mode | p95 ms | recall@8 | context recall | context precision | evidence in pool | hard neg@8 | hard neg ctx |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| superseded_conflict | off | 62.74 | 0.6057 | 0.6373 | 0.1415 | 0.6710 | 0.1514 | 0.1962 |
+| superseded_conflict | profiles | 61.93 | 0.7016 | 0.7157 | 0.2179 | 0.7243 | 0.1243 | 0.1691 |
+| superseded_conflict | anti | 61.82 | 0.6051 | 0.6390 | 0.1677 | 0.6710 | 0.1278 | 0.0679 |
+| superseded_conflict | both | 62.24 | 0.7016 | 0.7157 | 0.2474 | 0.7243 | 0.1000 | 0.0586 |
+| stale_preference | off | 61.22 | 0.6281 | 0.6580 | 0.1626 | 0.6800 | 0.0292 | 0.0736 |
+| stale_preference | profiles | 61.20 | 0.7201 | 0.7319 | 0.2427 | 0.7370 | 0.0243 | 0.0649 |
+| stale_preference | anti | 62.19 | 0.6180 | 0.6489 | 0.1692 | 0.6710 | 0.0215 | 0.0409 |
+| stale_preference | both | 62.00 | 0.7063 | 0.7180 | 0.2485 | 0.7231 | 0.0181 | 0.0392 |
+| mixed | off | 61.88 | 0.6099 | 0.6346 | 0.1505 | 0.6764 | 0.1625 | 0.1877 |
+| mixed | profiles | 62.54 | 0.6979 | 0.7097 | 0.2282 | 0.7230 | 0.1424 | 0.1649 |
+| mixed | anti | 62.63 | 0.6064 | 0.6319 | 0.1544 | 0.6736 | 0.1354 | 0.1626 |
+| mixed | both | 61.66 | 0.6951 | 0.7069 | 0.2332 | 0.7202 | 0.1139 | 0.1425 |
+
+Interpretation:
+- Entity profiles are the stronger quality lever in this harness. They improve
+  recall, context recall, context precision, and evidence-in-pool because one
+  derived profile can cover multiple source memories.
+- Anti-memories do what they were designed to do: they mostly reduce hard
+  negative context exposure. On superseded_conflict, hard-negative context rate
+  dropped from 0.1962 to 0.0679 without a latency hit.
+- Combining profiles + anti-memories gives the cleanest context. Context
+  precision roughly moved:
+  - superseded_conflict: 0.1415 -> 0.2474
+  - stale_preference: 0.1626 -> 0.2485
+  - mixed: 0.1505 -> 0.2332
+- Latency stayed effectively flat at about 62 ms p95 for the calibrated path.
+- Determinism stayed clean: zero mismatches in all completed runs.
+
+Verdict:
+- Keep both concepts.
+- Entity profiles are the more important product direction for design-agent and
+  compliance workflows because the natural object is a profile: brand, user,
+  project, policy, vendor, case, account.
+- Anti-memories are valuable because they turn corrections into visible,
+  explainable blockers instead of hoping the reranker quietly downweights stale
+  content.
+- Do not use these benchmark numbers as an external headline until profiles are
+  generated by the write path rather than labels. The direction is strong, but
+  the current test intentionally gives the derived representation privileged
+  provenance.
+
+Next action:
+- Build production-style profile generation from the append-only memory log:
+  entity extraction, deterministic profile rebuild, provenance links, profile
+  invalidation on correction.
+- Add feedback-created anti-memories: when a memory is corrected, create a
+  blocker with `blocked_ids`, `provenance_source_ids`, and a correction edge.
+- Retest profiles and anti-memories on a no-label path where only write-time
+  consolidation creates derived cards.
+- Combine this with learned stop/budget packing. Profiles compress context;
+  learned stop decides whether the compressed profile is enough.
