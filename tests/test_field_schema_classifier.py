@@ -184,7 +184,7 @@ class FieldSchemaClassifierTests(unittest.TestCase):
             cache_data = {}
             for item in items:
                 text = str(item.get("text") or "")
-                cache_data[prediction_cache_key(text, registry)] = [
+                cache_data[stable_prediction_cache_key(text)] = [
                     {
                         "field_name": "project",
                         "value": "project_001",

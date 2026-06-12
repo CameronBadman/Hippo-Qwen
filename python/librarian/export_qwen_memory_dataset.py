@@ -7,7 +7,13 @@ from pathlib import Path
 from typing import Any
 
 from python.benchmarks.session_memory_stress import build_store
-from python.librarian.field_classifier import PROMPT_VERSION, FieldPredictionCache, parse_prediction_json, prediction_cache_key
+from python.librarian.field_classifier import (
+    PROMPT_VERSION,
+    FieldPredictionCache,
+    parse_prediction_json,
+    prediction_cache_key,
+    stable_prediction_cache_key,
+)
 from python.librarian.field_schema import FieldPrediction, FieldRegistry, default_field_registry
 from python.librarian.qwen_teacher_fields import TEACHER_SYSTEM_PROMPT, build_user_prompt
 
@@ -80,6 +86,8 @@ def kind_for_item(identifier: str) -> str:
 def predictions_for_text(cache: FieldPredictionCache, registry: FieldRegistry, text: str) -> list[FieldPrediction]:
     key = prediction_cache_key(text, registry, PROMPT_VERSION)
     cached = cache.get(key)
+    if cached is None:
+        cached = cache.get(stable_prediction_cache_key(text, PROMPT_VERSION))
     if cached is None:
         return []
     return parse_prediction_json(cached, source_type="qwen_cache", teacher_version=PROMPT_VERSION)
