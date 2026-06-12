@@ -314,6 +314,38 @@ def metadata_value(memory: dict[str, Any], key: str) -> str:
     return str(metadata.get(key) or "")
 
 
+def degrade_memory_metadata(memories: list[dict[str, Any]], *, availability: float, wrong_rate: float, seed: int) -> None:
+    availability = max(0.0, min(1.0, float(availability)))
+    wrong_rate = max(0.0, min(1.0, float(wrong_rate)))
+    if availability >= 1.0 and wrong_rate <= 0.0:
+        return
+    for memory in memories:
+        memory_id = str(memory.get("id") or "")
+        metadata = dict(memory.get("metadata") or {})
+        keep_roll = (fnv1a64(f"{seed}:metadata_keep:{memory_id}") % 1_000_000) / 1_000_000.0
+        wrong_roll = (fnv1a64(f"{seed}:metadata_wrong:{memory_id}") % 1_000_000) / 1_000_000.0
+        if keep_roll >= availability:
+            for key in ("user_id", "project", "brand", "session_id", "entities"):
+                metadata.pop(key, None)
+            memory["metadata"] = metadata
+            continue
+        if wrong_roll < wrong_rate:
+            current_user = str(metadata.get("user_id") or "")
+            current_project = str(metadata.get("project") or "")
+            current_brand = str(metadata.get("brand") or "")
+            user_id = stable_choice([item for item in USERS if item != current_user], f"{seed}:wrong_user:{memory_id}")
+            project = stable_choice([item for item in PROJECTS if item != current_project], f"{seed}:wrong_project:{memory_id}")
+            brand = stable_choice([item for item in BRANDS if item != current_brand], f"{seed}:wrong_brand:{memory_id}")
+            metadata["user_id"] = user_id
+            metadata["project"] = project
+            metadata["brand"] = brand
+            metadata["entities"] = [user_id, project, brand]
+            if metadata.get("session_id"):
+                metadata["session_id"] = f"{user_id}_{project}_corrupt_{fnv1a64(memory_id) % 100000:05d}"
+            memory["cluster"] = project
+        memory["metadata"] = metadata
+
+
 def build_metadata_index(memories: list[dict[str, Any]]) -> dict[str, dict[str, list[int]]]:
     indexes: dict[str, dict[str, list[int]]] = {
         "user_id": {},
@@ -761,6 +793,12 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         output = Path(args.output_dataset_json)
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({"memories": memories, "queries": queries}, indent=2) + "\n", encoding="utf-8")
+    degrade_memory_metadata(
+        memories,
+        availability=args.metadata_availability,
+        wrong_rate=args.metadata_wrong_rate,
+        seed=args.seed,
+    )
 
     backend = build_embedding_backend(args)
     embed_started = time.perf_counter()
@@ -910,6 +948,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "token_fetch": args.token_fetch,
         "metadata_fetch": args.metadata_fetch,
         "graph_fetch": args.graph_fetch,
+        "metadata_availability": args.metadata_availability,
+        "metadata_wrong_rate": args.metadata_wrong_rate,
         "budget": args.budget,
         "top_k": args.top_k,
         "packing_top_n": packing_top_ns(args),
@@ -949,6 +989,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- candidate_pool: `{result['candidate_pool']}`",
         f"- metadata_fetch: `{result.get('metadata_fetch', 0)}`",
         f"- graph_fetch: `{result.get('graph_fetch', 0)}`",
+        f"- metadata_availability: `{result.get('metadata_availability', 1.0)}`",
+        f"- metadata_wrong_rate: `{result.get('metadata_wrong_rate', 0.0)}`",
         f"- embed_seconds: `{result['embed_seconds']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
@@ -990,6 +1032,8 @@ def main() -> None:
     parser.add_argument("--token-fetch", type=int, default=512)
     parser.add_argument("--metadata-fetch", type=int, default=0)
     parser.add_argument("--metadata-per-bucket", type=int, default=512)
+    parser.add_argument("--metadata-availability", type=float, default=1.0)
+    parser.add_argument("--metadata-wrong-rate", type=float, default=0.0)
     parser.add_argument("--graph-fetch", type=int, default=0)
     parser.add_argument("--graph-seed-count", type=int, default=32)
     parser.add_argument("--graph-per-seed", type=int, default=16)
