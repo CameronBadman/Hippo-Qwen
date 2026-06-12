@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from argparse import Namespace
 from pathlib import Path
 
 from python.librarian.field_classifier import (
@@ -10,6 +11,7 @@ from python.librarian.field_classifier import (
     RuleFieldClassifier,
     prediction_cache_key,
 )
+from python.librarian.qwen_teacher_fields import build_user_prompt, run as run_qwen_teacher
 from python.librarian.field_schema import FieldPrediction, FieldRegistry, default_field_registry
 
 
@@ -94,6 +96,46 @@ class FieldSchemaClassifierTests(unittest.TestCase):
             predictions = classifier.classify(text, registry)
         pairs = {(item.field_name, item.value) for item in predictions}
         self.assertEqual(pairs, {("project", "project_001"), ("user_id", "user_001")})
+
+    def test_teacher_prompt_contains_registry_and_json_shape(self) -> None:
+        prompt = build_user_prompt("remember project_001", default_field_registry())
+        self.assertIn("Known field registry", prompt)
+        self.assertIn("project", prompt)
+        self.assertIn('"fields"', prompt)
+        self.assertIn("remember project_001", prompt)
+
+    def test_teacher_dry_run_writes_cache_without_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            input_path = Path(tmp) / "items.jsonl"
+            cache_path = Path(tmp) / "cache.json"
+            input_path.write_text('{"id":"m1","text":"remember user_001 project_001"}\n', encoding="utf-8")
+            result = run_qwen_teacher(
+                Namespace(
+                    input_jsonl=str(input_path),
+                    input_json="",
+                    from_session_stress=False,
+                    memory_count=1000,
+                    queries=20,
+                    seed=72000,
+                    text_key="text",
+                    limit=0,
+                    field_registry="",
+                    output_registry="",
+                    output_cache=str(cache_path),
+                    audit_jsonl="",
+                    api_key_env="MISSING_TEST_KEY",
+                    base_url="https://example.invalid/compatible-mode/v1",
+                    model="qwen-plus",
+                    timeout=1.0,
+                    max_retries=1,
+                    sleep_seconds=0.0,
+                    refresh=False,
+                    dry_run=True,
+                )
+            )
+            self.assertTrue(cache_path.exists())
+        self.assertEqual(result["labelled"], 1)
+        self.assertEqual(result["skipped_cached"], 0)
 
 
 if __name__ == "__main__":

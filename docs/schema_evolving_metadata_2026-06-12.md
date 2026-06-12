@@ -136,6 +136,68 @@ Each cache value can be either a list or an object with `fields`:
 For offline experiments, `--qwen-cache-rule-fallback` can fill missing cache
 entries with deterministic rule predictions and write them back to the cache.
 
+## Building A Qwen Teacher Cache
+
+The cache builder is:
+
+```bash
+python -m python.librarian.qwen_teacher_fields
+```
+
+It uses the OpenAI-compatible Qwen endpoint through standard-library HTTP. No
+Alibaba CLI is required. Provide credentials through environment variables, not
+through files:
+
+```bash
+export DASHSCOPE_API_KEY="..."
+export QWEN_BASE_URL="https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+export QWEN_MODEL="qwen-plus"
+```
+
+Generate labels for a small generated stress sample:
+
+```bash
+python -m python.librarian.qwen_teacher_fields \
+  --from-session-stress \
+  --memory-count 1000 \
+  --queries 20 \
+  --limit 200 \
+  --output-cache artifacts/field_classifier/qwen_teacher_cache.json \
+  --audit-jsonl artifacts/field_classifier/qwen_teacher_audit.jsonl
+```
+
+Run a deterministic replay benchmark from that cache:
+
+```bash
+python -m python.benchmarks.session_memory_stress \
+  --memory-count 1000 \
+  --queries 20 \
+  --vector-index numpy \
+  --vector-fetch 128 \
+  --token-fetch 128 \
+  --metadata-fetch 128 \
+  --graph-fetch 128 \
+  --candidate-pool 128 \
+  --embedding-backend hash \
+  --metadata-availability 0 \
+  --derived-metadata qwen-cache \
+  --metadata-source derived \
+  --field-cache artifacts/field_classifier/qwen_teacher_cache.json
+```
+
+Dry-run without network access:
+
+```bash
+python -m python.librarian.qwen_teacher_fields \
+  --from-session-stress \
+  --memory-count 120 \
+  --queries 2 \
+  --limit 3 \
+  --output-cache /tmp/qwen_teacher_dry_cache.json \
+  --audit-jsonl /tmp/qwen_teacher_dry_audit.jsonl \
+  --dry-run
+```
+
 ## Auto-Promotion
 
 New field names are first recorded as `proposed`. They become routing fields
