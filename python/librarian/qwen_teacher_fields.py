@@ -15,6 +15,7 @@ from python.librarian.field_classifier import (
     parse_prediction_json,
     prediction_cache_key,
     stable_predictions,
+    stable_prediction_cache_key,
 )
 from python.librarian.field_schema import FieldPrediction, FieldRegistry, default_field_registry
 
@@ -168,6 +169,14 @@ def checkpoint_outputs(cache: FieldPredictionCache, registry: FieldRegistry, out
         registry.save(output_registry)
 
 
+def cache_key_for_text(text: str, registry: FieldRegistry, cache_key_mode: str) -> str:
+    if cache_key_mode == "stable":
+        return stable_prediction_cache_key(text, PROMPT_VERSION)
+    if cache_key_mode == "registry":
+        return prediction_cache_key(text, registry, PROMPT_VERSION)
+    raise ValueError(f"unknown cache key mode: {cache_key_mode}")
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     api_key = os.getenv(args.api_key_env)
     if not api_key and not args.dry_run:
@@ -183,8 +192,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     failures = 0
     for index, item in enumerate(items, start=1):
         text = item_text(item, args.text_key)
-        key = prediction_cache_key(text, registry, PROMPT_VERSION)
-        if cache.get(key) is not None and not args.refresh:
+        key = cache_key_for_text(text, registry, args.cache_key_mode)
+        cached = cache.get(key)
+        if cached is not None and not args.refresh:
+            for prediction in parse_prediction_json(
+                cached,
+                source_type="qwen_cache",
+                teacher_version=PROMPT_VERSION,
+            ):
+                registry.record_predictions([prediction])
             skipped += 1
             continue
         if args.dry_run:
@@ -234,6 +250,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "registry_version": registry.version,
         "model": args.model,
         "base_url": args.base_url,
+        "cache_key_mode": args.cache_key_mode,
         "dry_run": bool(args.dry_run),
     }
 
@@ -259,6 +276,7 @@ def main() -> None:
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
     parser.add_argument("--save-every", type=int, default=25)
+    parser.add_argument("--cache-key-mode", choices=("registry", "stable"), default="registry")
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

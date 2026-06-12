@@ -10,6 +10,7 @@ from python.librarian.field_classifier import (
     QwenTeacherFieldClassifier,
     RuleFieldClassifier,
     prediction_cache_key,
+    stable_prediction_cache_key,
 )
 from python.librarian.export_qwen_memory_dataset import run as run_dataset_export
 from python.librarian.qwen_teacher_fields import build_user_prompt, run as run_qwen_teacher
@@ -98,6 +99,27 @@ class FieldSchemaClassifierTests(unittest.TestCase):
         pairs = {(item.field_name, item.value) for item in predictions}
         self.assertEqual(pairs, {("project", "project_001"), ("user_id", "user_001")})
 
+    def test_qwen_cache_reads_stable_predictions(self) -> None:
+        text = "remember user_001 project_001"
+        key = stable_prediction_cache_key(text)
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.json"
+            cache_path.write_text(
+                json.dumps(
+                    {
+                        key: [
+                            {"field_name": "project", "value": "project_001", "confidence": 0.94},
+                        ]
+                    },
+                    sort_keys=True,
+                ),
+                encoding="utf-8",
+            )
+            classifier = QwenTeacherFieldClassifier(cache_path)
+            predictions = classifier.classify(text, default_field_registry())
+        pairs = {(item.field_name, item.value) for item in predictions}
+        self.assertEqual(pairs, {("project", "project_001")})
+
     def test_teacher_prompt_contains_registry_and_json_shape(self) -> None:
         prompt = build_user_prompt("remember project_001", default_field_registry())
         self.assertIn("Known field registry", prompt)
@@ -131,6 +153,7 @@ class FieldSchemaClassifierTests(unittest.TestCase):
                     max_retries=1,
                     sleep_seconds=0.0,
                     save_every=25,
+                    cache_key_mode="registry",
                     refresh=False,
                     dry_run=True,
                 )

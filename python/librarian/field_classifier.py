@@ -30,6 +30,16 @@ def prediction_cache_key(text: str, registry: FieldRegistry, prompt_version: str
     return hashlib.sha256(encoded).hexdigest()
 
 
+def stable_prediction_cache_key(text: str, prompt_version: str = PROMPT_VERSION) -> str:
+    payload = {
+        "cache_key_mode": "stable-text-v1",
+        "prompt_version": prompt_version,
+        "text": str(text or ""),
+    }
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
 def parse_prediction_json(value: Any, *, source_type: str, teacher_version: str) -> list[FieldPrediction]:
     if isinstance(value, str):
         data = json.loads(value)
@@ -166,8 +176,11 @@ class QwenTeacherFieldClassifier:
 
     def classify(self, text: str, registry: FieldRegistry | None = None) -> list[FieldPrediction]:
         registry = registry or default_field_registry()
-        key = prediction_cache_key(text, registry, self.prompt_version)
-        cached = self.cache.get(key)
+        registry_key = prediction_cache_key(text, registry, self.prompt_version)
+        stable_key = stable_prediction_cache_key(text, self.prompt_version)
+        cached = self.cache.get(registry_key)
+        if cached is None:
+            cached = self.cache.get(stable_key)
         if cached is not None:
             return parse_prediction_json(cached, source_type="qwen_cache", teacher_version=self.prompt_version)
         if not self.allow_rule_fallback:
