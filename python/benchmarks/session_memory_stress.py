@@ -636,6 +636,48 @@ def context_ids(ranked: list[tuple[str, float, str]], budget: int) -> list[str]:
     return out
 
 
+def context_ids_from_candidates(candidates: list[tuple[str, float, str]], budget: int, limit: int | None = None) -> list[str]:
+    used = 0
+    out = []
+    for candidate_id, _, text in candidates:
+        if limit is not None and len(out) >= limit:
+            break
+        cost = max(1, len(tokens(text)))
+        if used + cost > budget:
+            break
+        used += cost
+        out.append(candidate_id)
+    return out
+
+
+def packed_context_ids(
+    scored: list[dict[str, Any]],
+    budget: int,
+    *,
+    top_n: int | None = None,
+    include_threshold: float | None = None,
+    min_items: int = 0,
+) -> list[str]:
+    ranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in scored]
+    if include_threshold is None:
+        return context_ids_from_candidates(ranked, budget, top_n)
+    selected = [
+        item
+        for item in scored
+        if float(item.get("include_probability") or 0.0) >= include_threshold
+    ]
+    if min_items > 0 and len(selected) < min_items:
+        selected_ids = {str(item["id"]) for item in selected}
+        for item in scored:
+            if str(item["id"]) not in selected_ids:
+                selected.append(item)
+                selected_ids.add(str(item["id"]))
+            if len(selected) >= min_items:
+                break
+    selected_ranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in selected]
+    return context_ids_from_candidates(selected_ranked, budget, top_n)
+
+
 def metrics_for(
     query: dict[str, Any],
     ranked: list[tuple[str, float, str]],
@@ -644,12 +686,15 @@ def metrics_for(
     budget: int,
     *,
     source_pools: dict[str, set[str]] | None = None,
+    included_ids: list[str] | None = None,
 ) -> dict[str, float]:
     relevant = set(str(item) for item in query.get("relevant_ids") or [])
     top_ids = [candidate_id for candidate_id, _, _ in ranked[:top_k]]
     top16_ids = [candidate_id for candidate_id, _, _ in ranked[:16]]
     top32_ids = [candidate_id for candidate_id, _, _ in ranked[:32]]
-    included = context_ids(ranked, budget)
+    included = list(included_ids) if included_ids is not None else context_ids(ranked, budget)
+    text_by_id = {candidate_id: text for candidate_id, _, text in ranked}
+    token_count = sum(max(1, len(tokens(text_by_id.get(candidate_id, "")))) for candidate_id in included)
     top_hits = len(relevant & set(top_ids))
     top16_hits = len(relevant & set(top16_ids))
     top32_hits = len(relevant & set(top32_ids))
@@ -664,6 +709,7 @@ def metrics_for(
         "precision_at_k": top_hits / max(1, min(top_k, len(top_ids))),
         "context_recall": context_hits / max(1, len(relevant)),
         "context_precision": context_hits / max(1, len(included)),
+        "context_token_count": float(token_count),
         "included_count": float(len(included)),
         "hard_negative_top_k_rate": hard_top / max(1, len(top_ids)),
         "hard_negative_context_rate": hard_context / max(1, len(included)),
@@ -691,6 +737,21 @@ def aggregate(rows: list[dict[str, float]]) -> dict[str, dict[str, float]]:
             "max": values[-1],
         }
     return out
+
+
+def packing_top_ns(args: argparse.Namespace) -> list[int]:
+    values = [int(value) for value in (args.packing_top_n or []) if int(value) > 0]
+    if args.packing_sweep and not values:
+        values = [3, 5, 8]
+    return sorted(set(values))
+
+
+def packing_thresholds(args: argparse.Namespace) -> list[float]:
+    values = [float(value) for value in (args.packing_threshold or [])]
+    values = [value for value in values if 0.0 <= value <= 1.0]
+    if args.packing_sweep and not values:
+        values = [0.5, 0.7, 0.9]
+    return sorted(set(values))
 
 
 def run(args: argparse.Namespace) -> dict[str, Any]:
@@ -726,6 +787,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
     systems: dict[str, list[dict[str, float]]] = {"vector": [], "hybrid": []}
     if calibrator is not None:
         systems["calibrated"] = []
+        for top_n in packing_top_ns(args):
+            systems[f"calibrated_pack_top{top_n}"] = []
+        for threshold in packing_thresholds(args):
+            systems[f"calibrated_pack_p{int(round(threshold * 100)):02d}"] = []
     signatures: dict[str, list[str]] = {key: [] for key in systems}
     calibration_rows: list[dict[str, Any]] = []
 
@@ -785,7 +850,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         signatures["hybrid"].append("|".join(candidate_id for candidate_id, _, _ in hybrid_ranked[: args.top_k]))
 
         if calibrator is not None:
-            from python.librarian.hippo_calibrator import rerank_with_calibrator
+            from python.librarian.hippo_calibrator import score_with_calibrator
 
             payload = {
                 "query": str(query["text"]),
@@ -793,9 +858,45 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "budget": args.budget,
                 "candidates": hybrid,
             }
-            reranked = rerank_with_calibrator(calibrator, payload, max_candidates=args.candidate_pool)
+            scored = score_with_calibrator(calibrator, payload, max_candidates=args.candidate_pool)
+            reranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in scored]
             systems["calibrated"].append(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
             signatures["calibrated"].append("|".join(candidate_id for candidate_id, _, _ in reranked[: args.top_k]))
+            for top_n in packing_top_ns(args):
+                system_name = f"calibrated_pack_top{top_n}"
+                included = packed_context_ids(scored, args.budget, top_n=top_n)
+                systems[system_name].append(
+                    metrics_for(
+                        query,
+                        reranked,
+                        hybrid_pool,
+                        args.top_k,
+                        args.budget,
+                        source_pools=source_pools,
+                        included_ids=included,
+                    )
+                )
+                signatures[system_name].append("|".join(included))
+            for threshold in packing_thresholds(args):
+                system_name = f"calibrated_pack_p{int(round(threshold * 100)):02d}"
+                included = packed_context_ids(
+                    scored,
+                    args.budget,
+                    include_threshold=threshold,
+                    min_items=args.packing_threshold_min_items,
+                )
+                systems[system_name].append(
+                    metrics_for(
+                        query,
+                        reranked,
+                        hybrid_pool,
+                        args.top_k,
+                        args.budget,
+                        source_pools=source_pools,
+                        included_ids=included,
+                    )
+                )
+                signatures[system_name].append("|".join(included))
 
     result = {
         "benchmark": "session_memory_stress",
@@ -811,6 +912,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "graph_fetch": args.graph_fetch,
         "budget": args.budget,
         "top_k": args.top_k,
+        "packing_top_n": packing_top_ns(args),
+        "packing_threshold": packing_thresholds(args),
+        "packing_threshold_min_items": args.packing_threshold_min_items,
         "calibrator_checkpoint": args.calibrator_checkpoint,
         "embed_seconds": round(embed_seconds, 3),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
@@ -848,8 +952,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- embed_seconds: `{result['embed_seconds']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
-        "| system | pool | vector | token | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context precision |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | pool | vector | token | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context recall | context precision | hard neg ctx | included | ctx tokens |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, metrics in result["systems"].items():
         lines.append(
@@ -865,7 +969,11 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
             f"{metrics.get('hit_any_relevant', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('precision_at_k', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('hard_negative_top_k_rate', {}).get('avg', 0.0):.4f} | "
-            f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} |"
+            f"{metrics.get('context_recall', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('context_precision', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('hard_negative_context_rate', {}).get('avg', 0.0):.4f} | "
+            f"{metrics.get('included_count', {}).get('avg', 0.0):.2f} | "
+            f"{metrics.get('context_token_count', {}).get('avg', 0.0):.1f} |"
         )
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -907,6 +1015,10 @@ def main() -> None:
     parser.add_argument("--output-dataset-json", default="")
     parser.add_argument("--output-calibration-jsonl", default="")
     parser.add_argument("--calibration-max-candidates", type=int, default=128)
+    parser.add_argument("--packing-sweep", action="store_true")
+    parser.add_argument("--packing-top-n", type=int, nargs="*", default=[])
+    parser.add_argument("--packing-threshold", type=float, nargs="*", default=[])
+    parser.add_argument("--packing-threshold-min-items", type=int, default=0)
     args = parser.parse_args()
     print(json.dumps(run(args), indent=2, sort_keys=True))
 

@@ -203,6 +203,28 @@ def rerank_with_calibrator(
     base_weight: float | None = None,
     utility_weight: float | None = None,
 ) -> list[tuple[str, float, str]]:
+    ranked = score_with_calibrator(
+        model,
+        payload,
+        max_candidates=max_candidates,
+        relevance_weight=relevance_weight,
+        include_weight=include_weight,
+        base_weight=base_weight,
+        utility_weight=utility_weight,
+    )
+    return [(item["id"], item["score"], item["text"]) for item in ranked]
+
+
+def score_with_calibrator(
+    model: HippoCalibrationTransformer,
+    payload: dict[str, Any],
+    *,
+    max_candidates: int | None = None,
+    relevance_weight: float | None = None,
+    include_weight: float | None = None,
+    base_weight: float | None = None,
+    utility_weight: float | None = None,
+) -> list[dict[str, Any]]:
     metadata = getattr(model, "metadata", {}) or {}
     has_trained_include_head = bool(getattr(model, "has_trained_include_head", True))
     if relevance_weight is None:
@@ -226,17 +248,29 @@ def rerank_with_calibrator(
         logits = outputs["relevance_logits"][0].detach().cpu().tolist()
         include_logits = outputs.get("include_logits", outputs["relevance_logits"])[0].detach().cpu().tolist()
         utility = outputs["utility"][0].detach().cpu().tolist()
-    ranked = []
+    ranked: list[dict[str, Any]] = []
     for idx, candidate in enumerate(candidates):
         base_score = float(candidate.get("base_score") or 0.0)
+        include_logit = float(include_logits[idx])
         score = (
             relevance_weight * float(logits[idx])
-            + include_weight * float(include_logits[idx])
+            + include_weight * include_logit
             + base_weight * float(base_score)
             + utility_weight * float(utility[idx])
         )
-        ranked.append((str(candidate.get("id") or ""), score, str(candidate.get("text") or "")))
-    return sorted(ranked, key=lambda item: (-item[1], item[0]))
+        ranked.append(
+            {
+                "id": str(candidate.get("id") or ""),
+                "score": score,
+                "text": str(candidate.get("text") or ""),
+                "relevance_logit": float(logits[idx]),
+                "include_logit": include_logit,
+                "include_probability": float(torch.sigmoid(torch.tensor(include_logit)).item()),
+                "utility": float(utility[idx]),
+                "base_score": base_score,
+            }
+        )
+    return sorted(ranked, key=lambda item: (-float(item["score"]), str(item["id"])))
 
 
 def save_calibrator(model: HippoCalibrationTransformer, path: str | Path, **metadata: Any) -> None:
