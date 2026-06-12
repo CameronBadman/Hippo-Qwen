@@ -162,6 +162,12 @@ def write_audit_row(path: Path | None, row: dict[str, Any]) -> None:
         handle.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n")
 
 
+def checkpoint_outputs(cache: FieldPredictionCache, registry: FieldRegistry, output_registry: str) -> None:
+    cache.save()
+    if output_registry:
+        registry.save(output_registry)
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     api_key = os.getenv(args.api_key_env)
     if not api_key and not args.dry_run:
@@ -216,9 +222,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         )
         if args.sleep_seconds > 0:
             time.sleep(args.sleep_seconds)
-    cache.save()
-    if args.output_registry:
-        registry.save(args.output_registry)
+        if args.save_every > 0 and labelled % args.save_every == 0:
+            checkpoint_outputs(cache, registry, args.output_registry)
+    checkpoint_outputs(cache, registry, args.output_registry)
     return {
         "items": len(items),
         "labelled": labelled,
@@ -252,6 +258,7 @@ def main() -> None:
     parser.add_argument("--timeout", type=float, default=60.0)
     parser.add_argument("--max-retries", type=int, default=3)
     parser.add_argument("--sleep-seconds", type=float, default=0.0)
+    parser.add_argument("--save-every", type=int, default=25)
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

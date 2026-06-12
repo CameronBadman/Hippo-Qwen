@@ -130,6 +130,7 @@ class FieldSchemaClassifierTests(unittest.TestCase):
                     timeout=1.0,
                     max_retries=1,
                     sleep_seconds=0.0,
+                    save_every=25,
                     refresh=False,
                     dry_run=True,
                 )
