@@ -11,6 +11,7 @@ from python.librarian.field_classifier import (
     RuleFieldClassifier,
     prediction_cache_key,
 )
+from python.librarian.export_qwen_memory_dataset import run as run_dataset_export
 from python.librarian.qwen_teacher_fields import build_user_prompt, run as run_qwen_teacher
 from python.librarian.field_schema import FieldPrediction, FieldRegistry, default_field_registry
 
@@ -136,6 +137,69 @@ class FieldSchemaClassifierTests(unittest.TestCase):
             self.assertTrue(cache_path.exists())
         self.assertEqual(result["labelled"], 1)
         self.assertEqual(result["skipped_cached"], 0)
+
+    def test_qwen_memory_dataset_export_splits_rows(self) -> None:
+        from python.benchmarks.session_memory_stress import build_store
+
+        registry = default_field_registry()
+        memories, queries = build_store(80, 2, 72000)
+        by_id = {str(memory["id"]): memory for memory in memories}
+        items: list[dict[str, object]] = [{"id": query["id"], "text": query["text"]} for query in queries]
+        for query in queries:
+            items.extend(by_id[str(item)] for item in query["relevant_ids"])
+            index = int(str(query["id"]).split("::")[1])
+            items.extend(by_id[f"hard::{index}::{slot}"] for slot in range(12))
+        items.extend(
+            memory
+            for memory in memories
+            if str(memory["id"]).startswith("background::") and int(str(memory["id"]).split("::")[1]) < 4
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_path = Path(tmp) / "cache.json"
+            cache_data = {}
+            for item in items:
+                text = str(item.get("text") or "")
+                cache_data[prediction_cache_key(text, registry)] = [
+                    {
+                        "field_name": "project",
+                        "value": "project_001",
+                        "confidence": 0.9,
+                        "source_span": "project_001",
+                        "source_type": "qwen_teacher",
+                        "teacher_version": "field-classifier-v1",
+                    }
+                ]
+            cache_path.write_text(json.dumps(cache_data, sort_keys=True) + "\n", encoding="utf-8")
+            output_dir = Path(tmp) / "dataset"
+            result = run_dataset_export(
+                Namespace(
+                    field_cache=str(cache_path),
+                    field_registry="",
+                    output_dir=str(output_dir),
+                    memory_count=80,
+                    queries=2,
+                    seed=72000,
+                    train_query_limit=1,
+                    holdout_query_start=1,
+                    holdout_query_limit=1,
+                    background_train_limit=2,
+                    background_holdout_limit=2,
+                    teacher_model="qwen-plus",
+                    dataset_version="test-dataset",
+                    include_missing_cache=False,
+                )
+            )
+            self.assertEqual(result["stats"]["train_retrieval_rows"], 15)
+            self.assertEqual(result["stats"]["holdout_retrieval_rows"], 15)
+            train_sft = output_dir / "qwen_field_sft_train.jsonl"
+            holdout_pairs = output_dir / "retrieval_pairs_holdout.jsonl"
+            self.assertTrue(train_sft.exists())
+            self.assertTrue(holdout_pairs.exists())
+            first_sft = json.loads(train_sft.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first_sft["messages"][0]["role"], "system")
+            first_pair = json.loads(holdout_pairs.read_text(encoding="utf-8").splitlines()[0])
+            self.assertEqual(first_pair["split"], "holdout")
 
 
 if __name__ == "__main__":
