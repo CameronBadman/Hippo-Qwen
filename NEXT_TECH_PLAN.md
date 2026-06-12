@@ -60,6 +60,7 @@ expansion, the 50k result changed materially.
 | 50k | expanded | calibrated | 1.0000 | 0.7194 | 0.8722 | 0.9972 | 0.2750 |
 | 50k | expanded | hybrid | 1.0000 | 0.7056 | 0.9500 | 1.0000 | 0.5896 |
 | 50k | expanded + stress-trained calibrator | calibrated | 1.0000 | 1.0000 | 1.0000 | 1.0000 | 0.0656 |
+| 50k | expanded + stress calibrator + p>=0.40 packing | calibrated | 1.0000 | 1.0000 | n/a | n/a | 0.0281 |
 
 Interpretation:
 
@@ -71,6 +72,11 @@ Interpretation:
   benchmark.
 - After training on the expanded stress candidate pools, the calibrator reached
   recall@8 1.0000 with hard-negative top-k 0.0656.
+- A fresh hash-backed packing sweep showed that the default budget packer was
+  the context-collapse point: it returned about 40 memories. A simple include
+  probability threshold of p>=0.40 returned about 3.5 memories with context
+  recall 0.9917, context precision 0.9167, and hard-negative context rate 0.0
+  on the 50k synthetic stress run.
 - This is promising, but it is still a synthetic metadata-rich benchmark.
 - The next risk is benchmark generosity: the graph layer currently gets clean
   user/project/brand metadata.
@@ -320,10 +326,12 @@ Next implementation loop:
 
 1. Add partial metadata ablations: 100%, 70%, 40%, and 0% metadata availability.
 2. Add wrong-entity/noisy-metadata ablations.
-3. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
+3. Re-run the p>=0.40 packing rule under those ablations.
+4. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
    recall@8 above 0.50.
-4. Add learned include/stop packing.
-5. Add a real-ish write-path entity extractor or Qwen teacher path to generate
+5. Add learned include/stop packing only if the threshold packer fails under
+   noisy metadata.
+6. Add a real-ish write-path entity extractor or Qwen teacher path to generate
    metadata instead of giving the benchmark perfect metadata.
 
 The current 50k synthetic result is strong enough to continue. It should not be

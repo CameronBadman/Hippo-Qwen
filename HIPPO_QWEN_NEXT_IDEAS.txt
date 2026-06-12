@@ -1627,3 +1627,76 @@ Next action:
   recall.
 - Add a real-ish write-path entity extractor or Qwen teacher to produce metadata
   instead of giving the benchmark perfect labels.
+
+
+31. Packing policy sweep for stress calibrator
+
+Implemented and tested.
+
+Setup:
+- Hippo-Qwen commit: `65ef9db`.
+- Runtime: fresh Colab A100.
+- The prior Hippo-encoder checkpoint and stress calibrator were not present in
+  this fresh runtime, so this run used the hash embedding backend. Treat this as
+  a packing diagnostic, not a replacement for the previous Hippo-backed result.
+- Added `score_with_calibrator` so benchmark code can inspect relevance logits,
+  include logits, include probabilities, utility, and final scores.
+- Added explicit packing policies to `session_memory_stress.py`:
+  fixed top-N context caps and include-probability thresholds.
+- Added context metrics to the benchmark report:
+  context recall, context precision, hard-negative context rate, included count,
+  and estimated context tokens.
+- Trained a fresh 33-feature stress calibrator on:
+  30k memories, 360 queries, seed `73000`, hash embeddings.
+- Evaluated on:
+  50k memories, 120 queries, seed `72000`, hash embeddings.
+
+Artifacts:
+- `/content/session_pack_sweep_hash/stress_train.jsonl`
+- `/content/session_pack_sweep_hash/stress_feature33_hash.pt`
+- `/content/session_pack_sweep_hash/eval_50k_pack_sweep.json`
+- `/content/session_pack_sweep_hash/eval_50k_pack_fine.json`
+
+Top-level results:
+
+| system | recall@8 | hard neg@8 | context recall | context precision | hard neg ctx | included | ctx tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| vector | 0.2806 | 0.5542 | 0.4278 | 0.0375 | 0.3863 | 38.03 | 892.3 |
+| hybrid expanded | 0.9417 | 0.5135 | 1.0000 | 0.0680 | 0.3394 | 44.63 | 891.1 |
+| calibrated default budget pack | 1.0000 | 0.0292 | 1.0000 | 0.0760 | 0.1833 | 40.70 | 890.5 |
+| calibrated top-3 pack | 1.0000 | 0.0292 | 0.9167 | 0.9167 | 0.0000 | 3.00 | 77.0 |
+| calibrated top-5 pack | 1.0000 | 0.0292 | 0.9722 | 0.5833 | 0.0050 | 5.00 | 126.7 |
+| calibrated top-8 pack | 1.0000 | 0.0292 | 1.0000 | 0.3750 | 0.0292 | 8.00 | 200.8 |
+| calibrated p>=0.40 pack | 1.0000 | 0.0281 | 0.9917 | 0.9167 | 0.0000 | 3.46 | 89.0 |
+| calibrated p>=0.45 pack | 1.0000 | 0.0281 | 0.9778 | 0.9167 | 0.0000 | 3.39 | 87.2 |
+| calibrated p>=0.50 pack | 1.0000 | 0.0281 | 0.9472 | 0.9167 | 0.0000 | 3.26 | 83.8 |
+| calibrated p>=0.60 pack | 1.0000 | 0.0281 | 0.8639 | 0.9167 | 0.0000 | 2.91 | 74.9 |
+
+Interpretation:
+- The collapse was in the default budget packer. It kept consuming memories until
+  the 900-token budget was full, averaging about 40 memories per query.
+- Top-k ranking was not collapsed in this synthetic stress run:
+  recall@8 = 1.0000 and hard-negative top-k was about 0.03.
+- Include probabilities are useful without retraining. A simple threshold of
+  p>=0.40 returns about 3.5 memories, keeps context recall at 0.9917, raises
+  context precision to 0.9167, and eliminates hard negatives from returned
+  context on this run.
+- A fixed top-6 cap preserves full context recall, but has lower precision
+  than the include-probability threshold. The threshold is the better default
+  candidate.
+- The result is still synthetic and metadata-rich. The next credibility test is
+  whether p>=0.40 continues to work under partial/noisy metadata and with the
+  Hippo-encoder backend restored.
+
+Verdict:
+- Keep the packing sweep code.
+- For the current stress calibrator, use `p>=0.40` as the first candidate
+  production packing rule, with `top-8` as a conservative fallback.
+- Do not retrain the stop head yet. First run the same packing policy under
+  metadata ablations; if p>=0.40 breaks, then train a real stop/packing loss.
+
+Next action:
+- Re-run with the Hippo-encoder checkpoint restored.
+- Run partial/noisy metadata ablations with the p>=0.40 packer.
+- Add a rule baseline:
+  rank user/project/brand matches first and pack by the same p/top-N policies.
