@@ -980,6 +980,11 @@ def packing_thresholds(args: argparse.Namespace) -> list[float]:
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     memories, queries = build_store(args.memory_count, args.queries, args.seed)
+    query_start = max(0, int(args.query_start))
+    query_end = len(queries)
+    if int(args.query_limit) > 0:
+        query_end = min(query_end, query_start + int(args.query_limit))
+    queries = queries[query_start:query_end]
     if args.output_dataset_json:
         output = Path(args.output_dataset_json)
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -1134,6 +1139,9 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "embedding_backend": backend.name,
         "memory_count": args.memory_count,
         "queries": args.queries,
+        "query_start": query_start,
+        "query_limit": int(args.query_limit),
+        "evaluated_queries": len(queries),
         "seed": args.seed,
         "vector_index": args.vector_index,
         "candidate_pool": args.candidate_pool,
@@ -1182,6 +1190,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- backend: `{result['embedding_backend']}`",
         f"- memory_count: `{result['memory_count']}`",
         f"- queries: `{result['queries']}`",
+        f"- query_start: `{result.get('query_start', 0)}`",
+        f"- query_limit: `{result.get('query_limit', 0)}`",
+        f"- evaluated_queries: `{result.get('evaluated_queries', result['queries'])}`",
         f"- vector_index: `{result['vector_index']}`",
         f"- candidate_pool: `{result['candidate_pool']}`",
         f"- metadata_fetch: `{result.get('metadata_fetch', 0)}`",
@@ -1225,6 +1236,8 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--memory-count", type=int, default=10000)
     parser.add_argument("--queries", type=int, default=100)
+    parser.add_argument("--query-start", type=int, default=0)
+    parser.add_argument("--query-limit", type=int, default=0)
     parser.add_argument("--seed", type=int, default=72000)
     parser.add_argument("--vector-index", choices=["numpy", "faiss_flat", "faiss_hnsw"], default="faiss_hnsw")
     parser.add_argument("--hnsw-m", type=int, default=32)
