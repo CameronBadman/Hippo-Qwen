@@ -1700,3 +1700,58 @@ Next action:
 - Run partial/noisy metadata ablations with the p>=0.40 packer.
 - Add a rule baseline:
   rank user/project/brand matches first and pack by the same p/top-N policies.
+
+
+32. Metadata degradation and adaptive packing
+
+Implemented and partially tested.
+
+Setup:
+- Hippo-Qwen commit: `25f8efe`.
+- Runtime: Colab A100.
+- Benchmark: 50k generated memories, 120 queries, seed `72000`.
+- Embedding backend: hash.
+- Candidate sources:
+  vector fetch 1024, token fetch 1024, metadata fetch 256, graph fetch 256,
+  final candidate pool 128.
+- Calibrator:
+  `/content/session_metadata_degradation_hash/stress_feature33_hash.pt`
+- Full details:
+  `docs/session_metadata_degradation_2026-06-12.md`
+
+Result:
+- Clean structured metadata is very favorable:
+  `p>=0.40` reached recall@8 1.0000, context recall 0.9917, context precision
+  0.9167, and hard-negative context 0.0000.
+- With degraded metadata, the main failure becomes evidence reaching the pool:
+  pool recall fell to 0.8278 at 70% metadata, 0.6694 at 40% metadata, and
+  0.5972 with no metadata.
+- The calibrator still suppresses hard negatives well when candidates arrive.
+- Pure `p>=0.40` is too brittle. With no metadata it returned zero context,
+  even though fixed top-8 still had recall@8 0.5500.
+- A minimum fallback fixes that collapse. The best completed setting was
+  `p>=0.40` plus `min_items=3`.
+
+Minimum-3 policy result:
+
+| case | recall@8 | context recall | context precision | hard neg ctx | included |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| clean | 1.0000 | 0.9889 | 0.9167 | 0.0000 | 3.43 |
+| 70% metadata | 0.8361 | 0.7111 | 0.6833 | 0.0000 | 3.17 |
+| 40% metadata | 0.7111 | 0.5111 | 0.5083 | 0.0000 | 3.02 |
+| 0% metadata | 0.5556 | 0.4694 | 0.4694 | 0.0000 | 3.00 |
+| 25% wrong metadata | 0.8306 | 0.7167 | 0.6972 | 0.0028 | 3.12 |
+| 50% wrong metadata | 0.6917 | 0.5250 | 0.5083 | 0.0028 | 3.10 |
+
+Interpretation:
+- Use `p>=0.40` with a minimum-3 backfill as the next default packing policy.
+- Do not claim the clean benchmark as production quality. It depends heavily on
+  reliable structured metadata.
+- The next quality lever is not just the packer. It is metadata-robust candidate
+  generation and a better encoder.
+- Train with metadata dropout/noise and retest with the Hippo encoder.
+
+Caveat:
+- Colab became stale while starting the `min_items=5` block. Minimums 1, 2,
+  and 3 completed and were enough to choose the next default. Minimum 5 still
+  needs a clean rerun.

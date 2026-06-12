@@ -81,6 +81,62 @@ Interpretation:
 - The next risk is benchmark generosity: the graph layer currently gets clean
   user/project/brand metadata.
 
+## Metadata Degradation Result
+
+The partial/noisy metadata ablation has now been run on Colab A100 with the
+hash-backed 50k stress setup. Detailed numbers are in
+`docs/session_metadata_degradation_2026-06-12.md`.
+
+Key findings:
+
+- Clean metadata remains strong: `p>=0.40` packing reached recall@8 1.0000,
+  context recall 0.9917, context precision 0.9167, and hard-negative context
+  0.0000.
+- With 70% metadata availability, pool recall dropped to 0.8278 and `p>=0.40`
+  context recall dropped to 0.6917 while context precision stayed high at
+  0.8917.
+- With 40% metadata availability, pool recall dropped to 0.6694 and `p>=0.40`
+  context recall dropped to 0.3944.
+- With 0% metadata availability, pool recall was 0.5972 and pure `p>=0.40`
+  returned no context at all.
+- With 50% wrong metadata, pool recall was 0.7778 and `p>=0.40` context recall
+  was 0.4806.
+
+Adaptive packing was then tested with `--packing-threshold-min-items`.
+The reliable completed sweep covers minimums 1, 2, and 3. Colab became stale
+while starting the minimum-5 block, so minimum-5 still needs a clean rerun.
+
+Best current policy:
+
+```text
+include memories with include_probability >= 0.40
+if fewer than 3 memories are included, backfill from top-ranked candidates to 3
+respect the token budget
+```
+
+That minimum-3 fallback fixed the no-context collapse:
+
+| case | recall@8 | context recall | context precision | hard neg ctx | included |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| clean | 1.0000 | 0.9889 | 0.9167 | 0.0000 | 3.43 |
+| 70% metadata | 0.8361 | 0.7111 | 0.6833 | 0.0000 | 3.17 |
+| 40% metadata | 0.7111 | 0.5111 | 0.5083 | 0.0000 | 3.02 |
+| 0% metadata | 0.5556 | 0.4694 | 0.4694 | 0.0000 | 3.00 |
+| 25% wrong metadata | 0.8306 | 0.7167 | 0.6972 | 0.0028 | 3.12 |
+| 50% wrong metadata | 0.6917 | 0.5250 | 0.5083 | 0.0028 | 3.10 |
+
+Interpretation:
+
+- The calibrator is still doing useful suppression work under degraded
+  metadata.
+- Perfect structured metadata was inflating the prior clean result.
+- The remaining bottleneck is a mix of candidate generation and confidence
+  calibration under degraded metadata.
+- The packer should not be a pure threshold. It needs an adaptive minimum or a
+  learned stop/abstention head trained on metadata dropout/noise.
+- The next credible quality run should use the Hippo-encoder backend and
+  metadata dropout/noise during training.
+
 ## Core Diagnosis
 
 Current retrieval behaves too much like global semantic search:
@@ -324,13 +380,13 @@ The first implementation loop is complete:
 
 Next implementation loop:
 
-1. Add partial metadata ablations: 100%, 70%, 40%, and 0% metadata availability.
-2. Add wrong-entity/noisy-metadata ablations.
-3. Re-run the p>=0.40 packing rule under those ablations.
+1. Repeat the metadata-degradation sweep with the Hippo-encoder backend.
+2. Complete the minimum-5 adaptive packing block after a clean Colab reset.
+3. Train with metadata dropout/noise so the calibrator does not depend on clean
+   structured fields.
 4. Add quota sweeps to find the smallest metadata/graph pool that keeps 50k
    recall@8 above 0.50.
-5. Add learned include/stop packing only if the threshold packer fails under
-   noisy metadata.
+5. Add learned include/stop packing if the minimum-3 rule is still too blunt.
 6. Add a real-ish write-path entity extractor or Qwen teacher path to generate
    metadata instead of giving the benchmark perfect metadata.
 
