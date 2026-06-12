@@ -18,6 +18,8 @@ if __package__ is None or __package__ == "":
     sys.path.append(str(Path(__file__).resolve().parents[2]))
 
 from python.benchmarks.hippocampus_retrieval import build_embedding_backend, text_for_embedding
+from python.librarian.field_classifier import QwenTeacherFieldClassifier, RuleFieldClassifier, apply_derived_metadata
+from python.librarian.field_schema import FieldPrediction, FieldRegistry, default_field_registry
 from python.librarian.features import fnv1a64, tokens
 
 
@@ -314,6 +316,45 @@ def metadata_value(memory: dict[str, Any], key: str) -> str:
     return str(metadata.get(key) or "")
 
 
+def derived_field_values(item: dict[str, Any], key: str) -> list[tuple[str, float]]:
+    fields = ((item.get("derived_metadata") or {}).get("fields") or {})
+    values = []
+    for entry in fields.get(key) or []:
+        if isinstance(entry, dict):
+            value = str(entry.get("value") or "")
+            confidence = float(entry.get("confidence") or 0.0)
+        else:
+            value = str(entry or "")
+            confidence = 0.5
+        if value:
+            values.append((value, confidence))
+    return sorted(values, key=lambda item: (-item[1], item[0]))
+
+
+def metadata_values(item: dict[str, Any], key: str, source: str) -> list[tuple[str, float, str]]:
+    values: list[tuple[str, float, str]] = []
+    if source in {"original", "both"}:
+        if key == "entity":
+            for entity in (item.get("metadata") or {}).get("entities") or []:
+                value = str(entity or "")
+                if value:
+                    values.append((value, 1.0, "metadata"))
+        else:
+            value = metadata_value(item, key)
+            if value:
+                values.append((value, 1.0, "metadata"))
+    if source in {"derived", "both"}:
+        for value, confidence in derived_field_values(item, key):
+            values.append((value, confidence, "derived_metadata"))
+    dedup: dict[tuple[str, str], tuple[str, float, str]] = {}
+    for value, confidence, value_source in values:
+        key_tuple = (value_source, value)
+        current = dedup.get(key_tuple)
+        if current is None or confidence > current[1]:
+            dedup[key_tuple] = (value, confidence, value_source)
+    return sorted(dedup.values(), key=lambda item: (item[2], item[0]))
+
+
 def degrade_memory_metadata(memories: list[dict[str, Any]], *, availability: float, wrong_rate: float, seed: int) -> None:
     availability = max(0.0, min(1.0, float(availability)))
     wrong_rate = max(0.0, min(1.0, float(wrong_rate)))
@@ -346,24 +387,15 @@ def degrade_memory_metadata(memories: list[dict[str, Any]], *, availability: flo
         memory["metadata"] = metadata
 
 
-def build_metadata_index(memories: list[dict[str, Any]]) -> dict[str, dict[str, list[int]]]:
-    indexes: dict[str, dict[str, list[int]]] = {
-        "user_id": {},
-        "project": {},
-        "brand": {},
-        "session_id": {},
-        "entity": {},
-    }
+def build_metadata_index(memories: list[dict[str, Any]], source: str = "original") -> dict[str, dict[str, list[int]]]:
+    indexes: dict[str, dict[str, list[int]]] = {}
     for index, memory in enumerate(memories):
-        metadata = memory.get("metadata") or {}
-        for key in ("user_id", "project", "brand", "session_id"):
-            value = str(metadata.get(key) or "")
-            if value:
-                indexes[key].setdefault(value, []).append(index)
-        for entity in metadata.get("entities") or []:
-            value = str(entity or "")
-            if value:
-                indexes["entity"].setdefault(value, []).append(index)
+        field_names = {"user_id", "project", "brand", "session_id", "entity"}
+        field_names.update(((memory.get("derived_metadata") or {}).get("fields") or {}).keys())
+        for key in sorted(field_names):
+            for value, _, value_source in metadata_values(memory, key, source):
+                index_key = f"{value_source}:{key}" if source == "both" else key
+                indexes.setdefault(index_key, {}).setdefault(value, []).append(index)
     return indexes
 
 
@@ -374,12 +406,13 @@ def bounded_bucket(
     preferred_project: str = "",
     preferred_brand: str = "",
     memories: list[dict[str, Any]],
+    metadata_source: str = "original",
 ) -> list[int]:
     ordered = sorted(
         bucket,
         key=lambda index: (
-            0 if not preferred_project or metadata_value(memories[index], "project") == preferred_project else 1,
-            0 if not preferred_brand or metadata_value(memories[index], "brand") == preferred_brand else 1,
+            0 if not preferred_project or any(value == preferred_project for value, _, _ in metadata_values(memories[index], "project", metadata_source)) else 1,
+            0 if not preferred_brand or any(value == preferred_brand for value, _, _ in metadata_values(memories[index], "brand", metadata_source)) else 1,
             -float(memories[index].get("importance") or 0.0),
             int(memories[index].get("age_days") or 0),
             str(memories[index].get("id") or ""),
@@ -388,43 +421,100 @@ def bounded_bucket(
     return ordered[:limit]
 
 
+def query_metadata_values(query: dict[str, Any], source: str) -> dict[str, list[tuple[str, float, str]]]:
+    values: dict[str, list[tuple[str, float, str]]] = {}
+    if source in {"original", "both"}:
+        original = {
+            "user_id": str(query.get("user_id") or ""),
+            "project": str(query.get("project_id") or ""),
+            "brand": str(query.get("brand") or ""),
+        }
+        for field_name, value in original.items():
+            if value:
+                values.setdefault(field_name, []).append((value, 1.0, "metadata"))
+                values.setdefault("entity", []).append((value, 0.65, "metadata"))
+    if source in {"derived", "both"}:
+        fields = ((query.get("derived_metadata") or {}).get("fields") or {})
+        for field_name, entries in fields.items():
+            for entry in entries or []:
+                if isinstance(entry, dict):
+                    value = str(entry.get("value") or "")
+                    confidence = float(entry.get("confidence") or 0.0)
+                else:
+                    value = str(entry or "")
+                    confidence = 0.5
+                if value:
+                    values.setdefault(str(field_name), []).append((value, confidence, "derived_metadata"))
+    out: dict[str, list[tuple[str, float, str]]] = {}
+    for field_name, field_values in values.items():
+        dedup: dict[tuple[str, str], tuple[str, float, str]] = {}
+        for value, confidence, value_source in field_values:
+            key = (value_source, value)
+            current = dedup.get(key)
+            if current is None or confidence > current[1]:
+                dedup[key] = (value, confidence, value_source)
+        out[field_name] = sorted(dedup.values(), key=lambda item: (-item[1], item[2], item[0]))
+    return dict(sorted(out.items()))
+
+
+def first_query_value(values: dict[str, list[tuple[str, float, str]]], field_name: str) -> str:
+    bucket = values.get(field_name) or []
+    return str(bucket[0][0]) if bucket else ""
+
+
 def metadata_scores(
     query: dict[str, Any],
     metadata_index: dict[str, dict[str, list[int]]],
     memories: list[dict[str, Any]],
     limit: int,
     per_bucket: int,
+    metadata_source: str = "original",
 ) -> list[tuple[int, float, str]]:
     if limit <= 0:
         return []
-    user_id = str(query.get("user_id") or "")
-    project = str(query.get("project_id") or "")
-    brand = str(query.get("brand") or "")
-    weighted_sources = [
-        ("user_id", user_id, 1.00, "metadata:user"),
-        ("project", project, 1.20, "metadata:project"),
-        ("brand", brand, 0.90, "metadata:brand"),
-        ("entity", user_id, 0.60, "metadata:entity_user"),
-        ("entity", project, 0.70, "metadata:entity_project"),
-        ("entity", brand, 0.55, "metadata:entity_brand"),
-    ]
+    query_values = query_metadata_values(query, metadata_source)
+    project = first_query_value(query_values, "project")
+    brand = first_query_value(query_values, "brand")
+    user_id = first_query_value(query_values, "user_id")
+    field_weights = {
+        "user_id": 1.00,
+        "project": 1.20,
+        "brand": 0.90,
+        "session_id": 0.80,
+        "entity": 0.65,
+        "preference": 0.45,
+        "correction": 0.50,
+        "tool": 0.45,
+        "time_scope": 0.35,
+        "topic": 0.35,
+    }
+    weighted_sources = []
+    for field_name, values in sorted(query_values.items()):
+        for value, confidence, value_source in values:
+            weight = field_weights.get(field_name, 0.30) * confidence
+            source_prefix = "derived_metadata" if value_source.startswith("derived") else "metadata"
+            index_key = f"{value_source}:{field_name}" if metadata_source == "both" else field_name
+            weighted_sources.append((index_key, field_name, value, weight, f"{source_prefix}:{field_name}"))
     scores: dict[int, tuple[float, set[str]]] = {}
-    for key, value, weight, source in weighted_sources:
+    for index_key, field_name, value, weight, source in weighted_sources:
         if not value:
             continue
-        bucket = metadata_index.get(key, {}).get(value) or []
-        for index in bounded_bucket(bucket, per_bucket, preferred_project=project, preferred_brand=brand, memories=memories):
+        bucket = metadata_index.get(index_key, {}).get(value) or []
+        for index in bounded_bucket(bucket, per_bucket, preferred_project=project, preferred_brand=brand, memories=memories, metadata_source=metadata_source):
             score, sources = scores.setdefault(index, (0.0, set()))
             sources.add(source)
             scores[index] = (score + weight, sources)
     boosted = []
     for index, (score, sources) in scores.items():
         memory = memories[index]
-        if project and metadata_value(memory, "project") == project:
+        memory_projects = {value for value, _, _ in metadata_values(memory, "project", metadata_source)}
+        memory_users = {value for value, _, _ in metadata_values(memory, "user_id", metadata_source)}
+        memory_brands = {value for value, _, _ in metadata_values(memory, "brand", metadata_source)}
+        if project and project in memory_projects:
             score += 1.25
-        if user_id and metadata_value(memory, "user_id") == user_id:
+        if user_id and user_id in memory_users:
             score += 0.95
-        if brand and metadata_value(memory, "brand") == brand:
+        if brand and brand in memory_brands:
             score += 0.75
         score += 0.10 * float(memory.get("importance") or 0.0)
         score -= 0.0005 * float(memory.get("age_days") or 0.0)
@@ -432,22 +522,29 @@ def metadata_scores(
     return sorted(boosted, key=lambda item: (-item[1], str(memories[item[0]].get("id") or "")))[:limit]
 
 
-def build_graph_index(memories: list[dict[str, Any]]) -> dict[int, list[tuple[int, str, float]]]:
-    buckets = build_metadata_index(memories)
+def build_graph_index(memories: list[dict[str, Any]], metadata_source: str = "original") -> dict[int, list[tuple[int, str, float]]]:
+    buckets = build_metadata_index(memories, metadata_source)
     graph: dict[int, list[tuple[int, str, float]]] = {index: [] for index in range(len(memories))}
     edge_specs = [
         ("session_id", "same_session", 1.00, 18),
         ("project", "same_project", 0.65, 24),
         ("brand", "same_brand", 0.45, 24),
         ("user_id", "same_user", 0.35, 24),
+        ("entity", "same_entity", 0.40, 18),
+        ("tool", "same_tool", 0.30, 12),
+        ("preference", "same_preference", 0.28, 12),
     ]
     for key, edge_type, weight, per_node_limit in edge_specs:
-        for bucket in buckets.get(key, {}).values():
-            ordered = sorted(bucket, key=lambda index: str(memories[index].get("id") or ""))
-            for position, source in enumerate(ordered):
-                window = ordered[max(0, position - per_node_limit) : position] + ordered[position + 1 : position + 1 + per_node_limit]
-                for target in window:
-                    graph[source].append((target, edge_type, weight))
+        matching_keys = [key]
+        if metadata_source == "both":
+            matching_keys = [f"metadata:{key}", f"derived_metadata:{key}"]
+        for index_key in matching_keys:
+            for bucket in buckets.get(index_key, {}).values():
+                ordered = sorted(bucket, key=lambda index: str(memories[index].get("id") or ""))
+                for position, source in enumerate(ordered):
+                    window = ordered[max(0, position - per_node_limit) : position] + ordered[position + 1 : position + 1 + per_node_limit]
+                    for target in window:
+                        graph[source].append((target, edge_type, weight))
     for source, edges in graph.items():
         dedup: dict[int, tuple[str, float]] = {}
         for target, edge_type, weight in edges:
@@ -595,15 +692,40 @@ def hybrid_candidates(
     return out
 
 
-def annotate_query_matches(query: dict[str, Any], candidate: dict[str, Any]) -> None:
+def annotate_query_matches(query: dict[str, Any], candidate: dict[str, Any], metadata_source: str = "original") -> None:
     metadata = candidate.get("metadata") or {}
     user_match = bool(query.get("user_id")) and str(metadata.get("user_id") or "") == str(query.get("user_id") or "")
     project_match = bool(query.get("project_id")) and str(metadata.get("project") or "") == str(query.get("project_id") or "")
     brand_match = bool(query.get("brand")) and str(metadata.get("brand") or "") == str(query.get("brand") or "")
+    query_values = query_metadata_values(query, metadata_source)
+    candidate_users = {value for value, _, _ in metadata_values(candidate, "user_id", metadata_source)}
+    candidate_projects = {value for value, _, _ in metadata_values(candidate, "project", metadata_source)}
+    candidate_brands = {value for value, _, _ in metadata_values(candidate, "brand", metadata_source)}
+    derived_user_match = bool({value for value, _, _ in query_values.get("user_id", [])} & candidate_users)
+    derived_project_match = bool({value for value, _, _ in query_values.get("project", [])} & candidate_projects)
+    derived_brand_match = bool({value for value, _, _ in query_values.get("brand", [])} & candidate_brands)
+    fields = ((candidate.get("derived_metadata") or {}).get("fields") or {})
+    derived_confidences = [
+        float(entry.get("confidence") or 0.0)
+        for entries in fields.values()
+        for entry in (entries or [])
+        if isinstance(entry, dict)
+    ]
     candidate["query_user_match"] = user_match
     candidate["query_project_match"] = project_match
     candidate["query_brand_match"] = brand_match
     candidate["query_all_metadata_match"] = user_match and project_match and brand_match
+    candidate["derived_query_user_match"] = derived_user_match
+    candidate["derived_query_project_match"] = derived_project_match
+    candidate["derived_query_brand_match"] = derived_brand_match
+    candidate["derived_query_any_match"] = derived_user_match or derived_project_match or derived_brand_match
+    candidate["derived_metadata_field_count"] = sum(len(entries or []) for entries in fields.values())
+    candidate["derived_metadata_confidence"] = sum(derived_confidences) / max(1, len(derived_confidences))
+    candidate["metadata_disagreement"] = (
+        (user_match != derived_user_match)
+        or (project_match != derived_project_match)
+        or (brand_match != derived_brand_match)
+    )
 
 
 def mark_candidate_labels(candidates: list[dict[str, Any]], relevant: set[str]) -> None:
@@ -620,6 +742,75 @@ def mark_candidate_labels(candidates: list[dict[str, Any]], relevant: set[str]) 
         candidate["label_weight"] = 1.0 if is_relevant else (4.0 if is_hard else 1.0)
         candidate["include_weight"] = 1.0 if is_relevant else (8.0 if is_hard else 2.0)
         candidate["base_score_gap"] = best_score - float(candidate.get("base_score") or 0.0)
+
+
+def load_field_registry(path: str) -> FieldRegistry:
+    if path:
+        registry_path = Path(path)
+        if registry_path.exists():
+            return FieldRegistry.load(registry_path)
+    return default_field_registry()
+
+
+def build_field_classifier(args: argparse.Namespace) -> Any | None:
+    mode = str(getattr(args, "derived_metadata", "none") or "none")
+    if mode == "none":
+        return None
+    if mode == "rules":
+        return RuleFieldClassifier()
+    if mode == "qwen-cache":
+        cache_path = str(getattr(args, "field_cache", "") or "artifacts/field_classifier/qwen_teacher_cache.json")
+        return QwenTeacherFieldClassifier(cache_path, allow_rule_fallback=bool(getattr(args, "qwen_cache_rule_fallback", False)))
+    raise ValueError(f"unknown derived metadata mode: {mode}")
+
+
+def load_float_mapping(path: str) -> dict[str, float]:
+    if not path:
+        return {}
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if isinstance(data, dict) and "fields" in data and isinstance(data["fields"], dict):
+        data = data["fields"]
+    if not isinstance(data, dict):
+        raise ValueError(f"expected JSON object in {path}")
+    return {str(key): float(value) for key, value in data.items()}
+
+
+def apply_derived_metadata_to_items(
+    memories: list[dict[str, Any]],
+    queries: list[dict[str, Any]],
+    args: argparse.Namespace,
+) -> FieldRegistry | None:
+    classifier = build_field_classifier(args)
+    if classifier is None:
+        return None
+    registry = load_field_registry(str(getattr(args, "field_registry", "") or ""))
+    predictions_by_item: list[tuple[dict[str, Any], list[FieldPrediction]]] = []
+    for item in memories:
+        predictions = classifier.classify(str(item.get("text") or ""), registry)
+        registry.record_predictions(predictions)
+        predictions_by_item.append((item, predictions))
+    for item in queries:
+        predictions = classifier.classify(str(item.get("text") or ""), registry)
+        registry.record_predictions(predictions)
+        predictions_by_item.append((item, predictions))
+    if bool(getattr(args, "schema_auto_promote", False)):
+        registry.promote_ready_fields(
+            load_float_mapping(str(getattr(args, "schema_promotion_lifts_json", "") or "")),
+            load_float_mapping(str(getattr(args, "schema_hard_negative_deltas_json", "") or "")),
+            min_count=int(getattr(args, "schema_promotion_min_count", 25)),
+            min_confidence=float(getattr(args, "schema_promotion_min_confidence", 0.82)),
+            min_distinct_values=int(getattr(args, "schema_promotion_min_distinct_values", 5)),
+            min_lift=float(getattr(args, "schema_promotion_min_lift", 0.03)),
+            max_hard_negative_delta=float(getattr(args, "schema_promotion_max_hard_negative_delta", 0.01)),
+        )
+    for item, predictions in predictions_by_item:
+        apply_derived_metadata(item, predictions, registry)
+    if hasattr(classifier, "save"):
+        classifier.save()
+    output_registry = str(getattr(args, "output_field_registry", "") or "")
+    if output_registry:
+        registry.save(output_registry)
+    return registry
 
 
 def calibration_row(
@@ -799,6 +990,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         wrong_rate=args.metadata_wrong_rate,
         seed=args.seed,
     )
+    field_registry = apply_derived_metadata_to_items(memories, queries, args)
 
     backend = build_embedding_backend(args)
     embed_started = time.perf_counter()
@@ -815,8 +1007,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
 
     vector = VectorSearch(memory_vectors, args.vector_index, args.hnsw_m)
     postings = build_token_index(memories, args.max_token_postings)
-    metadata_index = build_metadata_index(memories)
-    graph_index = build_graph_index(memories) if args.graph_fetch > 0 else {}
+    metadata_index = build_metadata_index(memories, args.metadata_source)
+    graph_index = build_graph_index(memories, args.metadata_source) if args.graph_fetch > 0 else {}
     calibrator = None
     if args.calibrator_checkpoint:
         from python.librarian.hippo_calibrator import load_calibrator
@@ -842,6 +1034,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             memories,
             args.metadata_fetch,
             args.metadata_per_bucket,
+            args.metadata_source,
         )
         graph_seed_count = max(0, args.graph_seed_count)
         seed_scores = [(index, score) for index, score in vector_pairs[:graph_seed_count]]
@@ -878,7 +1071,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         hybrid = hybrid[: args.candidate_pool]
         relevant = {str(item) for item in query.get("relevant_ids") or []}
         for candidate in hybrid:
-            annotate_query_matches(query, candidate)
+            annotate_query_matches(query, candidate, args.metadata_source)
         mark_candidate_labels(hybrid, relevant)
         if args.output_calibration_jsonl:
             calibration_rows.append(calibration_row(query, query_vector, hybrid, args.budget, args.calibration_max_candidates))
@@ -947,6 +1140,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "vector_fetch": args.vector_fetch,
         "token_fetch": args.token_fetch,
         "metadata_fetch": args.metadata_fetch,
+        "metadata_source": args.metadata_source,
+        "derived_metadata": args.derived_metadata,
+        "schema_auto_promote": args.schema_auto_promote,
+        "field_registry_version": field_registry.version if field_registry is not None else 0,
         "graph_fetch": args.graph_fetch,
         "metadata_availability": args.metadata_availability,
         "metadata_wrong_rate": args.metadata_wrong_rate,
@@ -988,6 +1185,9 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- vector_index: `{result['vector_index']}`",
         f"- candidate_pool: `{result['candidate_pool']}`",
         f"- metadata_fetch: `{result.get('metadata_fetch', 0)}`",
+        f"- metadata_source: `{result.get('metadata_source', 'original')}`",
+        f"- derived_metadata: `{result.get('derived_metadata', 'none')}`",
+        f"- field_registry_version: `{result.get('field_registry_version', 0)}`",
         f"- graph_fetch: `{result.get('graph_fetch', 0)}`",
         f"- metadata_availability: `{result.get('metadata_availability', 1.0)}`",
         f"- metadata_wrong_rate: `{result.get('metadata_wrong_rate', 0.0)}`",
@@ -1034,6 +1234,20 @@ def main() -> None:
     parser.add_argument("--metadata-per-bucket", type=int, default=512)
     parser.add_argument("--metadata-availability", type=float, default=1.0)
     parser.add_argument("--metadata-wrong-rate", type=float, default=0.0)
+    parser.add_argument("--metadata-source", choices=["original", "derived", "both"], default="original")
+    parser.add_argument("--derived-metadata", choices=["none", "rules", "qwen-cache"], default="none")
+    parser.add_argument("--field-registry", default="")
+    parser.add_argument("--field-cache", default="artifacts/field_classifier/qwen_teacher_cache.json")
+    parser.add_argument("--output-field-registry", default="")
+    parser.add_argument("--qwen-cache-rule-fallback", action="store_true")
+    parser.add_argument("--schema-auto-promote", action="store_true")
+    parser.add_argument("--schema-promotion-lifts-json", default="")
+    parser.add_argument("--schema-hard-negative-deltas-json", default="")
+    parser.add_argument("--schema-promotion-min-count", type=int, default=25)
+    parser.add_argument("--schema-promotion-min-confidence", type=float, default=0.82)
+    parser.add_argument("--schema-promotion-min-distinct-values", type=int, default=5)
+    parser.add_argument("--schema-promotion-min-lift", type=float, default=0.03)
+    parser.add_argument("--schema-promotion-max-hard-negative-delta", type=float, default=0.01)
     parser.add_argument("--graph-fetch", type=int, default=0)
     parser.add_argument("--graph-seed-count", type=int, default=32)
     parser.add_argument("--graph-per-seed", type=int, default=16)

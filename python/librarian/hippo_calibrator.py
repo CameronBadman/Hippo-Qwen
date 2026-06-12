@@ -76,6 +76,13 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
     lower_text = text.lower()
     conflict_terms = ("decoy", "wrong", "conflict", "contradict", "superseded", "obsolete", "ignored")
     candidate_sources = {str(source) for source in candidate.get("candidate_sources") or []}
+    derived_field_count = float(candidate.get("derived_metadata_field_count") or 0.0)
+    derived_confidence = clamp(float(candidate.get("derived_metadata_confidence") or 0.0), 0.0, 1.0)
+    derived_user_match = 1.0 if candidate.get("derived_query_user_match") else 0.0
+    derived_project_match = 1.0 if candidate.get("derived_query_project_match") else 0.0
+    derived_brand_match = 1.0 if candidate.get("derived_query_brand_match") else 0.0
+    derived_any_match = 1.0 if candidate.get("derived_query_any_match") else 0.0
+    original_any_match = 1.0 if any(candidate.get(key) for key in ("query_user_match", "query_project_match", "query_brand_match")) else 0.0
     values = [
         clamp(float(score), -2.0, 2.0) / 2.0,
         1.0 / float(max(1, rank)),
@@ -110,6 +117,21 @@ def calibration_features(query: str, candidate: dict[str, Any], rank: int, score
         1.0 if candidate.get("query_project_match") else 0.0,
         1.0 if candidate.get("query_brand_match") else 0.0,
         1.0 if candidate.get("query_all_metadata_match") else 0.0,
+        derived_user_match,
+        derived_project_match,
+        derived_brand_match,
+        derived_any_match,
+        clamp(derived_field_count / 12.0, 0.0, 1.0),
+        derived_confidence,
+        1.0 if candidate.get("metadata_disagreement") else 0.0,
+        1.0 if not original_any_match and derived_any_match else 0.0,
+        1.0 if any(source.startswith("derived_metadata:") for source in candidate_sources) else 0.0,
+        clamp(sum(1 for source in candidate_sources if source.startswith("derived_metadata:")) / 6.0, 0.0, 1.0),
+        1.0 if original_any_match and derived_any_match else 0.0,
+        1.0 if not metadata else 0.0,
+        1.0 if derived_confidence >= 0.80 else 0.0,
+        1.0 if derived_field_count >= 3 else 0.0,
+        1.0 if derived_user_match and derived_project_match and derived_brand_match else 0.0,
     ]
     if feature_dim <= len(values):
         return values[:feature_dim]
@@ -132,6 +154,8 @@ def apply_feature_ablation(values: list[float], ablation: str) -> list[float]:
         return out
     if mode in {"metadata", "no_metadata"}:
         zero_range(10, 15)
+        zero_range(29, 33)
+        zero_range(33, 48)
     elif mode in {"state", "no_state"}:
         zero_index(8)
         zero_index(9)
@@ -140,6 +164,8 @@ def apply_feature_ablation(values: list[float], ablation: str) -> list[float]:
         zero_range(8, 16)
         zero_range(16, 21)
         zero_index(21)
+        zero_range(29, 33)
+        zero_range(33, 48)
     elif mode in {"conflict_terms", "no_conflict_terms"}:
         zero_index(21)
     else:
