@@ -1163,7 +1163,16 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                 "budget": args.budget,
                 "candidates": hybrid,
             }
-            scored = score_with_relational_calibrator(calibrator_v2, payload, max_candidates=args.candidate_pool)
+            v2_max_candidates = int(args.calibrator_v2_max_candidates or args.candidate_pool)
+            v2_max_edges = None
+            if int(args.calibrator_v2_max_edges_per_candidate) >= 0:
+                v2_max_edges = int(args.calibrator_v2_max_edges_per_candidate)
+            scored = score_with_relational_calibrator(
+                calibrator_v2,
+                payload,
+                max_candidates=v2_max_candidates,
+                max_edges_per_candidate=v2_max_edges,
+            )
             reranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in scored]
             systems["calibrated_v2"].append(add_latency(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools), calibrated_started))
             signatures["calibrated_v2"].append("|".join(candidate_id for candidate_id, _, _ in reranked[: args.top_k]))
@@ -1212,6 +1221,8 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "packing_threshold_min_items": args.packing_threshold_min_items,
         "calibrator_checkpoint": args.calibrator_checkpoint,
         "calibrator_v2_checkpoint": args.calibrator_v2_checkpoint,
+        "calibrator_v2_max_candidates": int(args.calibrator_v2_max_candidates or 0),
+        "calibrator_v2_max_edges_per_candidate": int(args.calibrator_v2_max_edges_per_candidate),
         "embed_seconds": round(embed_seconds, 3),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "systems": {name: aggregate(rows) for name, rows in systems.items()},
@@ -1255,6 +1266,8 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- metadata_wrong_rate: `{result.get('metadata_wrong_rate', 0.0)}`",
         f"- calibrator_checkpoint: `{result.get('calibrator_checkpoint', '')}`",
         f"- calibrator_v2_checkpoint: `{result.get('calibrator_v2_checkpoint', '')}`",
+        f"- calibrator_v2_max_candidates: `{result.get('calibrator_v2_max_candidates', 0)}`",
+        f"- calibrator_v2_max_edges_per_candidate: `{result.get('calibrator_v2_max_edges_per_candidate', -1)}`",
         f"- embed_seconds: `{result['embed_seconds']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
@@ -1329,6 +1342,8 @@ def main() -> None:
     parser.add_argument("--budget", type=int, default=900)
     parser.add_argument("--calibrator-checkpoint", default="")
     parser.add_argument("--calibrator-v2-checkpoint", default="")
+    parser.add_argument("--calibrator-v2-max-candidates", type=int, default=0)
+    parser.add_argument("--calibrator-v2-max-edges-per-candidate", type=int, default=-1)
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--dim-count", type=int, default=1024)
     parser.add_argument("--hash-dims", type=int, default=0)

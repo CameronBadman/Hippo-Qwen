@@ -8,7 +8,7 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from python.librarian.features import DEFAULT_DIMS, clamp, cosine, jaccard, tokens
+from python.librarian.features import DEFAULT_DIMS, clamp, cosine, jaccard, token_set, tokens
 from python.librarian.hippo_calibrator import (
     apply_feature_ablation,
     calibration_features,
@@ -187,12 +187,15 @@ class RelationalFrameCalibrator(nn.Module):
             gather_shape = (-1, -1, node_frames.shape[-1])
             source_frames = torch.gather(node_frames, 1, source_index.unsqueeze(-1).expand(gather_shape))
             neighbor_frames = torch.gather(node_frames, 1, neighbor_index.unsqueeze(-1).expand(gather_shape))
+            edge_group_size = max(0, int(self.config.max_edges_per_candidate))
+            if max_candidates > 0 and max_edges % max_candidates == 0:
+                edge_group_size = max_edges // max_candidates
             edge_outputs = self.edge_encoder(
                 source_frames,
                 neighbor_frames,
                 edge_features,
                 edge_mask,
-                group_size=max(0, int(self.config.max_edges_per_candidate)),
+                group_size=edge_group_size,
             )
             large_edges = edge_outputs["large_edge_frame"] * edge_mask.unsqueeze(-1).to(node_frames.dtype)
             small_edges = edge_outputs["small_edge_frame"] * edge_mask.unsqueeze(-1).to(node_frames.dtype)
@@ -244,6 +247,53 @@ def derived_values(candidate: dict[str, Any]) -> dict[str, set[str]]:
                     field_name = "entity"
                 out.setdefault(field_name, set()).add(str(entry["value"]).lower())
     return out
+
+
+def edge_context(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    embedding_dim = max([len(candidate.get("embedding") or []) for candidate in candidates] + [0])
+    return {
+        "ids": [str(candidate.get("id") or "") for candidate in candidates],
+        "ranks": [int(candidate.get("base_rank") or index + 1) for index, candidate in enumerate(candidates)],
+        "scores": [clamp(float(candidate.get("base_score") or 0.0), -2.0, 2.0) / 2.0 for candidate in candidates],
+        "embeddings": [fit_embedding(candidate.get("embedding") or [], embedding_dim) for candidate in candidates],
+        "token_sets": [token_set(str(candidate.get("text") or "")) for candidate in candidates],
+        "sources": [candidate_sources(candidate) for candidate in candidates],
+        "fields": [derived_values(candidate) for candidate in candidates],
+        "turns": [turn_number(candidate) for candidate in candidates],
+        "timestamps": [timestamp_seconds(candidate) for candidate in candidates],
+        "corrections": [correction_like(candidate) for candidate in candidates],
+        "texts_lower": [str(candidate.get("text") or "").lower() for candidate in candidates],
+    }
+
+
+def cached_jaccard(context: dict[str, Any], left_index: int, right_index: int) -> float:
+    left = context["token_sets"][left_index]
+    right = context["token_sets"][right_index]
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def cached_field_overlap(context: dict[str, Any], left_index: int, right_index: int) -> float:
+    left_values = context["fields"][left_index]
+    right_values = context["fields"][right_index]
+    keys = set(left_values) | set(right_values)
+    if not keys:
+        return 0.0
+    hits = 0
+    total = 0
+    for key in keys:
+        a = left_values.get(key, set())
+        b = right_values.get(key, set())
+        if a or b:
+            total += 1
+            if a & b:
+                hits += 1
+    return hits / max(1, total)
+
+
+def cached_same_field(context: dict[str, Any], left_index: int, right_index: int, field: str) -> bool:
+    return bool(context["fields"][left_index].get(field, set()) & context["fields"][right_index].get(field, set()))
 
 
 def field_overlap(left: dict[str, Any], right: dict[str, Any]) -> float:
@@ -303,6 +353,18 @@ def temporal_gap(left: dict[str, Any], right: dict[str, Any]) -> float:
     return 0.0
 
 
+def cached_temporal_gap(context: dict[str, Any], left_index: int, right_index: int) -> float:
+    left_turn = context["turns"][left_index]
+    right_turn = context["turns"][right_index]
+    if left_turn is not None and right_turn is not None:
+        return float(abs(left_turn - right_turn))
+    left_ts = context["timestamps"][left_index]
+    right_ts = context["timestamps"][right_index]
+    if left_ts is not None and right_ts is not None:
+        return abs(left_ts - right_ts) / 3600.0
+    return 0.0
+
+
 def correction_like(candidate: dict[str, Any]) -> bool:
     text = str(candidate.get("text") or "").lower()
     fields = (candidate.get("derived_metadata") or {}).get("fields") or {}
@@ -357,6 +419,53 @@ def edge_feature_values(
     return values + [0.0] * (edge_feature_dim - len(values))
 
 
+def cached_edge_feature_values(
+    context: dict[str, Any],
+    source_index: int,
+    neighbor_index: int,
+    relation_type: str,
+    max_candidates: int,
+    edge_feature_dim: int,
+) -> list[float]:
+    source_rank = context["ranks"][source_index]
+    neighbor_rank = context["ranks"][neighbor_index]
+    source_score = context["scores"][source_index]
+    neighbor_score = context["scores"][neighbor_index]
+    source_sources = context["sources"][source_index]
+    neighbor_sources = context["sources"][neighbor_index]
+    gap = cached_temporal_gap(context, source_index, neighbor_index)
+    relation_id = RELATION_TYPE_TO_ID.get(relation_type, 0)
+    values = [
+        clamp(source_rank / max(1, max_candidates), 0.0, 1.0),
+        clamp(neighbor_rank / max(1, max_candidates), 0.0, 1.0),
+        clamp((source_rank - neighbor_rank) / max(1, max_candidates), -1.0, 1.0),
+        source_score,
+        neighbor_score,
+        clamp(source_score - neighbor_score, -1.0, 1.0),
+        cosine(context["embeddings"][source_index], context["embeddings"][neighbor_index]),
+        cached_jaccard(context, source_index, neighbor_index),
+        cached_field_overlap(context, source_index, neighbor_index),
+        1.0 if cached_same_field(context, source_index, neighbor_index, "user_id") else 0.0,
+        1.0 if cached_same_field(context, source_index, neighbor_index, "project") else 0.0,
+        1.0 if cached_same_field(context, source_index, neighbor_index, "brand") else 0.0,
+        1.0 if cached_same_field(context, source_index, neighbor_index, "session_id") else 0.0,
+        1.0 if bool(source_sources & neighbor_sources) else 0.0,
+        1.0 if "vector" in source_sources and "vector" in neighbor_sources else 0.0,
+        1.0 if "token" in source_sources and "token" in neighbor_sources else 0.0,
+        1.0 if any(item.startswith("metadata:") for item in source_sources) and any(item.startswith("metadata:") for item in neighbor_sources) else 0.0,
+        1.0 if any(item.startswith("graph:") for item in source_sources) and any(item.startswith("graph:") for item in neighbor_sources) else 0.0,
+        1.0 if any(item.startswith("derived_metadata:") for item in source_sources) and any(item.startswith("derived_metadata:") for item in neighbor_sources) else 0.0,
+        clamp(gap / 32.0, 0.0, 1.0),
+        1.0 if neighbor_rank and source_rank and neighbor_rank < source_rank else 0.0,
+        1.0 if relation_type == "temporal_neighbor" else 0.0,
+        1.0 if context["corrections"][source_index] or context["corrections"][neighbor_index] else 0.0,
+        relation_id / max(1, len(RELATION_TYPES) - 1),
+    ]
+    if edge_feature_dim <= len(values):
+        return values[:edge_feature_dim]
+    return values + [0.0] * (edge_feature_dim - len(values))
+
+
 def relation_priority(relation_type: str) -> int:
     return {
         "correction": 0,
@@ -380,23 +489,24 @@ def build_candidate_edges(
     max_edges_per_candidate: int = 16,
     lexical_neighbors: int = 4,
     vector_neighbors: int = 4,
+    _context: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
-    embeddings = [fit_embedding(candidate.get("embedding") or [], len(candidate.get("embedding") or [])) for candidate in candidates]
+    context = _context or edge_context(candidates)
     lexical_by_target: dict[int, list[tuple[float, int]]] = {idx: [] for idx in range(len(candidates))}
     vector_by_target: dict[int, list[tuple[float, int]]] = {idx: [] for idx in range(len(candidates))}
     for left_index, left in enumerate(candidates):
-        for right_index, right in enumerate(candidates):
+        for right_index, _right in enumerate(candidates):
             if left_index == right_index:
                 continue
-            lexical_by_target[left_index].append((jaccard(str(left.get("text") or ""), str(right.get("text") or "")), right_index))
-            vector_by_target[left_index].append((cosine(embeddings[left_index], embeddings[right_index]), right_index))
+            lexical_by_target[left_index].append((cached_jaccard(context, left_index, right_index), right_index))
+            vector_by_target[left_index].append((cosine(context["embeddings"][left_index], context["embeddings"][right_index]), right_index))
     for values in lexical_by_target.values():
-        values.sort(key=lambda item: (-item[0], int(candidates[item[1]].get("base_rank") or item[1] + 1), str(candidates[item[1]].get("id") or "")))
+        values.sort(key=lambda item: (-item[0], context["ranks"][item[1]], context["ids"][item[1]]))
     for values in vector_by_target.values():
-        values.sort(key=lambda item: (-item[0], int(candidates[item[1]].get("base_rank") or item[1] + 1), str(candidates[item[1]].get("id") or "")))
+        values.sort(key=lambda item: (-item[0], context["ranks"][item[1]], context["ids"][item[1]]))
 
-    for source_index, source in enumerate(candidates):
+    for source_index, _source in enumerate(candidates):
         proposals: dict[int, tuple[str, int, float]] = {}
 
         def add(neighbor_index: int, relation_type: str, strength: float = 1.0) -> None:
@@ -404,46 +514,46 @@ def build_candidate_edges(
                 return
             priority = relation_priority(relation_type)
             current = proposals.get(neighbor_index)
-            key = (priority, -float(strength), int(candidates[neighbor_index].get("base_rank") or neighbor_index + 1), str(candidates[neighbor_index].get("id") or ""))
+            key = (priority, -float(strength), context["ranks"][neighbor_index], context["ids"][neighbor_index])
             if current is None:
                 proposals[neighbor_index] = (relation_type, priority, float(strength))
                 return
-            current_key = (current[1], -current[2], int(candidates[neighbor_index].get("base_rank") or neighbor_index + 1), str(candidates[neighbor_index].get("id") or ""))
+            current_key = (current[1], -current[2], context["ranks"][neighbor_index], context["ids"][neighbor_index])
             if key < current_key:
                 proposals[neighbor_index] = (relation_type, priority, float(strength))
 
-        source_rank = int(source.get("base_rank") or source_index + 1)
-        for neighbor_index, neighbor in enumerate(candidates):
-            neighbor_rank = int(neighbor.get("base_rank") or neighbor_index + 1)
+        source_rank = context["ranks"][source_index]
+        for neighbor_index, _neighbor in enumerate(candidates):
+            neighbor_rank = context["ranks"][neighbor_index]
             if neighbor_rank < source_rank:
                 add(neighbor_index, "higher_rank", 1.0 / max(1, source_rank - neighbor_rank))
-            if same_field(source, neighbor, "session_id"):
+            if cached_same_field(context, source_index, neighbor_index, "session_id"):
                 add(neighbor_index, "same_session", 1.0)
-            if same_field(source, neighbor, "user_id"):
+            if cached_same_field(context, source_index, neighbor_index, "user_id"):
                 add(neighbor_index, "same_user", 0.8)
-            if same_field(source, neighbor, "project"):
+            if cached_same_field(context, source_index, neighbor_index, "project"):
                 add(neighbor_index, "same_project", 0.9)
-            if same_field(source, neighbor, "brand"):
+            if cached_same_field(context, source_index, neighbor_index, "brand"):
                 add(neighbor_index, "same_brand", 0.7)
-            if same_field(source, neighbor, "entity"):
+            if cached_same_field(context, source_index, neighbor_index, "entity"):
                 add(neighbor_index, "field_overlap", 0.8)
-            overlap = field_overlap(source, neighbor)
+            overlap = cached_field_overlap(context, source_index, neighbor_index)
             if overlap > 0.0:
                 add(neighbor_index, "field_overlap", overlap)
-            if candidate_sources(source) & candidate_sources(neighbor):
+            if context["sources"][source_index] & context["sources"][neighbor_index]:
                 add(neighbor_index, "same_source", 0.4)
-            if correction_like(source) or correction_like(neighbor):
-                if same_field(source, neighbor, "project") or same_field(source, neighbor, "user_id"):
+            if context["corrections"][source_index] or context["corrections"][neighbor_index]:
+                if cached_same_field(context, source_index, neighbor_index, "project") or cached_same_field(context, source_index, neighbor_index, "user_id"):
                     add(neighbor_index, "correction", 1.0)
-                if "superseded" in f"{source.get('text', '')} {neighbor.get('text', '')}".lower():
+                if "superseded" in f"{context['texts_lower'][source_index]} {context['texts_lower'][neighbor_index]}":
                     add(neighbor_index, "supersedes", 1.0)
 
         same_session = [
-            (temporal_gap(source, neighbor), neighbor_index)
-            for neighbor_index, neighbor in enumerate(candidates)
-            if neighbor_index != source_index and same_field(source, neighbor, "session_id")
+            (cached_temporal_gap(context, source_index, neighbor_index), neighbor_index)
+            for neighbor_index, _neighbor in enumerate(candidates)
+            if neighbor_index != source_index and cached_same_field(context, source_index, neighbor_index, "session_id")
         ]
-        same_session.sort(key=lambda item: (item[0], int(candidates[item[1]].get("base_rank") or item[1] + 1), str(candidates[item[1]].get("id") or "")))
+        same_session.sort(key=lambda item: (item[0], context["ranks"][item[1]], context["ids"][item[1]]))
         for _, neighbor_index in same_session[:2]:
             add(neighbor_index, "temporal_neighbor", 1.0)
 
@@ -456,15 +566,15 @@ def build_candidate_edges(
 
         ordered = sorted(
             proposals.items(),
-            key=lambda item: (item[1][1], -item[1][2], int(candidates[item[0]].get("base_rank") or item[0] + 1), str(candidates[item[0]].get("id") or "")),
+            key=lambda item: (item[1][1], -item[1][2], context["ranks"][item[0]], context["ids"][item[0]]),
         )
         for neighbor_index, (relation_type, _, strength) in ordered[: max(0, int(max_edges_per_candidate))]:
             rows.append(
                 {
                     "source_index": source_index,
                     "neighbor_index": neighbor_index,
-                    "source_id": str(source.get("id") or ""),
-                    "neighbor_id": str(candidates[neighbor_index].get("id") or ""),
+                    "source_id": context["ids"][source_index],
+                    "neighbor_id": context["ids"][neighbor_index],
                     "relation_type": relation_type,
                     "strength": float(strength),
                 }
@@ -483,6 +593,7 @@ def tensorize_relational_payload(
     query = str(payload.get("query") or "")
     query_embedding = fit_embedding([float(value) for value in payload.get("query_embedding") or []], embedding_dim)
     candidates = [dict(item) for item in payload.get("candidates", [])[:max_candidates]]
+    edge_info = edge_context(candidates) if max_edges_per_candidate > 0 else None
     feature_ablation = str(payload.get("feature_ablation") or "none")
     candidate_tensor = torch.zeros((1, max_candidates, embedding_dim), dtype=torch.float32)
     node_feature_tensor = torch.zeros((1, max_candidates, node_feature_dim), dtype=torch.float32)
@@ -505,7 +616,7 @@ def tensorize_relational_payload(
         )
         mask[0, idx] = True
     if max_edges_per_candidate > 0:
-        edges = build_candidate_edges(candidates, max_edges_per_candidate=max_edges_per_candidate)
+        edges = build_candidate_edges(candidates, max_edges_per_candidate=max_edges_per_candidate, _context=edge_info)
     else:
         edges = []
     max_edges = max(1, max_candidates * max(0, int(max_edges_per_candidate)))
@@ -528,9 +639,10 @@ def tensorize_relational_payload(
         edge_index[0, idx, 0] = source_index
         edge_index[0, idx, 1] = neighbor_index
         edge_features[0, idx] = torch.tensor(
-            edge_feature_values(
-                candidates[source_index],
-                candidates[neighbor_index],
+            cached_edge_feature_values(
+                edge_info,
+                source_index,
+                neighbor_index,
                 str(edge["relation_type"]),
                 max_candidates,
                 edge_feature_dim,
@@ -558,6 +670,7 @@ def score_with_relational_calibrator(
     include_weight: float | None = None,
     base_weight: float | None = None,
     utility_weight: float | None = None,
+    max_edges_per_candidate: int | None = None,
 ) -> list[dict[str, Any]]:
     metadata = getattr(model, "metadata", {}) or {}
     if relevance_weight is None:
@@ -570,13 +683,16 @@ def score_with_relational_calibrator(
         utility_weight = float(metadata.get("rerank_utility_weight", 0.02))
     with torch.no_grad():
         device = next(model.parameters()).device
+        edge_budget = int(model.config.max_edges_per_candidate if max_edges_per_candidate is None else max_edges_per_candidate)
+        if not model.config.use_edges:
+            edge_budget = 0
         tensors, candidates, _ = tensorize_relational_payload(
             payload,
             int(max_candidates or model.config.max_candidates),
             model.config.node_feature_dim,
             model.config.embedding_dim,
             model.config.edge_feature_dim,
-            model.config.max_edges_per_candidate if model.config.use_edges else 0,
+            edge_budget,
         )
         tensors = {key: value.to(device) for key, value in tensors.items()}
         outputs = model(**tensors)
@@ -613,8 +729,9 @@ def rerank_with_relational_calibrator(
     payload: dict[str, Any],
     *,
     max_candidates: int | None = None,
+    max_edges_per_candidate: int | None = None,
 ) -> list[tuple[str, float, str]]:
-    ranked = score_with_relational_calibrator(model, payload, max_candidates=max_candidates)
+    ranked = score_with_relational_calibrator(model, payload, max_candidates=max_candidates, max_edges_per_candidate=max_edges_per_candidate)
     return [(item["id"], item["score"], item["text"]) for item in ranked]
 
 
