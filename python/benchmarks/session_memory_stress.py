@@ -977,6 +977,12 @@ def packing_thresholds(args: argparse.Namespace) -> list[float]:
     return sorted(set(values))
 
 
+def add_latency(row: dict[str, float], started: float) -> dict[str, float]:
+    out = dict(row)
+    out["latency_ms"] = max(0.0, (time.perf_counter() - started) * 1000.0)
+    return out
+
+
 def run(args: argparse.Namespace) -> dict[str, Any]:
     started = time.perf_counter()
     memories, queries = build_store(args.memory_count, args.queries, args.seed)
@@ -1019,6 +1025,11 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         from python.librarian.hippo_calibrator import load_calibrator
 
         calibrator = load_calibrator(args.calibrator_checkpoint, device=args.device or "cpu")
+    calibrator_v2 = None
+    if args.calibrator_v2_checkpoint:
+        from python.librarian.relational_frame_calibrator import load_relational_calibrator
+
+        calibrator_v2 = load_relational_calibrator(args.calibrator_v2_checkpoint, device=args.device or "cpu")
     systems: dict[str, list[dict[str, float]]] = {"vector": [], "hybrid": []}
     if calibrator is not None:
         systems["calibrated"] = []
@@ -1026,10 +1037,15 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             systems[f"calibrated_pack_top{top_n}"] = []
         for threshold in packing_thresholds(args):
             systems[f"calibrated_pack_p{int(round(threshold * 100)):02d}"] = []
+    if calibrator_v2 is not None:
+        systems["calibrated_v2"] = []
+        for top_n in packing_top_ns(args):
+            systems[f"calibrated_v2_pack_top{top_n}"] = []
     signatures: dict[str, list[str]] = {key: [] for key in systems}
     calibration_rows: list[dict[str, Any]] = []
 
     for query_index, query in enumerate(queries):
+        query_started = time.perf_counter()
         query_vector = query_vectors[query_index]
         vector_pairs = vector.search(query_vector, args.vector_fetch)
         token_pairs = token_scores(str(query["text"]), postings, len(memories), args.token_fetch)
@@ -1058,9 +1074,10 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         }
         vector_ranked = ranked_from_indexes(memories, vector_pairs)
         vector_pool = {candidate_id for candidate_id, _, _ in vector_ranked[: args.candidate_pool]}
-        systems["vector"].append(metrics_for(query, vector_ranked, vector_pool, args.top_k, args.budget, source_pools=source_pools))
+        systems["vector"].append(add_latency(metrics_for(query, vector_ranked, vector_pool, args.top_k, args.budget, source_pools=source_pools), query_started))
         signatures["vector"].append("|".join(candidate_id for candidate_id, _, _ in vector_ranked[: args.top_k]))
 
+        hybrid_started = time.perf_counter()
         hybrid = hybrid_candidates(
             str(query["text"]),
             vector_pairs,
@@ -1082,21 +1099,22 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
             calibration_rows.append(calibration_row(query, query_vector, hybrid, args.budget, args.calibration_max_candidates))
         hybrid_ranked = [(str(item["id"]), float(item.get("base_score") or 0.0), str(item.get("text") or "")) for item in hybrid]
         hybrid_pool = {candidate_id for candidate_id, _, _ in hybrid_ranked}
-        systems["hybrid"].append(metrics_for(query, hybrid_ranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
+        systems["hybrid"].append(add_latency(metrics_for(query, hybrid_ranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools), hybrid_started))
         signatures["hybrid"].append("|".join(candidate_id for candidate_id, _, _ in hybrid_ranked[: args.top_k]))
 
         if calibrator is not None:
             from python.librarian.hippo_calibrator import score_with_calibrator
 
+            calibrated_started = time.perf_counter()
             payload = {
                 "query": str(query["text"]),
-                "query_embedding": query_vector.tolist(),
+                "query_embedding": vector_to_list(query_vector),
                 "budget": args.budget,
                 "candidates": hybrid,
             }
             scored = score_with_calibrator(calibrator, payload, max_candidates=args.candidate_pool)
             reranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in scored]
-            systems["calibrated"].append(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools))
+            systems["calibrated"].append(add_latency(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools), calibrated_started))
             signatures["calibrated"].append("|".join(candidate_id for candidate_id, _, _ in reranked[: args.top_k]))
             for top_n in packing_top_ns(args):
                 system_name = f"calibrated_pack_top{top_n}"
@@ -1112,6 +1130,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         included_ids=included,
                     )
                 )
+                systems[system_name][-1]["latency_ms"] = systems["calibrated"][-1]["latency_ms"]
                 signatures[system_name].append("|".join(included))
             for threshold in packing_thresholds(args):
                 system_name = f"calibrated_pack_p{int(round(threshold * 100)):02d}"
@@ -1132,6 +1151,37 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
                         included_ids=included,
                     )
                 )
+                systems[system_name][-1]["latency_ms"] = systems["calibrated"][-1]["latency_ms"]
+                signatures[system_name].append("|".join(included))
+        if calibrator_v2 is not None:
+            from python.librarian.relational_frame_calibrator import score_with_relational_calibrator
+
+            calibrated_started = time.perf_counter()
+            payload = {
+                "query": str(query["text"]),
+                "query_embedding": vector_to_list(query_vector),
+                "budget": args.budget,
+                "candidates": hybrid,
+            }
+            scored = score_with_relational_calibrator(calibrator_v2, payload, max_candidates=args.candidate_pool)
+            reranked = [(str(item["id"]), float(item["score"]), str(item["text"])) for item in scored]
+            systems["calibrated_v2"].append(add_latency(metrics_for(query, reranked, hybrid_pool, args.top_k, args.budget, source_pools=source_pools), calibrated_started))
+            signatures["calibrated_v2"].append("|".join(candidate_id for candidate_id, _, _ in reranked[: args.top_k]))
+            for top_n in packing_top_ns(args):
+                system_name = f"calibrated_v2_pack_top{top_n}"
+                included = packed_context_ids(scored, args.budget, top_n=top_n)
+                systems[system_name].append(
+                    metrics_for(
+                        query,
+                        reranked,
+                        hybrid_pool,
+                        args.top_k,
+                        args.budget,
+                        source_pools=source_pools,
+                        included_ids=included,
+                    )
+                )
+                systems[system_name][-1]["latency_ms"] = systems["calibrated_v2"][-1]["latency_ms"]
                 signatures[system_name].append("|".join(included))
 
     result = {
@@ -1161,6 +1211,7 @@ def run(args: argparse.Namespace) -> dict[str, Any]:
         "packing_threshold": packing_thresholds(args),
         "packing_threshold_min_items": args.packing_threshold_min_items,
         "calibrator_checkpoint": args.calibrator_checkpoint,
+        "calibrator_v2_checkpoint": args.calibrator_v2_checkpoint,
         "embed_seconds": round(embed_seconds, 3),
         "elapsed_seconds": round(time.perf_counter() - started, 3),
         "systems": {name: aggregate(rows) for name, rows in systems.items()},
@@ -1202,15 +1253,19 @@ def write_markdown(result: dict[str, Any], path: Path) -> None:
         f"- graph_fetch: `{result.get('graph_fetch', 0)}`",
         f"- metadata_availability: `{result.get('metadata_availability', 1.0)}`",
         f"- metadata_wrong_rate: `{result.get('metadata_wrong_rate', 0.0)}`",
+        f"- calibrator_checkpoint: `{result.get('calibrator_checkpoint', '')}`",
+        f"- calibrator_v2_checkpoint: `{result.get('calibrator_v2_checkpoint', '')}`",
         f"- embed_seconds: `{result['embed_seconds']}`",
         f"- elapsed_seconds: `{result['elapsed_seconds']}`",
         "",
-        "| system | pool | vector | token | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context recall | context precision | hard neg ctx | included | ctx tokens |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| system | p50 ms | p95 ms | pool | vector | token | metadata | graph | recall@8 | recall@16 | recall@32 | hit any | precision@8 | hard neg@8 | context recall | context precision | hard neg ctx | included | ctx tokens |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name, metrics in result["systems"].items():
         lines.append(
             f"| {name} | "
+            f"{metrics.get('latency_ms', {}).get('p50', 0.0):.2f} | "
+            f"{metrics.get('latency_ms', {}).get('p95', 0.0):.2f} | "
             f"{metrics.get('evidence_in_pool', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('evidence_in_vector_fetch', {}).get('avg', 0.0):.4f} | "
             f"{metrics.get('evidence_in_token_fetch', {}).get('avg', 0.0):.4f} | "
@@ -1273,6 +1328,7 @@ def main() -> None:
     parser.add_argument("--top-k", type=int, default=8)
     parser.add_argument("--budget", type=int, default=900)
     parser.add_argument("--calibrator-checkpoint", default="")
+    parser.add_argument("--calibrator-v2-checkpoint", default="")
     parser.add_argument("--embedding-backend", choices=["hash", "hippo"], default="hash")
     parser.add_argument("--dim-count", type=int, default=1024)
     parser.add_argument("--hash-dims", type=int, default=0)
