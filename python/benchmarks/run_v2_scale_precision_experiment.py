@@ -61,6 +61,9 @@ def percentile(values: list[float], p: float) -> float:
 def direct_latency(checkpoint: Path, train_jsonl: Path, max_candidates: int, max_edges: int, rows: int = 32) -> dict[str, float]:
     import torch
 
+    repo_root = Path(__file__).resolve().parents[2]
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
     from python.librarian.relational_frame_calibrator import load_relational_calibrator, score_with_relational_calibrator
 
     payloads = []
@@ -224,7 +227,18 @@ def main() -> None:
     artifact_dir = Path(args.artifact_dir)
     log_dir = artifact_dir / "logs"
     artifact_dir.mkdir(parents=True, exist_ok=True)
-    summary: list[dict[str, Any]] = []
+    summary_path = artifact_dir / "scale_precision_summary.json"
+    if summary_path.exists():
+        summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    else:
+        summary: list[dict[str, Any]] = []
+
+    def append_summary(row: dict[str, Any]) -> None:
+        summary[:] = [existing for existing in summary if existing.get("name") != row.get("name")]
+        summary.append(row)
+        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+        print("SUMMARY_ROW " + json.dumps(row, sort_keys=True), flush=True)
+        print(f"wrote {summary_path}", flush=True)
 
     variants = [
         ("fast64_edge4_l1_precision", 64, 4),
@@ -252,37 +266,41 @@ def main() -> None:
                 log_dir / f"build_{memory_count}.log",
                 repo,
             )
+        else:
+            print(f"reuse train rows {memory_count}: {train_jsonl}", flush=True)
 
         if args.existing_checkpoint and not args.skip_existing_eval:
             checkpoint = Path(args.existing_checkpoint)
             output_json = artifact_dir / f"eval_{memory_count}_existing_fast64.json"
-            run_logged(
-                f"eval existing fast64 {memory_count}",
-                benchmark_base(args, memory_count)
-                + [
-                    "--query-start",
-                    str(args.train_queries),
-                    "--query-limit",
-                    str(args.holdout_queries),
-                    "--calibrator-v2-checkpoint",
-                    str(checkpoint),
-                    "--calibrator-v2-max-candidates",
-                    "64",
-                    "--calibrator-v2-max-edges-per-candidate",
-                    "4",
-                    "--output-json",
-                    str(output_json),
-                    "--output-md",
-                    str(artifact_dir / f"eval_{memory_count}_existing_fast64.md"),
-                ],
-                log_dir / f"eval_{memory_count}_existing_fast64.log",
-                repo,
-            )
+            if not output_json.exists():
+                run_logged(
+                    f"eval existing fast64 {memory_count}",
+                    benchmark_base(args, memory_count)
+                    + [
+                        "--query-start",
+                        str(args.train_queries),
+                        "--query-limit",
+                        str(args.holdout_queries),
+                        "--calibrator-v2-checkpoint",
+                        str(checkpoint),
+                        "--calibrator-v2-max-candidates",
+                        "64",
+                        "--calibrator-v2-max-edges-per-candidate",
+                        "4",
+                        "--output-json",
+                        str(output_json),
+                        "--output-md",
+                        str(artifact_dir / f"eval_{memory_count}_existing_fast64.md"),
+                    ],
+                    log_dir / f"eval_{memory_count}_existing_fast64.log",
+                    repo,
+                )
+            else:
+                print(f"reuse eval existing fast64 {memory_count}: {output_json}", flush=True)
             row = summarize_eval(output_json, f"existing_fast64_on_{memory_count}", memory_count, checkpoint)
             if not args.skip_direct_latency:
                 row.update(direct_latency(checkpoint, train_jsonl, 64, 4))
-            summary.append(row)
-            print("SUMMARY_ROW " + json.dumps(row, sort_keys=True), flush=True)
+            append_summary(row)
 
         for variant_name, max_candidates, max_edges in variants:
             checkpoint = artifact_dir / f"v2_{variant_name}_{memory_count}.pt"
@@ -293,38 +311,38 @@ def main() -> None:
                     log_dir / f"train_{variant_name}_{memory_count}.log",
                     repo,
                 )
+            else:
+                print(f"reuse checkpoint {variant_name} {memory_count}: {checkpoint}", flush=True)
             output_json = artifact_dir / f"eval_{memory_count}_{variant_name}.json"
-            run_logged(
-                f"eval {variant_name} {memory_count}",
-                benchmark_base(args, memory_count)
-                + [
-                    "--query-start",
-                    str(args.train_queries),
-                    "--query-limit",
-                    str(args.holdout_queries),
-                    "--calibrator-v2-checkpoint",
-                    str(checkpoint),
-                    "--calibrator-v2-max-candidates",
-                    str(max_candidates),
-                    "--calibrator-v2-max-edges-per-candidate",
-                    str(max_edges),
-                    "--output-json",
-                    str(output_json),
-                    "--output-md",
-                    str(artifact_dir / f"eval_{memory_count}_{variant_name}.md"),
-                ],
-                log_dir / f"eval_{variant_name}_{memory_count}.log",
-                repo,
-            )
+            if not output_json.exists():
+                run_logged(
+                    f"eval {variant_name} {memory_count}",
+                    benchmark_base(args, memory_count)
+                    + [
+                        "--query-start",
+                        str(args.train_queries),
+                        "--query-limit",
+                        str(args.holdout_queries),
+                        "--calibrator-v2-checkpoint",
+                        str(checkpoint),
+                        "--calibrator-v2-max-candidates",
+                        str(max_candidates),
+                        "--calibrator-v2-max-edges-per-candidate",
+                        str(max_edges),
+                        "--output-json",
+                        str(output_json),
+                        "--output-md",
+                        str(artifact_dir / f"eval_{memory_count}_{variant_name}.md"),
+                    ],
+                    log_dir / f"eval_{variant_name}_{memory_count}.log",
+                    repo,
+                )
+            else:
+                print(f"reuse eval {variant_name} {memory_count}: {output_json}", flush=True)
             row = summarize_eval(output_json, f"{variant_name}_on_{memory_count}", memory_count, checkpoint)
             if not args.skip_direct_latency:
                 row.update(direct_latency(checkpoint, train_jsonl, max_candidates, max_edges))
-            summary.append(row)
-            print("SUMMARY_ROW " + json.dumps(row, sort_keys=True), flush=True)
-
-        summary_path = artifact_dir / "scale_precision_summary.json"
-        summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
-        print(f"wrote {summary_path}", flush=True)
+            append_summary(row)
 
 
 if __name__ == "__main__":
